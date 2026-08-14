@@ -244,6 +244,16 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(first.publication_key, store.puts[-1])
         marker = read_publication(store, first.publication_key)
         self.assertEqual(marker["publication_id"], first.publication_id)
+
+    @unittest.skipIf(os.name == "nt", "Windows does not expose POSIX mode bits")
+    def test_script_publish_posix_checkpoint_is_owner_only(self) -> None:
+        checkpoint = self.root / "state" / "publish.json"
+
+        publish_s3_session(
+            self.script_request(checkpoint),
+            store_factory=lambda spec: MemoryObjectStore(),
+        )
+
         self.assertEqual(checkpoint.stat().st_mode & 0o777, 0o600)
 
     def test_script_publish_reuses_prepared_identity_after_interruption(self) -> None:
