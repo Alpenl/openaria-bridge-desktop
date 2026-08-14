@@ -1,0 +1,543 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ylx:schema:bucket-publication:v2",
+  "title": "YLX Bucket Publication v2",
+  "description": "Immutable bucket-side publication evidence. It binds a sealed source manifest to explicit object keys and exact artifact bytes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "publication_id",
+    "sealed",
+    "published_at",
+    "device",
+    "source_manifest",
+    "take",
+    "publication_object_key",
+    "artifacts"
+  ],
+  "properties": {
+    "schema": {
+      "const": "ylx.bucket-publication.v2"
+    },
+    "publication_id": {
+      "$ref": "#/$defs/uuidV7"
+    },
+    "sealed": {
+      "const": true,
+      "description": "The publication object is written last; true means all listed objects were verified before publication."
+    },
+    "published_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "device": {
+      "$ref": "#/$defs/deviceIdentity"
+    },
+    "source_manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifest_id", "schema", "session_id", "volume_id", "object_key", "bytes", "sha256"],
+      "properties": {
+        "manifest_id": {
+          "$ref": "#/$defs/uuidV7"
+        },
+        "schema": {
+          "const": "ylx.device-session.v1"
+        },
+        "session_id": {
+          "$ref": "#/$defs/uuidV7"
+        },
+        "volume_id": {
+          "$ref": "#/$defs/uuidV4"
+        },
+        "object_key": {
+          "$ref": "#/$defs/contentObjectKey",
+          "description": "Fetchable exact source-manifest bytes. Its f-<id> leaf MUST use sha256."
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256",
+          "description": "SHA-256 of the exact source manifest bytes, not a reserialized JSON value."
+        }
+      }
+    },
+    "take": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["take_id", "sequence", "continuation_of"],
+      "description": "Exact adapter copy of the bound device-session take relation for bucket-only aggregation.",
+      "oneOf": [
+        {
+          "properties": {
+            "sequence": {
+              "const": 1
+            },
+            "continuation_of": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "sequence": {
+              "type": "integer",
+              "minimum": 2
+            },
+            "continuation_of": {
+              "$ref": "#/$defs/uuidV7"
+            }
+          }
+        }
+      ],
+      "properties": {
+        "take_id": {
+          "$ref": "#/$defs/uuidV7"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "continuation_of": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/uuidV7"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "publication_object_key": {
+      "$ref": "#/$defs/publicationObjectKey",
+      "description": "Full bucket object key for these exact publication bytes."
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "$ref": "#/$defs/publishedArtifact"
+      },
+      "allOf": [
+        {
+          "contains": {
+            "type": "object",
+            "required": ["role"],
+            "properties": {
+              "role": {
+                "const": "video.left"
+              }
+            }
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "type": "object",
+            "required": ["role"],
+            "properties": {
+              "role": {
+                "const": "video.right"
+              }
+            }
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "if": {
+            "contains": {
+              "type": "object",
+              "required": ["provenance"],
+              "properties": {
+                "provenance": {
+                  "type": "object",
+                  "required": ["kind"],
+                  "properties": {
+                    "kind": {
+                      "const": "normalized-output"
+                    }
+                  }
+                }
+              }
+            },
+            "minContains": 1
+          },
+          "then": {
+            "contains": {
+              "type": "object",
+              "required": ["role"],
+              "properties": {
+                "role": {
+                  "const": "publication.transform-log"
+                }
+              }
+            },
+            "minContains": 1,
+            "maxContains": 1
+          }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "uuidV7": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "Canonical lowercase UUIDv7."
+    },
+    "uuidV4": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "Canonical lowercase random UUIDv4."
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "contentObjectKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*[\\u0000-\\u001f\\u007f-\\u009f])(?!.*(?:^|/)\\.{1,2}(?:/|$))(?:(?!__ylx_evidence__(?:/|$))[^/]+/)*[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/f-[0-9a-f]{64}$",
+      "description": "Normalized relative content key shaped as raw-prefix/device-UUIDv4/session-UUIDv7/f-sha256. Empty, dot, parent, control, backslash, and reserved evidence-namespace segments are forbidden; equality to sibling identity fields remains procedural."
+    },
+    "publicationObjectKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*[\\u0000-\\u001f\\u007f-\\u009f])(?!.*(?:^|/)\\.{1,2}(?:/|$))(?:(?!__ylx_evidence__(?:/|$))[^/]+/)*[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/__ylx_evidence__/publication\\.json$",
+      "description": "Normalized relative publication key shaped as raw-prefix/device-UUIDv4/session-UUIDv7/__ylx_evidence__/publication.json, with exactly one terminal evidence namespace. Equality to sibling identity fields remains procedural."
+    },
+    "deviceIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device_id", "device_label"],
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/uuidV4"
+        },
+        "device_label": {
+          "type": "string",
+          "pattern": "^YLX-[0-9A-F]{8}$",
+          "description": "Display-only label."
+        }
+      }
+    },
+    "publishedArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "role",
+        "object_key",
+        "media_type",
+        "bytes",
+        "sha256",
+        "provenance"
+      ],
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/sha256",
+          "description": "Content identity of the exact published bytes; MUST equal sha256. It may differ from every source artifact after normalization."
+        },
+        "role": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$",
+          "maxLength": 96,
+          "description": "Semantic role of these published bytes. publication.transform-log is reserved for publication-side normalization evidence; source log.* roles remain independently deliverable inventory."
+        },
+        "object_key": {
+          "$ref": "#/$defs/contentObjectKey",
+          "description": "Explicit full bucket object key. Its f-<id> leaf MUST use artifact_id."
+        },
+        "media_type": {
+          "type": "string",
+          "pattern": "^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "provenance": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/directProvenance"
+            },
+            {
+              "$ref": "#/$defs/normalizedProvenance"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["role"],
+            "properties": {
+              "role": {
+                "enum": ["video.left", "video.right"]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "media_type": {
+                "const": "video/mp4"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["role"],
+            "properties": {
+              "role": {
+                "const": "publication.transform-log"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "media_type": {
+                "const": "application/json"
+              },
+              "bytes": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "provenance": {
+                "$ref": "#/$defs/transformLogProvenance"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["provenance"],
+            "properties": {
+              "provenance": {
+                "type": "object",
+                "required": ["transform"],
+                "properties": {
+                  "transform": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {
+                      "name": {
+                        "const": "ylx-transform-log"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "role": {
+                "const": "publication.transform-log"
+              },
+              "media_type": {
+                "const": "application/json"
+              },
+              "bytes": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "directProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "source_artifact_ids"],
+      "properties": {
+        "kind": {
+          "const": "device-artifact"
+        },
+        "source_artifact_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/sha256"
+          },
+          "description": "Artifact identities resolved from the bound ylx.device-session.v1 manifest."
+        }
+      }
+    },
+    "normalizedProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "source_artifact_ids", "transform"],
+      "properties": {
+        "kind": {
+          "const": "normalized-output"
+        },
+        "source_artifact_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/sha256"
+          },
+          "description": "One or more source artifacts from the bound device-session manifest."
+        },
+        "transform": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version", "parameters"],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "parameters": {
+              "type": "object",
+              "description": "Explicit transform-specific extension bag. Consumers ignore unknown keys only inside this object.",
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "transformLogProvenance": {
+      "description": "Closed metadata for the separate hash-protected publication.transform-log object. This publication-only role cannot collide with a source Device Session log role. Consumers still validate the fetched JSON bytes and their artifact digest procedurally.",
+      "allOf": [
+        {
+          "$ref": "#/$defs/normalizedProvenance"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "transform": {
+              "$ref": "#/$defs/transformLogTransform"
+            }
+          }
+        }
+      ]
+    },
+    "transformLogTransform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "parameters"],
+      "properties": {
+        "name": {
+          "const": "ylx-transform-log"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "parameters": {
+          "$ref": "#/$defs/transformLogParameters"
+        }
+      }
+    },
+    "transformLogParameters": {
+      "type": "object",
+      "description": "Machine-readable execution summary that the external publication.transform-log JSON evidence must record exactly.",
+      "additionalProperties": false,
+      "required": ["command", "tool", "environment", "exit_status"],
+      "properties": {
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "prefixItems": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          ],
+          "items": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "description": "Exact argv vector; no shell re-parsing is implied."
+        },
+        "tool": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version", "build"],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "build": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["build_id", "artifact_sha256"],
+              "properties": {
+                "build_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "artifact_sha256": {
+                  "$ref": "#/$defs/sha256"
+                }
+              }
+            }
+          }
+        },
+        "environment": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 128,
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "description": "Exact environment inputs consumed by the command."
+        },
+        "exit_status": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "signal"],
+          "properties": {
+            "code": {
+              "const": 0
+            },
+            "signal": {
+              "type": "null"
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ylx-transfer"
+version = "0.1.0"
+description = "YLX 录制数据的本地导入与传输应用"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "LicenseRef-Proprietary"
+license-files = ["LICENSE"]
+authors = [{ name = "Pi-DEV" }]
+dependencies = ["boto3>=1.35,<2", "jsonschema[format]>=4.23,<5"]
+
+[project.scripts]
+ylx-transfer = "ylx_transfer.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ylx_transfer = [
+  "schemas/*.json",
+  "static/*.html",
+  "static/*.css",
+  "static/*.js",
+]
+
+[tool.unittest]
+start-directory = "tests"
