@@ -357,7 +357,9 @@ class PublicationTests(unittest.TestCase):
         try:
             with (
                 patch("ylx_transfer.script_publication.os.name", "nt"),
-                patch("ylx_transfer.script_publication.os.fchmod") as fchmod,
+                patch(
+                    "ylx_transfer.script_publication.os.fchmod", create=True
+                ) as fchmod,
                 patch("ylx_transfer.script_publication.os.open") as open_directory,
             ):
                 _secure_mode(descriptor)
