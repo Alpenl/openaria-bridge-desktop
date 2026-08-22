@@ -1,0 +1,80 @@
+{
+  "fixture_schema": "ylx.removable_media.payload_catalog.v1",
+  "payloads": {
+    "raw-mjpeg-three-frames": {
+      "encoding": "hex",
+      "data": "ffd84630ffd9ffd84631ffd9ffd84632ffd9",
+      "size_bytes": 18,
+      "sha256": "aa7b4e88cd4fcef378b2b0016bf20b56711c52c18147ddc21db65ef3228256dd",
+      "note": "Three six-byte JPEG boundary stubs at offsets 0, 6, and 12."
+    },
+    "raw-mjpeg-two-frames": {
+      "encoding": "hex",
+      "data": "ffd84630ffd9ffd84631ffd9",
+      "size_bytes": 12,
+      "sha256": "97fb20ac6ef54c2c91352221a4ca200df3afb9d3dcbab5f71cf939e4f0056675",
+      "note": "Two six-byte JPEG boundary stubs at offsets 0 and 6."
+    },
+    "spool-mjpeg-segment-00000": {
+      "encoding": "utf8",
+      "data": "YLX-FIXTURE-MJPEG-MP4-SEGMENT-00000\n",
+      "size_bytes": 36,
+      "sha256": "bb10fd204eab7438d6cf9dbc7fc72c80fcfa2dfde19da283e5eb8318d55ed2ee"
+    },
+    "spool-mjpeg-short-tail-00001": {
+      "encoding": "utf8",
+      "data": "YLX-FIXTURE-MJPEG-MP4-TAIL-00001\n",
+      "size_bytes": 33,
+      "sha256": "6abfa27f62c50673e5e18c3db284d21c12588641fe09c82fc07872cbb370d715"
+    },
+    "legacy-v5-segment-00000": {
+      "encoding": "utf8",
+      "data": "YLX-FIXTURE-V5-MJPEG-FMP4-SEGMENT-00000\n",
+      "size_bytes": 40,
+      "sha256": "e25760aeed2af2cfc1c6fd730671118dfa11f26c4c160895f59d7f15a2d4f60f"
+    },
+    "legacy-v5-short-tail-00001": {
+      "encoding": "utf8",
+      "data": "YLX-FIXTURE-V5-MJPEG-FMP4-TAIL-00001\n",
+      "size_bytes": 37,
+      "sha256": "bf26cee1f7d8600c9c300cee12e4b3dc31dff012fd46c516bff26b9fa66e6a4b"
+    },
+    "h264-left-00000": {
+      "encoding": "utf8",
+      "data": "YLX-FIXTURE-H264-LEFT-00000\n",
+      "size_bytes": 28,
+      "sha256": "762d15491c3eb5d24b328b1d80922ce898c558a72e1be9013ed2938ff3c3ba6b"
+    },
+    "h264-right-00000": {
+      "encoding": "utf8",
+      "data": "YLX-FIXTURE-H264-RIGHT-00000\n",
+      "size_bytes": 29,
+      "sha256": "f5da13d7bcaaaba850c51a2021b7240f45aac1ccd480f41cd761dbf8e6ff64eb"
+    },
+    "h264-left-same-size-mismatch": {
+      "encoding": "utf8",
+      "data": "YLX-FIXTURE-H264-LEFT-X0000\n",
+      "size_bytes": 28,
+      "sha256": "7c1e10537e59fbceaf6ec905c26351afe60016cafd821e340eb22012bf8a4c64",
+      "note": "Same byte length as h264-left-00000 but a different digest."
+    },
+    "signed-v1-session-json": {
+      "encoding": "utf8",
+      "data": "{\"schema_version\":6,\"session_id\":\"fixture-signed-v1\",\"state\":\"complete\"}",
+      "size_bytes": 72,
+      "sha256": "c9d720b0d31c683fa62308cbd0b8a807530ebe2c2857df8d2ac3b346b3673089"
+    },
+    "signed-v1-capture-commit-json": {
+      "encoding": "utf8",
+      "data": "{\"schema_version\":1,\"session_id\":\"fixture-signed-v1\",\"state\":\"committed\"}",
+      "size_bytes": 73,
+      "sha256": "1b7ce189cbaa2872800e2cda17ea4172a4e538b57916092b5b6af1c073bffd4c"
+    },
+    "imu-three-valid-samples": {
+      "encoding": "utf8",
+      "data": "{\"sample_index\":0,\"timestamp_ns\":1000000000}\n{\"sample_index\":1,\"timestamp_ns\":1033333333}\n{\"sample_index\":2,\"timestamp_ns\":1066666666}\n",
+      "size_bytes": 135,
+      "sha256": "62c9f8ebf1ffa79513d06f04f3ad0fc4ec9866e111122a63ace487f350dfe91d"
+    }
+  }
+}

@@ -1,0 +1,144 @@
+{
+  "fixture_schema": "ylx.removable_media.case_group.v1",
+  "input_kind": "UnsignedPublicationV1",
+  "base_tree": [
+    {
+      "path": "recordings/fixture-unsigned-v1/publication_manifest.json",
+      "kind": "utf8",
+      "content_utf8": "{\"schema_version\":1,\"session_id\":\"fixture-unsigned-v1\",\"revision\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"captured_at\":\"2026-08-01T04:00:00Z\",\"published_at\":\"2026-08-01T04:00:01Z\",\"duration_seconds\":0.1,\"total_bytes\":57,\"video_bytes\":57,\"integrity_ok\":true,\"files\":[{\"id\":\"left-00000\",\"display_path\":\"video/left_00000.mp4\",\"role\":\"video_left\",\"size_bytes\":28,\"sha256\":\"762d15491c3eb5d24b328b1d80922ce898c558a72e1be9013ed2938ff3c3ba6b\",\"media_type\":\"video/mp4\"},{\"id\":\"right-00000\",\"display_path\":\"video/right_00000.mp4\",\"role\":\"video_right\",\"size_bytes\":29,\"sha256\":\"f5da13d7bcaaaba850c51a2021b7240f45aac1ccd480f41cd761dbf8e6ff64eb\",\"media_type\":\"video/mp4\"}]}"
+    },
+    {
+      "path": "recordings/fixture-unsigned-v1/session.json",
+      "kind": "utf8",
+      "content_utf8": "{\"schema_version\":6,\"session_id\":\"fixture-unsigned-v1\",\"camera\":{\"layout\":\"left_right_separate\",\"left_size\":[1920,1080],\"fps\":30,\"video_codec\":\"h264\"}}"
+    },
+    {
+      "path": "recordings/fixture-unsigned-v1/video/left_00000.mp4",
+      "kind": "payload",
+      "payload_id": "h264-left-00000"
+    },
+    {
+      "path": "recordings/fixture-unsigned-v1/video/right_00000.mp4",
+      "kind": "payload",
+      "payload_id": "h264-right-00000"
+    }
+  ],
+  "cases": [
+    {
+      "id": "unsigned-v1-valid-h264-separate",
+      "mutations": [],
+      "expected": {
+        "classification": "UnsignedPublicationV1",
+        "preflight_verdict": "ready_unsigned_requires_policy",
+        "admissible": true,
+        "provenance": "locally_validated_unsigned",
+        "normalization_eligible": true,
+        "automatic_upload_eligible": false,
+        "error_code": null,
+        "codec": "h264",
+        "geometry": "separate_eyes"
+      }
+    },
+    {
+      "id": "unsigned-v1-valid-mjpeg-side-by-side",
+      "mutations": [
+        {
+          "operation": "replace_utf8",
+          "path": "recordings/fixture-unsigned-v1/publication_manifest.json",
+          "content_utf8": "{\"schema_version\":1,\"session_id\":\"fixture-unsigned-v1-mjpeg\",\"revision\":\"sha256:4444444444444444444444444444444444444444444444444444444444444444\",\"captured_at\":\"2026-08-01T04:01:00Z\",\"published_at\":\"2026-08-01T04:01:01Z\",\"duration_seconds\":0.1,\"total_bytes\":36,\"video_bytes\":36,\"integrity_ok\":true,\"files\":[{\"id\":\"stereo-00000\",\"display_path\":\"video/stereo_00000.mp4\",\"role\":\"video_stereo\",\"size_bytes\":36,\"sha256\":\"bb10fd204eab7438d6cf9dbc7fc72c80fcfa2dfde19da283e5eb8318d55ed2ee\",\"media_type\":\"video/mp4\"}]}"
+        },
+        {
+          "operation": "replace_utf8",
+          "path": "recordings/fixture-unsigned-v1/session.json",
+          "content_utf8": "{\"schema_version\":6,\"session_id\":\"fixture-unsigned-v1-mjpeg\",\"camera\":{\"layout\":\"left_right_side_by_side\",\"width\":3840,\"height\":1080,\"fps\":30,\"video_codec\":\"mjpeg\"}}"
+        },
+        { "operation": "remove_entry", "path": "recordings/fixture-unsigned-v1/video/left_00000.mp4" },
+        { "operation": "remove_entry", "path": "recordings/fixture-unsigned-v1/video/right_00000.mp4" },
+        {
+          "operation": "add_entry",
+          "entry": {
+            "path": "recordings/fixture-unsigned-v1/video/stereo_00000.mp4",
+            "kind": "payload",
+            "payload_id": "spool-mjpeg-segment-00000"
+          }
+        }
+      ],
+      "expected": {
+        "classification": "UnsignedPublicationV1",
+        "preflight_verdict": "ready_unsigned_requires_policy",
+        "admissible": true,
+        "provenance": "locally_validated_unsigned",
+        "normalization_eligible": true,
+        "automatic_upload_eligible": false,
+        "error_code": null,
+        "codec": "mjpeg",
+        "geometry": "left_right_side_by_side"
+      }
+    },
+    {
+      "id": "unsigned-v1-half-present-signature",
+      "mutations": [
+        {
+          "operation": "add_entry",
+          "entry": {
+            "path": "recordings/fixture-unsigned-v1/publication_manifest.sig",
+            "kind": "utf8",
+            "content_utf8": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+          }
+        }
+      ],
+      "expected": {
+        "classification": "Rejected",
+        "preflight_verdict": "corrupt",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "invalid_manifest",
+        "must_not_downgrade_to_unsigned": true
+      }
+    },
+    {
+      "id": "unsigned-v1-half-present-public-key",
+      "mutations": [
+        {
+          "operation": "add_entry",
+          "entry": {
+            "path": "recordings/fixture-unsigned-v1/publication_public_key.hex",
+            "kind": "utf8",
+            "content_utf8": "0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        }
+      ],
+      "expected": {
+        "classification": "Rejected",
+        "preflight_verdict": "corrupt",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "invalid_manifest",
+        "must_not_downgrade_to_unsigned": true
+      }
+    },
+    {
+      "id": "unsigned-v1-unsupported-codec",
+      "mutations": [
+        {
+          "operation": "replace_utf8",
+          "path": "recordings/fixture-unsigned-v1/session.json",
+          "content_utf8": "{\"schema_version\":6,\"session_id\":\"fixture-unsigned-v1\",\"camera\":{\"layout\":\"left_right_separate\",\"left_size\":[1920,1080],\"fps\":30,\"video_codec\":\"vp9\"}}"
+        }
+      ],
+      "expected": {
+        "classification": "Rejected",
+        "preflight_verdict": "unsupported_schema",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "unknown_schema"
+      }
+    }
+  ]
+}

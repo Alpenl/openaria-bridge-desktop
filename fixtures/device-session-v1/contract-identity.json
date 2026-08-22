@@ -1,0 +1,277 @@
+{
+  "schema": "openaria.bridge.desktop.vendored-device-session-contracts.v1",
+  "source_snapshot": "1f026c9d0273186acc35f465014aa25029bd6863",
+  "source_note": "Curated Open Aria Device Session consumer snapshot; provenance is the snapshot id plus per-file SHA-256.",
+  "local_authority": "per_file_sha256",
+  "contract_file_count": 32,
+  "contract_files": [
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.adjacent-drop-events.json",
+      "sha256": "96bb4fdce0b8649a9e8929a4bb34afaf82f25a02ee7b515075da15236e4d4055"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.duplicate-artifact-path.json",
+      "sha256": "03dcff13965c18a80580e2ed7d5b2007251c35ff73daa83d0fbb0f466984d5ea"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.effective-fps-mismatch.json",
+      "sha256": "e8e9141f8c95a2c6c65e4f2e44f0317b206b1fa82800ef5db07b5ea67329082b"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.frame-count-mismatch.json",
+      "sha256": "af8996e32c192377e2e940b4357d43b6a9e7b47bfb767f0776bfae8706ab4199"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.role-media-type-mismatch.json",
+      "sha256": "310621f3fc6bc354d60a7f8259a02805c26592e8597d4ca3bcdd0d9351b8fc48"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.sealed-before-verification.json",
+      "sha256": "5881ca9815ff576bf38a6024823d8b6e502df11f3d1fd04a479b75a6d30f85a5"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.successor-without-predecessor.json",
+      "sha256": "2e4dac6142b60b9bc370900f39b12225ba21ce64406bfe90621faea8e111113a"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.unsafe-path-segments.json",
+      "sha256": "1274925acabb97fefad0639a5708ca43a32f9c6341a540d0f90120421556baf3"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.unsealed.json",
+      "sha256": "181f60e09a4bd0b548005e5919f773440de93ca0c386d2345150e75279222e9d"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-channel-payload-mismatch.json",
+      "sha256": "1f1981d9f696f33bfe7ac61ddcbbe8367fb4ec5ecc3127ba5cf259119ed932af"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-file-bytes-mismatch.json",
+      "sha256": "10238783346dd3aa79d393aacb63df2686a9433bdc66dc21974ada56d0eb8dc3"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-header-file-inconsistency.json",
+      "sha256": "f03743a4bc841fd5ebe9ee1751d799e87c0a9e90c2166867c55bc2fd8d0a9d9b"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-not-recorded-extra-artifact.json",
+      "sha256": "8d9fc18b2151608098bfed20dd0a39a73e846e6ea66dffd1681570941ee48802"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-recorded-missing-artifact.json",
+      "sha256": "c7efe4cbefdbb392d14e4c6a690bbece64f49b4124c3345cc681fad5d2e710a1"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-sample-count-mismatch.json",
+      "sha256": "68b394a92df5cca957e52256f4a09a1f24481fcb2b34a4e17d8f6c54add8ffc9"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-sample-rate-time-mismatch.json",
+      "sha256": "66ed20ae391425e698448344af692bcc90358d13a425e53979acfee88830b8eb"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-segment-gap.json",
+      "sha256": "8b8022f04549c39c9e72b1ce8a5cb87b61541ca95b7f87b1be7e94eeca781943"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-segment-sample-time-mismatch.json",
+      "sha256": "560bc93485ad051093ce818fa9aba5185be0c70ff32067e1fd00a98d04785dad"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-sync-out-of-bounds.json",
+      "sha256": "9a9d5d02565e9995e02c572850ab187f3d3982a7bc834cefc29a5d04ece3b07e"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-zero-recorded-domain.json",
+      "sha256": "c3fd07815c04987a05bd35d7b42c1276533c19e9ff22672ab5672540e7c3df25"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.duplicate-audio-path.json",
+      "sha256": "0d38d984b71a1bea59af63f112565a6dc6cbcc548b76fb30676eeaa7607718be"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.missing-audio.json",
+      "sha256": "844e81e7d8d8245a67152dbf8963feab1dc0890d9f92cc11f2c109981659dbf6"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.raw-imu-opencv-frame.json",
+      "sha256": "06ad04453e4eb04d30ed6159f8922598a248f5ddbbe73c0aae9832d9b849a095"
+    },
+    {
+      "path": "contracts/fixtures/valid/ylx-device-session-v1.continuation.json",
+      "sha256": "4f8e957ddb9d65f4ddaa34585e53010ec821dd2fa61b0af761581a88424bc905"
+    },
+    {
+      "path": "contracts/fixtures/valid/ylx-device-session-v1.json",
+      "sha256": "7e53429e512f12d8b6aa2b1794b73c1790792e738df44d20e5487a69d6412815"
+    },
+    {
+      "path": "contracts/fixtures/valid/ylx-device-session-v1.multi-segment.json",
+      "sha256": "79b133cdb865949e650a642ecc41ca6efa970658d691505f268821d1c79c5feb"
+    },
+    {
+      "path": "contracts/fixtures/valid/ylx-device-session-v1.raw-side-by-side.json",
+      "sha256": "d67ed9d7d03d1b538029d25389a699ad4fcd39f86d28398bc325632e03db6403"
+    },
+    {
+      "path": "contracts/fixtures/valid/ylx-device-session-v2.audio-not-recorded.json",
+      "sha256": "d4b7a5b400d3678e74b3e97b25cdd50dfff4a7fee72a17e5bec38e2aa53f4232"
+    },
+    {
+      "path": "contracts/fixtures/valid/ylx-device-session-v2.audio-recorded-multi-segment.json",
+      "sha256": "3d9773099e8e77c41052f064a5b4d5e4a7ddb8d726151dca807ca41e37e9a42a"
+    },
+    {
+      "path": "contracts/fixtures/valid/ylx-device-session-v2.audio-recorded.json",
+      "sha256": "00dfeec7fba9285423065cef0789c3e71b5f1f6a5c0412ac803e31e301bf727e"
+    },
+    {
+      "path": "contracts/schemas/ylx-device-session-v1.schema.json",
+      "sha256": "9292820ba81b518c17fd580de49bfd1c92a3519242abf4eb29bbe05f96a02b9c"
+    },
+    {
+      "path": "contracts/schemas/ylx-device-session-v2.schema.json",
+      "sha256": "8dc6096981f3fc50f9b4418000431955e0ba9424c7c0257cd2e129251a6a715b"
+    }
+  ],
+  "schemas": [
+    {
+      "path": "contracts/schemas/ylx-device-session-v1.schema.json",
+      "sha256": "9292820ba81b518c17fd580de49bfd1c92a3519242abf4eb29bbe05f96a02b9c",
+      "discriminator": "ylx.device-session.v1"
+    },
+    {
+      "path": "contracts/schemas/ylx-device-session-v2.schema.json",
+      "sha256": "8dc6096981f3fc50f9b4418000431955e0ba9424c7c0257cd2e129251a6a715b",
+      "discriminator": "ylx.device-session.v2"
+    }
+  ],
+  "valid_fixtures": [
+    {
+      "path": "contracts/fixtures/valid/ylx-device-session-v1.continuation.json",
+      "sha256": "4f8e957ddb9d65f4ddaa34585e53010ec821dd2fa61b0af761581a88424bc905"
+    },
+    {
+      "path": "contracts/fixtures/valid/ylx-device-session-v1.json",
+      "sha256": "7e53429e512f12d8b6aa2b1794b73c1790792e738df44d20e5487a69d6412815"
+    },
+    {
+      "path": "contracts/fixtures/valid/ylx-device-session-v1.multi-segment.json",
+      "sha256": "79b133cdb865949e650a642ecc41ca6efa970658d691505f268821d1c79c5feb"
+    },
+    {
+      "path": "contracts/fixtures/valid/ylx-device-session-v1.raw-side-by-side.json",
+      "sha256": "d67ed9d7d03d1b538029d25389a699ad4fcd39f86d28398bc325632e03db6403"
+    },
+    {
+      "path": "contracts/fixtures/valid/ylx-device-session-v2.audio-not-recorded.json",
+      "sha256": "d4b7a5b400d3678e74b3e97b25cdd50dfff4a7fee72a17e5bec38e2aa53f4232"
+    },
+    {
+      "path": "contracts/fixtures/valid/ylx-device-session-v2.audio-recorded-multi-segment.json",
+      "sha256": "3d9773099e8e77c41052f064a5b4d5e4a7ddb8d726151dca807ca41e37e9a42a"
+    },
+    {
+      "path": "contracts/fixtures/valid/ylx-device-session-v2.audio-recorded.json",
+      "sha256": "00dfeec7fba9285423065cef0789c3e71b5f1f6a5c0412ac803e31e301bf727e"
+    }
+  ],
+  "invalid_fixtures": [
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.adjacent-drop-events.json",
+      "sha256": "96bb4fdce0b8649a9e8929a4bb34afaf82f25a02ee7b515075da15236e4d4055"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.duplicate-artifact-path.json",
+      "sha256": "03dcff13965c18a80580e2ed7d5b2007251c35ff73daa83d0fbb0f466984d5ea"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.effective-fps-mismatch.json",
+      "sha256": "e8e9141f8c95a2c6c65e4f2e44f0317b206b1fa82800ef5db07b5ea67329082b"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.frame-count-mismatch.json",
+      "sha256": "af8996e32c192377e2e940b4357d43b6a9e7b47bfb767f0776bfae8706ab4199"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.role-media-type-mismatch.json",
+      "sha256": "310621f3fc6bc354d60a7f8259a02805c26592e8597d4ca3bcdd0d9351b8fc48"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.sealed-before-verification.json",
+      "sha256": "5881ca9815ff576bf38a6024823d8b6e502df11f3d1fd04a479b75a6d30f85a5"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.successor-without-predecessor.json",
+      "sha256": "2e4dac6142b60b9bc370900f39b12225ba21ce64406bfe90621faea8e111113a"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.unsafe-path-segments.json",
+      "sha256": "1274925acabb97fefad0639a5708ca43a32f9c6341a540d0f90120421556baf3"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v1.unsealed.json",
+      "sha256": "181f60e09a4bd0b548005e5919f773440de93ca0c386d2345150e75279222e9d"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-channel-payload-mismatch.json",
+      "sha256": "1f1981d9f696f33bfe7ac61ddcbbe8367fb4ec5ecc3127ba5cf259119ed932af"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-file-bytes-mismatch.json",
+      "sha256": "10238783346dd3aa79d393aacb63df2686a9433bdc66dc21974ada56d0eb8dc3"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-header-file-inconsistency.json",
+      "sha256": "f03743a4bc841fd5ebe9ee1751d799e87c0a9e90c2166867c55bc2fd8d0a9d9b"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-not-recorded-extra-artifact.json",
+      "sha256": "8d9fc18b2151608098bfed20dd0a39a73e846e6ea66dffd1681570941ee48802"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-recorded-missing-artifact.json",
+      "sha256": "c7efe4cbefdbb392d14e4c6a690bbece64f49b4124c3345cc681fad5d2e710a1"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-sample-count-mismatch.json",
+      "sha256": "68b394a92df5cca957e52256f4a09a1f24481fcb2b34a4e17d8f6c54add8ffc9"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-sample-rate-time-mismatch.json",
+      "sha256": "66ed20ae391425e698448344af692bcc90358d13a425e53979acfee88830b8eb"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-segment-gap.json",
+      "sha256": "8b8022f04549c39c9e72b1ce8a5cb87b61541ca95b7f87b1be7e94eeca781943"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-segment-sample-time-mismatch.json",
+      "sha256": "560bc93485ad051093ce818fa9aba5185be0c70ff32067e1fd00a98d04785dad"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-sync-out-of-bounds.json",
+      "sha256": "9a9d5d02565e9995e02c572850ab187f3d3982a7bc834cefc29a5d04ece3b07e"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.audio-zero-recorded-domain.json",
+      "sha256": "c3fd07815c04987a05bd35d7b42c1276533c19e9ff22672ab5672540e7c3df25"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.duplicate-audio-path.json",
+      "sha256": "0d38d984b71a1bea59af63f112565a6dc6cbcc548b76fb30676eeaa7607718be"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.missing-audio.json",
+      "sha256": "844e81e7d8d8245a67152dbf8963feab1dc0890d9f92cc11f2c109981659dbf6"
+    },
+    {
+      "path": "contracts/fixtures/invalid/ylx-device-session-v2.raw-imu-opencv-frame.json",
+      "sha256": "06ad04453e4eb04d30ed6159f8922598a248f5ddbbe73c0aae9832d9b849a095"
+    }
+  ],
+  "runtime_gate": {
+    "schemas": "Embedded in the transfer detector and validated by Rust tests.",
+    "reference_files": "Reference-only conformance material; no script from the snapshot is executed at runtime."
+  }
+}

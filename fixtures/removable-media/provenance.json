@@ -1,0 +1,227 @@
+{
+  "fixture_schema": "ylx.removable_media.fixture_provenance.v1",
+  "provenance_policy": {
+    "origin": "repository_authored_synthetic_contract_fixture",
+    "capture_date": null,
+    "source_device": null,
+    "source_software": "contract_fixture_materializer_v1",
+    "sanitized": true,
+    "redistribution": "repository_test_only",
+    "raw_material_retained": false,
+    "raw_digest": null,
+    "digest_note": "The repository stores virtual trees and boundary-byte payloads, not source-card media. The harness computes a materialized tree digest before each run.",
+    "quality_evidence_status": "not_a_quality_corpus"
+  },
+  "fixtures": [
+    {
+      "id": "signed-v1-valid-explicit-anchor",
+      "case_file": "cases/signed-publication-v1.json",
+      "case_id": "signed-v1-valid-explicit-anchor",
+      "expected_verdict": "ready_signed",
+      "provenance_variant": "device_signed"
+    },
+    {
+      "id": "signed-v1-valid-unpaired",
+      "case_file": "cases/signed-publication-v1.json",
+      "case_id": "signed-v1-valid-unpaired",
+      "expected_verdict": "waiting_for_pairing_key",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "signed-v1-hash-mismatch-same-size",
+      "case_file": "cases/signed-publication-v1.json",
+      "case_id": "signed-v1-hash-mismatch-same-size",
+      "expected_verdict": "corrupt",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "signed-v1-unsafe-parent-path",
+      "case_file": "cases/signed-publication-v1.json",
+      "case_id": "signed-v1-unsafe-parent-path",
+      "expected_verdict": "unsafe_path",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "signed-v1-symlink-entry",
+      "case_file": "cases/signed-publication-v1.json",
+      "case_id": "signed-v1-symlink-entry",
+      "expected_verdict": "unsafe_path",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "signed-v1-reparse-entry",
+      "case_file": "cases/signed-publication-v1.json",
+      "case_id": "signed-v1-reparse-entry",
+      "expected_verdict": "unsafe_path",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "complete-unpublished-v6-valid",
+      "case_file": "cases/complete-unpublished-v6.json",
+      "case_id": "complete-unpublished-v6-valid",
+      "expected_verdict": "ready_unsigned_requires_policy",
+      "provenance_variant": "locally_validated_unsigned"
+    },
+    {
+      "id": "spool-v6-valid-closed-short-tail",
+      "case_file": "cases/appliance-spool-v6.json",
+      "case_id": "spool-v6-valid-closed-short-tail",
+      "expected_verdict": "ready_unsigned_requires_policy",
+      "provenance_variant": "locally_validated_unsigned"
+    },
+    {
+      "id": "spool-v6-missing-segment",
+      "case_file": "cases/appliance-spool-v6.json",
+      "case_id": "spool-v6-missing-segment",
+      "expected_verdict": "corrupt",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "spool-v6-duplicate-segment",
+      "case_file": "cases/appliance-spool-v6.json",
+      "case_id": "spool-v6-duplicate-segment",
+      "expected_verdict": "corrupt",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "spool-v6-unclosed-tail",
+      "case_file": "cases/appliance-spool-v6.json",
+      "case_id": "spool-v6-unclosed-tail",
+      "expected_verdict": "recording_or_encoding_incomplete",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "spool-v6-capture-commit-conflict",
+      "case_file": "cases/appliance-spool-v6.json",
+      "case_id": "spool-v6-capture-commit-conflict",
+      "expected_verdict": "corrupt",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "spool-v6-encoding-interrupted",
+      "case_file": "cases/appliance-spool-v6.json",
+      "case_id": "spool-v6-encoding-interrupted",
+      "expected_verdict": "recording_or_encoding_incomplete",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "raw-v2-valid-30fps",
+      "case_file": "cases/raw-capture-v2.json",
+      "case_id": "raw-v2-valid-30fps",
+      "expected_verdict": "ready_unsigned_requires_policy",
+      "provenance_variant": "locally_validated_unsigned"
+    },
+    {
+      "id": "raw-v2-valid-60fps",
+      "case_file": "cases/raw-capture-v2.json",
+      "case_id": "raw-v2-valid-60fps",
+      "expected_verdict": "ready_unsigned_requires_policy",
+      "provenance_variant": "locally_validated_unsigned"
+    },
+    {
+      "id": "raw-v2-failed-result",
+      "case_file": "cases/raw-capture-v2.json",
+      "case_id": "raw-v2-failed-result",
+      "expected_verdict": "recording_or_encoding_incomplete",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "raw-v2-bad-jpeg-offset",
+      "case_file": "cases/raw-capture-v2.json",
+      "case_id": "raw-v2-bad-jpeg-offset",
+      "expected_verdict": "corrupt",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "raw-v2-frame-sequence-gap",
+      "case_file": "cases/raw-capture-v2.json",
+      "case_id": "raw-v2-frame-sequence-gap",
+      "expected_verdict": "corrupt",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "raw-v2-imu-timestamp-error",
+      "case_file": "cases/raw-capture-v2.json",
+      "case_id": "raw-v2-imu-timestamp-error",
+      "expected_verdict": "corrupt",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "legacy-v5-valid-pts-reset-short-tail",
+      "case_file": "cases/legacy-mjpeg-session-v5.json",
+      "case_id": "legacy-v5-valid-pts-reset-short-tail",
+      "expected_verdict": "ready_unsigned_requires_policy",
+      "provenance_variant": "locally_validated_unsigned"
+    },
+    {
+      "id": "legacy-v5-segment-sequence-gap",
+      "case_file": "cases/legacy-mjpeg-session-v5.json",
+      "case_id": "legacy-v5-segment-sequence-gap",
+      "expected_verdict": "corrupt",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "legacy-v4-unsupported",
+      "case_file": "cases/legacy-mjpeg-session-v5.json",
+      "case_id": "legacy-v4-unsupported",
+      "expected_verdict": "unsupported_schema",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "recovery-active-interrupted",
+      "case_file": "cases/rejections.json",
+      "case_id": "recovery-active-interrupted",
+      "expected_verdict": "recording_or_encoding_incomplete",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "recovery-malformed-session-json",
+      "case_file": "cases/rejections.json",
+      "case_id": "recovery-malformed-session-json",
+      "expected_verdict": "corrupt",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "recovery-unknown-major-schema",
+      "case_file": "cases/rejections.json",
+      "case_id": "recovery-unknown-major-schema",
+      "expected_verdict": "unsupported_schema",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "unsigned-v1-valid-h264-separate",
+      "case_file": "cases/unsigned-publication-v1.json",
+      "case_id": "unsigned-v1-valid-h264-separate",
+      "expected_verdict": "ready_unsigned_requires_policy",
+      "provenance_variant": "locally_validated_unsigned"
+    },
+    {
+      "id": "unsigned-v1-valid-mjpeg-side-by-side",
+      "case_file": "cases/unsigned-publication-v1.json",
+      "case_id": "unsigned-v1-valid-mjpeg-side-by-side",
+      "expected_verdict": "ready_unsigned_requires_policy",
+      "provenance_variant": "locally_validated_unsigned"
+    },
+    {
+      "id": "unsigned-v1-half-present-signature",
+      "case_file": "cases/unsigned-publication-v1.json",
+      "case_id": "unsigned-v1-half-present-signature",
+      "expected_verdict": "corrupt",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "unsigned-v1-half-present-public-key",
+      "case_file": "cases/unsigned-publication-v1.json",
+      "case_id": "unsigned-v1-half-present-public-key",
+      "expected_verdict": "corrupt",
+      "provenance_variant": "unverified"
+    },
+    {
+      "id": "unsigned-v1-unsupported-codec",
+      "case_file": "cases/unsigned-publication-v1.json",
+      "case_id": "unsigned-v1-unsupported-codec",
+      "expected_verdict": "unsupported_schema",
+      "provenance_variant": "unverified"
+    }
+  ]
+}

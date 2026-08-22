@@ -1,0 +1,219 @@
+{
+  "fixture_schema": "ylx.removable_media.case_group.v1",
+  "input_kind": "LegacyMjpegSessionV5",
+  "base_tree": [
+    {
+      "path": "YLX_RECORDINGS/fixture-legacy-v5/session.json",
+      "kind": "json",
+      "document": {
+        "schema_version": 5,
+        "session_id": "fixture-legacy-v5",
+        "state": "complete",
+        "native_capture_ok": true,
+        "mux_ok": true,
+        "camera": { "layout": "left_right_side_by_side", "width": 3840, "height": 1080, "eye_width": 1920, "fps": 30 },
+        "video_role": "video_mono",
+        "video_codec": "mjpeg",
+        "video_encoder": "copy",
+        "video_container": "fragmented_mp4",
+        "video_segments": [
+          {
+            "index": 0,
+            "path": "video/segment_00000.mp4",
+            "frame_count": 3,
+            "duration_seconds": 0.1,
+            "size_bytes": 40
+          },
+          {
+            "index": 1,
+            "path": "video/segment_00001.mp4",
+            "frame_count": 1,
+            "duration_seconds": 0.033333333,
+            "size_bytes": 37
+          }
+        ]
+      }
+    },
+    {
+      "path": "YLX_RECORDINGS/fixture-legacy-v5/video/segment_00000.mp4",
+      "kind": "payload",
+      "payload_id": "legacy-v5-segment-00000"
+    },
+    {
+      "path": "YLX_RECORDINGS/fixture-legacy-v5/video/segment_00001.mp4",
+      "kind": "payload",
+      "payload_id": "legacy-v5-short-tail-00001"
+    },
+    {
+      "path": "YLX_RECORDINGS/fixture-legacy-v5/raw/frames.jsonl",
+      "kind": "utf8",
+      "content_utf8": "{\"frame_index\":0,\"capture_sequence\":0,\"timestamp_ns\":1000000000}\n{\"frame_index\":1,\"capture_sequence\":1,\"timestamp_ns\":1033333333}\n{\"frame_index\":2,\"capture_sequence\":2,\"timestamp_ns\":1066666666}\n{\"frame_index\":3,\"capture_sequence\":3,\"timestamp_ns\":1099999999}\n"
+    },
+    {
+      "path": "YLX_RECORDINGS/fixture-legacy-v5/raw/imu.jsonl",
+      "kind": "payload",
+      "payload_id": "imu-three-valid-samples"
+    }
+  ],
+  "probe_evidence": [
+    {
+      "path": "video/segment_00000.mp4",
+      "codec": "mjpeg",
+      "container": "fragmented_mp4",
+      "width": 3840,
+      "height": 1080,
+      "fps": 30,
+      "frame_count": 3,
+      "duration_seconds": 0.1,
+      "pts_seconds": [0.0, 0.033333333, 0.066666666],
+      "stub": true
+    },
+    {
+      "path": "video/segment_00001.mp4",
+      "codec": "mjpeg",
+      "container": "fragmented_mp4",
+      "width": 3840,
+      "height": 1080,
+      "fps": 30,
+      "frame_count": 1,
+      "duration_seconds": 0.033333333,
+      "pts_seconds": [0.0],
+      "pts_reset": true,
+      "short_final_segment": true,
+      "stub": true
+    }
+  ],
+  "cases": [
+    {
+      "id": "legacy-v5-valid-pts-reset-short-tail",
+      "mutations": [],
+      "expected": {
+        "classification": "LegacyMjpegSessionV5",
+        "preflight_verdict": "ready_unsigned_requires_policy",
+        "admissible": true,
+        "source_kind": "legacy_removable_media",
+        "provenance": "locally_validated_unsigned",
+        "normalization_eligible": true,
+        "automatic_upload_eligible": false,
+        "error_code": null,
+        "role_is_not_geometry": true,
+        "layout": "left_right_side_by_side",
+        "segment_pts_mode": "reset_each_segment",
+        "timeline_basis": "raw/frames.jsonl",
+        "timeline_frame_count": 4,
+        "segment_timeline_starts_seconds": [0.0, 0.1],
+        "short_final_segment_index": 1
+      }
+    },
+    {
+      "id": "legacy-v5-segment-sequence-gap",
+      "mutations": [
+        {
+          "operation": "replace_json",
+          "path": "YLX_RECORDINGS/fixture-legacy-v5/session.json",
+          "document": {
+            "schema_version": 5,
+            "session_id": "fixture-legacy-v5",
+            "state": "complete",
+            "native_capture_ok": true,
+            "mux_ok": true,
+            "camera": {
+              "layout": "left_right_side_by_side",
+              "width": 3840,
+              "height": 1080,
+              "eye_width": 1920,
+              "fps": 30
+            },
+            "video_role": "video_mono",
+            "video_codec": "mjpeg",
+            "video_encoder": "copy",
+            "video_container": "fragmented_mp4",
+            "video_segments": [
+              {
+                "index": 0,
+                "path": "video/segment_00000.mp4",
+                "frame_count": 3,
+                "duration_seconds": 0.1,
+                "size_bytes": 40
+              },
+              {
+                "index": 2,
+                "path": "video/segment_00002.mp4",
+                "frame_count": 1,
+                "duration_seconds": 0.033333333,
+                "size_bytes": 37
+              }
+            ]
+          }
+        },
+        { "operation": "remove_entry", "path": "YLX_RECORDINGS/fixture-legacy-v5/video/segment_00001.mp4" },
+        {
+          "operation": "add_entry",
+          "entry": {
+            "path": "YLX_RECORDINGS/fixture-legacy-v5/video/segment_00002.mp4",
+            "kind": "payload",
+            "payload_id": "legacy-v5-short-tail-00001"
+          }
+        }
+      ],
+      "expected": {
+        "classification": "RecoveryOnly",
+        "preflight_verdict": "corrupt",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "segment_sequence_gap",
+        "expected_segment_index": 1,
+        "observed_segment_index": 2
+      }
+    },
+    {
+      "id": "legacy-v4-unsupported",
+      "mutations": [
+        {
+          "operation": "replace_json",
+          "path": "YLX_RECORDINGS/fixture-legacy-v5/session.json",
+          "document": {
+            "schema_version": 4,
+            "session_id": "fixture-legacy-v4",
+            "state": "complete",
+            "native_capture_ok": true,
+            "mux_ok": true,
+            "camera": {
+              "layout": "left_right_side_by_side",
+              "width": 3840,
+              "height": 1080,
+              "eye_width": 1920,
+              "fps": 30
+            },
+            "video_role": "video_mono",
+            "video_codec": "mjpeg",
+            "video_encoder": "copy",
+            "video_container": "fragmented_mp4",
+            "video_segments": [
+              {
+                "index": 0,
+                "path": "video/segment_00000.mp4",
+                "frame_count": 3,
+                "duration_seconds": 0.1,
+                "size_bytes": 40
+              }
+            ]
+          }
+        }
+      ],
+      "expected": {
+        "classification": "UnsupportedLegacy",
+        "preflight_verdict": "unsupported_schema",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "unsupported_legacy_schema",
+        "schema_version": 4,
+        "must_not_assume_v5": true
+      }
+    }
+  ]
+}

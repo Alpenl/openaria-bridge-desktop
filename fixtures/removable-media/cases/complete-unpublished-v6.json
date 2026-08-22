@@ -1,0 +1,133 @@
+{
+  "fixture_schema": "ylx.removable_media.case_group.v1",
+  "input_kind": "CompleteUnpublished",
+  "base_tree": [
+    {
+      "path": "recordings/fixture-complete-unpublished-v6/session.json",
+      "kind": "json",
+      "document": {
+        "schema_version": 6,
+        "session_id": "fixture-complete-unpublished-v6",
+        "state": "complete",
+        "integrity_ok": true,
+        "captured_at": "2026-08-01T01:00:00Z",
+        "camera": { "layout": "left_right_separate", "eye_width": 1920, "height": 1080, "fps": 30 },
+        "video_codec": "h264",
+        "video_segments": [
+          {
+            "role": "video_left",
+            "index": 0,
+            "path": "video/left_00000.mp4",
+            "frame_count": 3,
+            "duration_seconds": 0.1
+          },
+          {
+            "role": "video_right",
+            "index": 0,
+            "path": "video/right_00000.mp4",
+            "frame_count": 3,
+            "duration_seconds": 0.1
+          }
+        ]
+      }
+    },
+    {
+      "path": "recordings/fixture-complete-unpublished-v6/capture.commit.json",
+      "kind": "json",
+      "document": {
+        "schema_version": 1,
+        "session_id": "fixture-complete-unpublished-v6",
+        "state": "committed",
+        "native_capture_ok": true,
+        "mux_ok": true,
+        "source_segment_count": 1,
+        "source_frame_count": 3
+      }
+    },
+    {
+      "path": "recordings/fixture-complete-unpublished-v6/encoding.json",
+      "kind": "json",
+      "document": {
+        "schema_version": 1,
+        "session_id": "fixture-complete-unpublished-v6",
+        "state": "complete",
+        "integrity_ok": true,
+        "source_segments": [{ "index": 0, "frame_count": 3, "closed": true }],
+        "outputs": [
+          {
+            "role": "video_left",
+            "index": 0,
+            "path": "video/left_00000.mp4",
+            "size_bytes": 28,
+            "sha256": "762d15491c3eb5d24b328b1d80922ce898c558a72e1be9013ed2938ff3c3ba6b",
+            "full_decode_ok": true
+          },
+          {
+            "role": "video_right",
+            "index": 0,
+            "path": "video/right_00000.mp4",
+            "size_bytes": 29,
+            "sha256": "f5da13d7bcaaaba850c51a2021b7240f45aac1ccd480f41cd761dbf8e6ff64eb",
+            "full_decode_ok": true
+          }
+        ]
+      }
+    },
+    {
+      "path": "recordings/fixture-complete-unpublished-v6/video/left_00000.mp4",
+      "kind": "payload",
+      "payload_id": "h264-left-00000"
+    },
+    {
+      "path": "recordings/fixture-complete-unpublished-v6/video/right_00000.mp4",
+      "kind": "payload",
+      "payload_id": "h264-right-00000"
+    },
+    {
+      "path": "recordings/fixture-complete-unpublished-v6/raw/imu.jsonl",
+      "kind": "payload",
+      "payload_id": "imu-three-valid-samples"
+    }
+  ],
+  "probe_evidence": [
+    {
+      "path": "video/left_00000.mp4",
+      "codec": "h264",
+      "pixel_format": "yuv420p",
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "frame_count": 3,
+      "duration_seconds": 0.1,
+      "full_decode_ok": true,
+      "stub": true
+    },
+    {
+      "path": "video/right_00000.mp4",
+      "codec": "h264",
+      "pixel_format": "yuv420p",
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "frame_count": 3,
+      "duration_seconds": 0.1,
+      "full_decode_ok": true,
+      "stub": true
+    }
+  ],
+  "cases": [
+    {
+      "id": "complete-unpublished-v6-valid",
+      "mutations": [],
+      "expected": {
+        "classification": "CompleteUnpublished",
+        "preflight_verdict": "ready_unsigned_requires_policy",
+        "admissible": true,
+        "provenance": "locally_validated_unsigned",
+        "normalization_eligible": true,
+        "automatic_upload_eligible": false,
+        "error_code": null
+      }
+    }
+  ]
+}

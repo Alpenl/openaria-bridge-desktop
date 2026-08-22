@@ -1,0 +1,14 @@
+{
+  "fixture_schema": "ylx.removable_media.test_trust_anchor.v1",
+  "anchor_id": "fixture-ed25519-2026-08-v1",
+  "algorithm": "Ed25519",
+  "public_key_encoding": "raw_lowercase_hex",
+  "public_key_hex": "0d05fa031442e28f04e0714fa94cfd3815a6e2b18e3f866a5967b82b5b1e6662",
+  "fingerprint": "sha256:cdcea9f6bd158de587001da63b02a90e7564ce84785fb3b85fe6f5ab3479c671",
+  "scope": "TEST_ONLY",
+  "private_key_committed": false,
+  "trust_establishment": "EXPLICIT_TEST_HARNESS_INJECTION_REQUIRED",
+  "must_never_be_loaded_by_production": true,
+  "must_never_be_inferred_from_materialized_media": true,
+  "note": "This is a deterministic fixture identity, not a device or production root."
+}

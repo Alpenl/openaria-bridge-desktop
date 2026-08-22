@@ -1,0 +1,67 @@
+[package]
+name = "ylx-transfer-core"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+description = "YLX Transfer PC core domain/persistence crate — no Tauri, reqwest, mDNS, S3, or keyring dependency."
+
+[lib]
+name = "ylx_transfer_core"
+path = "src/lib.rs"
+
+[features]
+# Exposes `library::download_contract` (the shared `DownloadSource`
+# contract suite) to *dependent* crates' test builds — `ylx-transfer-
+# adapters` runs it against the real `PiDownloadSource`. Off by default,
+# so the app binary never links this test scaffolding.
+test-support = []
+# Compiles `testing` (deterministic concurrency test helpers: rendezvous,
+# deferred one-shot, fake clock, fault point, recording sink) for
+# dependants' integration tests. Off by default; never enabled in a
+# production build.
+testing = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+jsonschema = { version = "0.50", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+# `sha2` is pure Rust (no
+# C toolchain, unlike `rusqlite`'s `bundled` feature), used only to compute
+# the real SHA-256 of a finished `.part` file before it is atomically
+# committed — this is a genuine security-relevant integrity check (plan
+# section 9.2 step 5), not a placeholder, so a fake/non-cryptographic hash
+# (as `library/object_store_port.rs`'s mock ETag deliberately uses) would
+# defeat the point of this module.
+sha2 = { workspace = true }
+libc = "0.2"
+
+# Random, opaque, restart-safe job identifiers (`transfer::coordinator`'s
+# `next_job_id`). The root Tauri app already depends on `uuid`; only the
+# `v4` (random) generator is enabled here — no OS/network/time-based
+# variants, so this adds no new syscall or dependency surface to a crate
+# that must stay free of tauri/reqwest/mDNS/S3/keyring deps.
+uuid = { workspace = true }
+
+# --- Commit 51 addition (secret.rs only) ---
+# `zeroize`: the well-maintained, widely-audited RustCrypto primitive for
+# scrubbing secret material out of memory with a `volatile_write` +
+# `compiler_fence` sequence the optimizer is not allowed to elide. It
+# replaces this crate's previous hand-rolled `write_volatile` loop in
+# `credential_vault::Secret`. Pure Rust, zero transitive dependencies (the
+# optional `zeroize_derive` proc-macro feature is deliberately left off),
+# and already present in the shared workspace lockfile as a transitive
+# dependency of `keyring`/`rustls`, so it adds no new crate to the graph.
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Used by library/download.rs's tests and tests/download_http_spike.rs.
+# Test-only fake HTTP server, same crate/version/license already accepted
+# for ylx-transfer-adapters — used here only to prove the Range-response
+# parsing logic against real bytes on a real loopback socket, not just
+# hand-crafted header strings. Never compiled into a non-test build.
+tiny_http = { workspace = true }

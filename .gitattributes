@@ -1,0 +1,5 @@
+# This shared contract is compared byte-for-byte by the Rust DTO tests.
+/fixtures/rpc/application_contract.json text eol=lf
+
+# These vendored device-session contract fixtures are hash-checked byte-for-byte.
+/fixtures/device-session-v1/central/** text eol=lf

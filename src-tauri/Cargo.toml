@@ -1,0 +1,82 @@
+[workspace]
+members = [".", "crates/ylx-transfer-core", "crates/ylx-transfer-adapters"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+zeroize = "1"
+tempfile = "3"
+tiny_http = "0.12"
+ylx-transfer-core = { path = "crates/ylx-transfer-core" }
+
+[package]
+name = "ylx-transfer"
+version = "0.1.0"
+description = "Open Aria Bridge desktop client for verified recording import and publication"
+authors = ["Alpenl"]
+edition.workspace = true
+publish.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "ylx_transfer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+# Parses the build-time object-store credential file (see `build.rs`).
+# Already a direct runtime dependency of this same crate at the same
+# version, so this adds nothing to the dependency graph -- it only makes
+# the existing crate usable from the build script too.
+serde_json = { workspace = true }
+
+[features]
+# Off by default (plan section 16 / task PC-08): the simulated
+# pairing/transfer engine (`sim.rs`/`demo.rs`) is a fallback only, not the
+# default composition. `cargo build --features demo` re-enables it together
+# with the simulator's random progress generator.
+demo = ["dep:rand"]
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+rand = { version = "0.8", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+uuid = { workspace = true }
+libc = "0.2"
+
+# PC-08: the production core and adapter crates are members of this workspace.
+ylx-transfer-core = { workspace = true }
+ylx-transfer-adapters = { path = "crates/ylx-transfer-adapters" }
+
+[dev-dependencies]
+# Startup failpoint tests need an independent SQLite connection to hold a
+# transaction or mutate a durable row while the production connection is
+# executing reconciliation. Keep this test-only; production code uses typed
+# AppStore/TransferStore APIs exclusively.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Tauri's mock runtime is gated behind its unstable `test` feature and is
+# only needed by the application unit tests, not by production builds.
+tauri = { version = "2", features = ["test"] }
+
+# Library-root fencing is tested against real directories: the authority's
+# whole job is comparing canonical paths, st_dev and inodes, which a mocked
+# filesystem could not exercise.
+tempfile = { workspace = true }

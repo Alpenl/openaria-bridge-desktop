@@ -1,0 +1,73 @@
+{
+  "fixture_schema": "ylx.removable_media.fixture_contract.v1",
+  "fixture_schema_version": 1,
+  "payload_catalog": "payloads.json",
+  "index": "index.json",
+  "provenance_manifest": "provenance.json",
+  "case_files": [
+    "cases/signed-publication-v1.json",
+    "cases/complete-unpublished-v6.json",
+    "cases/appliance-spool-v6.json",
+    "cases/raw-capture-v2.json",
+    "cases/legacy-mjpeg-session-v5.json",
+    "cases/rejections.json",
+    "cases/unsigned-publication-v1.json"
+  ],
+  "materialization": {
+    "root_is_temporary": true,
+    "entry_kinds": ["json", "utf8", "payload", "symlink", "reparse_point"],
+    "json_encoding": "RFC8785_JCS_UTF8_NO_TRAILING_NEWLINE",
+    "utf8_encoding": "EXACT_UTF8",
+    "payload_encoding": "DECODE_FROM_PAYLOAD_CATALOG",
+    "mutation_order": "ARRAY_ORDER",
+    "path_separator": "/",
+    "must_not_materialize_outside_root": true,
+    "non_regular_entries_may_be_simulated": true
+  },
+  "mutation_operations": [
+    "replace_json",
+    "replace_utf8",
+    "replace_payload",
+    "remove_entry",
+    "add_entry",
+    "replace_entry_kind"
+  ],
+  "classifications": [
+    "TrustedPublished",
+    "CompleteUnpublished",
+    "CommittedRawSpool",
+    "SdkRawCapture",
+    "LegacyMjpegSessionV5",
+    "UnsignedPublicationV1",
+    "UnsupportedLegacy",
+    "RecoveryOnly",
+    "Rejected"
+  ],
+  "preflight_verdicts": [
+    "ready_signed",
+    "ready_unsigned_requires_policy",
+    "waiting_for_pairing_key",
+    "recording_or_encoding_incomplete",
+    "unsupported_schema",
+    "unsafe_path",
+    "corrupt"
+  ],
+  "provenance_values": ["device_signed", "locally_validated_unsigned", "unverified"],
+  "invariants": {
+    "detect_by_schema_not_extension": true,
+    "card_key_is_never_a_trust_anchor": true,
+    "unknown_major_fails_closed": true,
+    "all_relative_paths_are_component_validated": true,
+    "non_regular_files_are_never_followed": true,
+    "hash_is_checked_after_size": true,
+    "unsigned_is_never_described_as_device_signed": true,
+    "probe_evidence_does_not_establish_identity_or_integrity": true,
+    "source_tree_is_read_only": true
+  },
+  "provenance_requirements": {
+    "every_indexed_fixture_has_entry": true,
+    "synthetic_fixtures_must_not_claim_real_camera_capture": true,
+    "raw_digest_may_be_null_only_when_raw_material_is_not_retained": true,
+    "materialized_tree_digest_is_recomputed_by_harness": true
+  }
+}

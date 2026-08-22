@@ -1,0 +1,304 @@
+{
+  "fixture_schema": "ylx.removable_media.case_group.v1",
+  "input_kind": "RawCaptureV2",
+  "base_tree": [
+    {
+      "path": "fixture-raw-v2/capture.json",
+      "kind": "json",
+      "document": {
+        "schema": "ylx.stereo_imu.raw.v2",
+        "state": "complete",
+        "captured_at": "2026-08-01T03:00:00Z",
+        "video": {
+          "encoding": "mjpeg",
+          "layout": "left_right_side_by_side",
+          "transport": "file",
+          "persistent": true,
+          "path": "stereo.mjpeg",
+          "width": 3840,
+          "height": 1080,
+          "eye_width": 1920,
+          "source_fps": 30,
+          "output_fps": 30,
+          "sampling_ratio": 1,
+          "frame_count": 3,
+          "size_bytes": 18
+        },
+        "files": { "frames": "frames.jsonl", "imu": "imu.jsonl" },
+        "result": {
+          "native_capture_ok": true,
+          "frame_count": 3,
+          "sequence_gaps": 0,
+          "imu_sample_count": 3,
+          "imu_timestamp_errors": 0
+        }
+      }
+    },
+    { "path": "fixture-raw-v2/stereo.mjpeg", "kind": "payload", "payload_id": "raw-mjpeg-three-frames" },
+    {
+      "path": "fixture-raw-v2/frames.jsonl",
+      "kind": "utf8",
+      "content_utf8": "{\"frame_index\":0,\"capture_sequence\":0,\"jpeg_offset\":0,\"jpeg_length\":6,\"timestamp_ns\":1000000000}\n{\"frame_index\":1,\"capture_sequence\":1,\"jpeg_offset\":6,\"jpeg_length\":6,\"timestamp_ns\":1033333333}\n{\"frame_index\":2,\"capture_sequence\":2,\"jpeg_offset\":12,\"jpeg_length\":6,\"timestamp_ns\":1066666666}\n"
+    },
+    { "path": "fixture-raw-v2/imu.jsonl", "kind": "payload", "payload_id": "imu-three-valid-samples" }
+  ],
+  "probe_evidence": {
+    "path": "stereo.mjpeg",
+    "codec": "mjpeg",
+    "layout": "left_right_side_by_side",
+    "width": 3840,
+    "height": 1080,
+    "eye_width": 1920,
+    "jpeg_chroma_sampling": "4:2:2",
+    "decoded_pixel_format": "yuvj422p",
+    "color_range": "full",
+    "color_matrix": "bt709",
+    "evidence": "injected_fixture_probe",
+    "stub": true
+  },
+  "cases": [
+    {
+      "id": "raw-v2-valid-30fps",
+      "mutations": [],
+      "probe_overrides": { "fps": 30, "frame_count": 3, "duration_seconds": 0.1 },
+      "expected": {
+        "classification": "SdkRawCapture",
+        "preflight_verdict": "ready_unsigned_requires_policy",
+        "admissible": true,
+        "provenance": "locally_validated_unsigned",
+        "normalization_eligible": true,
+        "automatic_upload_eligible": false,
+        "error_code": null,
+        "source_fps": 30
+      }
+    },
+    {
+      "id": "raw-v2-valid-60fps",
+      "mutations": [
+        {
+          "operation": "replace_json",
+          "path": "fixture-raw-v2/capture.json",
+          "document": {
+            "schema": "ylx.stereo_imu.raw.v2",
+            "state": "complete",
+            "captured_at": "2026-08-01T03:01:00Z",
+            "video": {
+              "encoding": "mjpeg",
+              "layout": "left_right_side_by_side",
+              "transport": "file",
+              "persistent": true,
+              "path": "stereo.mjpeg",
+              "width": 3840,
+              "height": 1080,
+              "eye_width": 1920,
+              "source_fps": 60,
+              "output_fps": 60,
+              "sampling_ratio": 1,
+              "frame_count": 3,
+              "size_bytes": 18
+            },
+            "files": { "frames": "frames.jsonl", "imu": "imu.jsonl" },
+            "result": {
+              "native_capture_ok": true,
+              "frame_count": 3,
+              "sequence_gaps": 0,
+              "imu_sample_count": 3,
+              "imu_timestamp_errors": 0
+            }
+          }
+        },
+        {
+          "operation": "replace_utf8",
+          "path": "fixture-raw-v2/frames.jsonl",
+          "content_utf8": "{\"frame_index\":0,\"capture_sequence\":0,\"jpeg_offset\":0,\"jpeg_length\":6,\"timestamp_ns\":1000000000}\n{\"frame_index\":1,\"capture_sequence\":1,\"jpeg_offset\":6,\"jpeg_length\":6,\"timestamp_ns\":1016666667}\n{\"frame_index\":2,\"capture_sequence\":2,\"jpeg_offset\":12,\"jpeg_length\":6,\"timestamp_ns\":1033333334}\n"
+        }
+      ],
+      "probe_overrides": { "fps": 60, "frame_count": 3, "duration_seconds": 0.05 },
+      "expected": {
+        "classification": "SdkRawCapture",
+        "preflight_verdict": "ready_unsigned_requires_policy",
+        "admissible": true,
+        "provenance": "locally_validated_unsigned",
+        "normalization_eligible": true,
+        "automatic_upload_eligible": false,
+        "error_code": null,
+        "source_fps": 60
+      }
+    },
+    {
+      "id": "raw-v2-failed-result",
+      "mutations": [
+        {
+          "operation": "replace_json",
+          "path": "fixture-raw-v2/capture.json",
+          "document": {
+            "schema": "ylx.stereo_imu.raw.v2",
+            "state": "failed",
+            "captured_at": "2026-08-01T03:02:00Z",
+            "video": {
+              "encoding": "mjpeg",
+              "layout": "left_right_side_by_side",
+              "transport": "file",
+              "persistent": true,
+              "path": "stereo.mjpeg",
+              "width": 3840,
+              "height": 1080,
+              "eye_width": 1920,
+              "source_fps": 30,
+              "output_fps": 30,
+              "sampling_ratio": 1,
+              "frame_count": 2,
+              "size_bytes": 12
+            },
+            "files": { "frames": "frames.jsonl", "imu": "imu.jsonl" },
+            "result": {
+              "native_capture_ok": false,
+              "frame_count": 2,
+              "sequence_gaps": 0,
+              "imu_sample_count": 2,
+              "imu_timestamp_errors": 0,
+              "failure": "fixture capture stopped"
+            }
+          }
+        },
+        { "operation": "replace_payload", "path": "fixture-raw-v2/stereo.mjpeg", "payload_id": "raw-mjpeg-two-frames" }
+      ],
+      "expected": {
+        "classification": "RecoveryOnly",
+        "preflight_verdict": "recording_or_encoding_incomplete",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "capture_failed"
+      }
+    },
+    {
+      "id": "raw-v2-bad-jpeg-offset",
+      "mutations": [
+        {
+          "operation": "replace_utf8",
+          "path": "fixture-raw-v2/frames.jsonl",
+          "content_utf8": "{\"frame_index\":0,\"capture_sequence\":0,\"jpeg_offset\":0,\"jpeg_length\":6,\"timestamp_ns\":1000000000}\n{\"frame_index\":1,\"capture_sequence\":1,\"jpeg_offset\":6,\"jpeg_length\":6,\"timestamp_ns\":1033333333}\n{\"frame_index\":2,\"capture_sequence\":2,\"jpeg_offset\":15,\"jpeg_length\":6,\"timestamp_ns\":1066666666}\n"
+        }
+      ],
+      "expected": {
+        "classification": "RecoveryOnly",
+        "preflight_verdict": "corrupt",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "jpeg_range_out_of_bounds",
+        "file_size_bytes": 18,
+        "bad_offset": 15,
+        "bad_length": 6
+      }
+    },
+    {
+      "id": "raw-v2-frame-sequence-gap",
+      "mutations": [
+        {
+          "operation": "replace_utf8",
+          "path": "fixture-raw-v2/frames.jsonl",
+          "content_utf8": "{\"frame_index\":0,\"capture_sequence\":0,\"jpeg_offset\":0,\"jpeg_length\":6,\"timestamp_ns\":1000000000}\n{\"frame_index\":1,\"capture_sequence\":1,\"jpeg_offset\":6,\"jpeg_length\":6,\"timestamp_ns\":1033333333}\n{\"frame_index\":2,\"capture_sequence\":3,\"jpeg_offset\":12,\"jpeg_length\":6,\"timestamp_ns\":1066666666}\n"
+        },
+        {
+          "operation": "replace_json",
+          "path": "fixture-raw-v2/capture.json",
+          "document": {
+            "schema": "ylx.stereo_imu.raw.v2",
+            "state": "complete",
+            "captured_at": "2026-08-01T03:03:00Z",
+            "video": {
+              "encoding": "mjpeg",
+              "layout": "left_right_side_by_side",
+              "transport": "file",
+              "persistent": true,
+              "path": "stereo.mjpeg",
+              "width": 3840,
+              "height": 1080,
+              "eye_width": 1920,
+              "source_fps": 30,
+              "output_fps": 30,
+              "sampling_ratio": 1,
+              "frame_count": 3,
+              "size_bytes": 18
+            },
+            "files": { "frames": "frames.jsonl", "imu": "imu.jsonl" },
+            "result": {
+              "native_capture_ok": true,
+              "frame_count": 3,
+              "sequence_gaps": 1,
+              "imu_sample_count": 3,
+              "imu_timestamp_errors": 0
+            }
+          }
+        }
+      ],
+      "expected": {
+        "classification": "RecoveryOnly",
+        "preflight_verdict": "corrupt",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "frame_sequence_gap",
+        "expected_sequence": 2,
+        "observed_sequence": 3
+      }
+    },
+    {
+      "id": "raw-v2-imu-timestamp-error",
+      "mutations": [
+        {
+          "operation": "replace_utf8",
+          "path": "fixture-raw-v2/imu.jsonl",
+          "content_utf8": "{\"sample_index\":0,\"timestamp_ns\":1000000000}\n{\"sample_index\":1,\"timestamp_ns\":999999999}\n{\"sample_index\":2,\"timestamp_ns\":1066666666}\n"
+        },
+        {
+          "operation": "replace_json",
+          "path": "fixture-raw-v2/capture.json",
+          "document": {
+            "schema": "ylx.stereo_imu.raw.v2",
+            "state": "complete",
+            "captured_at": "2026-08-01T03:04:00Z",
+            "video": {
+              "encoding": "mjpeg",
+              "layout": "left_right_side_by_side",
+              "transport": "file",
+              "persistent": true,
+              "path": "stereo.mjpeg",
+              "width": 3840,
+              "height": 1080,
+              "eye_width": 1920,
+              "source_fps": 30,
+              "output_fps": 30,
+              "sampling_ratio": 1,
+              "frame_count": 3,
+              "size_bytes": 18
+            },
+            "files": { "frames": "frames.jsonl", "imu": "imu.jsonl" },
+            "result": {
+              "native_capture_ok": true,
+              "frame_count": 3,
+              "sequence_gaps": 0,
+              "imu_sample_count": 3,
+              "imu_timestamp_errors": 1
+            }
+          }
+        }
+      ],
+      "expected": {
+        "classification": "RecoveryOnly",
+        "preflight_verdict": "corrupt",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "imu_timestamp_not_monotonic",
+        "sample_index": 1
+      }
+    }
+  ]
+}

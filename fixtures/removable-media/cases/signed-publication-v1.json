@@ -1,0 +1,192 @@
+{
+  "fixture_schema": "ylx.removable_media.case_group.v1",
+  "input_kind": "SignedPublicationV1",
+  "base_tree": [
+    {
+      "path": "recordings/fixture-signed-v1/publication_manifest.json",
+      "kind": "utf8",
+      "content_utf8": "{\"schema_version\":1,\"session_id\":\"fixture-signed-v1\",\"revision\":\"sha256:6fb4de2f6a030858ddf7eea528f64bfc9d9c7334b97bcd788bd68a0f0a6a81fd\",\"captured_at\":\"2026-08-01T00:00:00Z\",\"published_at\":\"2026-08-01T00:00:01Z\",\"duration_seconds\":0.1,\"total_bytes\":202,\"video_bytes\":57,\"integrity_ok\":true,\"files\":[{\"id\":\"left-00000\",\"display_path\":\"video/left_00000.mp4\",\"role\":\"video_left\",\"size_bytes\":28,\"sha256\":\"762d15491c3eb5d24b328b1d80922ce898c558a72e1be9013ed2938ff3c3ba6b\",\"media_type\":\"video/mp4\"},{\"id\":\"right-00000\",\"display_path\":\"video/right_00000.mp4\",\"role\":\"video_right\",\"size_bytes\":29,\"sha256\":\"f5da13d7bcaaaba850c51a2021b7240f45aac1ccd480f41cd761dbf8e6ff64eb\",\"media_type\":\"video/mp4\"},{\"id\":\"session-json\",\"display_path\":\"session.json\",\"role\":\"metadata\",\"size_bytes\":72,\"sha256\":\"c9d720b0d31c683fa62308cbd0b8a807530ebe2c2857df8d2ac3b346b3673089\",\"media_type\":\"application/json\"},{\"id\":\"capture-commit-json\",\"display_path\":\"capture.commit.json\",\"role\":\"metadata\",\"size_bytes\":73,\"sha256\":\"1b7ce189cbaa2872800e2cda17ea4172a4e538b57916092b5b6af1c073bffd4c\",\"media_type\":\"application/json\"}]}"
+    },
+    {
+      "path": "recordings/fixture-signed-v1/publication_manifest.sig",
+      "kind": "utf8",
+      "content_utf8": "aa494245e0a57e1cddb683c258f1e6eb4c5913695ccb2270b8953577188fcc652cc1e2324ce7467797b50a2dd16ac2430a29aa22fd06254d569686f1a71df20d"
+    },
+    {
+      "path": "recordings/fixture-signed-v1/publication_public_key.hex",
+      "kind": "utf8",
+      "content_utf8": "0d05fa031442e28f04e0714fa94cfd3815a6e2b18e3f866a5967b82b5b1e6662"
+    },
+    { "path": "recordings/fixture-signed-v1/video/left_00000.mp4", "kind": "payload", "payload_id": "h264-left-00000" },
+    {
+      "path": "recordings/fixture-signed-v1/video/right_00000.mp4",
+      "kind": "payload",
+      "payload_id": "h264-right-00000"
+    },
+    { "path": "recordings/fixture-signed-v1/session.json", "kind": "payload", "payload_id": "signed-v1-session-json" },
+    {
+      "path": "recordings/fixture-signed-v1/capture.commit.json",
+      "kind": "payload",
+      "payload_id": "signed-v1-capture-commit-json"
+    }
+  ],
+  "signature_contract": {
+    "payload_path": "publication_manifest.json",
+    "detached_signature_path": "publication_manifest.sig",
+    "presented_public_key_path": "publication_public_key.hex",
+    "algorithm": "Ed25519",
+    "signed_payload_sha256": "af65cbe70761f82b510b9e9bae38cdde14f9eb8b88a8bb1687b0c61c6c04a626",
+    "presented_key_fingerprint": "sha256:cdcea9f6bd158de587001da63b02a90e7564ce84785fb3b85fe6f5ab3479c671",
+    "external_anchor_id": "fixture-ed25519-2026-08-v1"
+  },
+  "probe_evidence": [
+    {
+      "path": "video/left_00000.mp4",
+      "codec": "h264",
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "frame_count": 3,
+      "duration_seconds": 0.1,
+      "stub": true
+    },
+    {
+      "path": "video/right_00000.mp4",
+      "codec": "h264",
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "frame_count": 3,
+      "duration_seconds": 0.1,
+      "stub": true
+    }
+  ],
+  "cases": [
+    {
+      "id": "signed-v1-valid-explicit-anchor",
+      "mutations": [],
+      "trust_context": { "injected_anchor_ids": ["fixture-ed25519-2026-08-v1"] },
+      "expected": {
+        "classification": "TrustedPublished",
+        "preflight_verdict": "ready_signed",
+        "admissible": true,
+        "provenance": "device_signed",
+        "normalization_eligible": true,
+        "automatic_upload_eligible": true,
+        "error_code": null
+      }
+    },
+    {
+      "id": "signed-v1-valid-unpaired",
+      "mutations": [],
+      "trust_context": { "injected_anchor_ids": [] },
+      "expected": {
+        "classification": "Rejected",
+        "detected_input_kind": "SignedPublicationV1",
+        "manifest_signature_valid": true,
+        "producer_key_trusted": false,
+        "preflight_verdict": "waiting_for_pairing_key",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "producer_key_untrusted"
+      }
+    },
+    {
+      "id": "signed-v1-hash-mismatch-same-size",
+      "mutations": [
+        {
+          "operation": "replace_payload",
+          "path": "recordings/fixture-signed-v1/video/left_00000.mp4",
+          "payload_id": "h264-left-same-size-mismatch"
+        }
+      ],
+      "trust_context": { "injected_anchor_ids": ["fixture-ed25519-2026-08-v1"] },
+      "expected": {
+        "classification": "RecoveryOnly",
+        "preflight_verdict": "corrupt",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "inventory_hash_mismatch",
+        "claimed_size_bytes": 28,
+        "actual_size_bytes": 28
+      }
+    },
+    {
+      "id": "signed-v1-unsafe-parent-path",
+      "mutations": [
+        {
+          "operation": "replace_utf8",
+          "path": "recordings/fixture-signed-v1/publication_manifest.json",
+          "content_utf8": "{\"schema_version\":1,\"session_id\":\"fixture-signed-v1\",\"revision\":\"sha256:bc198d551f4aa53850bbe516657fdf2c86569756c6c13fdf7e94d6677a39ff2c\",\"captured_at\":\"2026-08-01T00:00:00Z\",\"published_at\":\"2026-08-01T00:00:01Z\",\"duration_seconds\":0.1,\"total_bytes\":28,\"video_bytes\":28,\"integrity_ok\":true,\"files\":[{\"id\":\"left-00000\",\"display_path\":\"../outside.mp4\",\"role\":\"video_left\",\"size_bytes\":28,\"sha256\":\"762d15491c3eb5d24b328b1d80922ce898c558a72e1be9013ed2938ff3c3ba6b\",\"media_type\":\"video/mp4\"}]}"
+        },
+        {
+          "operation": "replace_utf8",
+          "path": "recordings/fixture-signed-v1/publication_manifest.sig",
+          "content_utf8": "755ed2301c2b747f4fee663ebf79da3aceb8461c974906bb550ae169e182aaa375d50a208e27a5ffbc4074368fb3b3ff99e40f9cadd75b84bacde2c4fb93ac04"
+        }
+      ],
+      "signature_contract_overrides": {
+        "signed_payload_sha256": "a81d1b68bff7b950db69ea6d92902ec7680bf1f39fd33dafc83df7f41e5033ed"
+      },
+      "trust_context": { "injected_anchor_ids": ["fixture-ed25519-2026-08-v1"] },
+      "expected": {
+        "classification": "Rejected",
+        "preflight_verdict": "unsafe_path",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "unsafe_relative_path",
+        "must_not_open": "../outside.mp4"
+      }
+    },
+    {
+      "id": "signed-v1-symlink-entry",
+      "mutations": [
+        {
+          "operation": "replace_entry_kind",
+          "path": "recordings/fixture-signed-v1/video/left_00000.mp4",
+          "kind": "symlink",
+          "target": "../../outside.mp4"
+        }
+      ],
+      "trust_context": { "injected_anchor_ids": ["fixture-ed25519-2026-08-v1"] },
+      "expected": {
+        "classification": "Rejected",
+        "preflight_verdict": "unsafe_path",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "non_regular_file",
+        "must_not_follow": true
+      }
+    },
+    {
+      "id": "signed-v1-reparse-entry",
+      "mutations": [
+        {
+          "operation": "replace_entry_kind",
+          "path": "recordings/fixture-signed-v1/video/left_00000.mp4",
+          "kind": "reparse_point",
+          "target": "C:/outside.mp4"
+        }
+      ],
+      "trust_context": { "injected_anchor_ids": ["fixture-ed25519-2026-08-v1"] },
+      "expected": {
+        "classification": "Rejected",
+        "preflight_verdict": "unsafe_path",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "non_regular_file",
+        "must_not_follow": true
+      }
+    }
+  ]
+}

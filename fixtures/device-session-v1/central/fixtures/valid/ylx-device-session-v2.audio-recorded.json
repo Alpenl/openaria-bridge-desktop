@@ -1,0 +1,156 @@
+{
+  "schema": "ylx.device-session.v2",
+  "manifest_id": "01989f6b-2c01-7b2c-9d3e-4f5061728394",
+  "sealed": true,
+  "sealed_at": "2026-08-08T10:30:33+08:00",
+  "session_id": "01989f6b-2c00-7a1b-8c2d-3e4f50617283",
+  "volume_id": "6ba7b811-9dad-41d1-80b4-00c04fd430c8",
+  "capture_mode": "production",
+  "display_name": "2026-08-08_10-30-00_YLX-30D5872D",
+  "device": {
+    "device_id": "550e8400-e29b-41d4-a716-446655440000",
+    "device_label": "YLX-30D5872D",
+    "hardware_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": "raspberry-pi-5",
+    "software_version": "0.11.0-dev.1",
+    "commit": "b7d044d4bbc5ef0e335d2789c54f7d837d1a3e01"
+  },
+  "time": {
+    "started_at": "2026-08-08T10:30:00+08:00",
+    "ended_at": "2026-08-08T10:30:30+08:00",
+    "timezone": "Asia/Shanghai",
+    "duration_seconds": 30
+  },
+  "take": {
+    "take_id": "01989f6b-f000-7c3d-ae4f-5061728394a5",
+    "sequence": 1,
+    "continuation_of": null
+  },
+  "camera": {
+    "width": 3840,
+    "height": 1080,
+    "eye_width": 1920,
+    "sensor_fps": 60,
+    "frame_decimation": 2,
+    "nominal_fps": 30,
+    "effective_fps": 30,
+    "coordinate_frame": "opencv_optical"
+  },
+  "video": {
+    "layout": "split-eyes",
+    "codec": "h264",
+    "container": "mp4",
+    "segments": [
+      {
+        "index": 0,
+        "start_frame": 0,
+        "end_frame": 900,
+        "start_time_seconds": 0,
+        "end_time_seconds": 30,
+        "artifacts": {
+          "left": {
+            "artifact_id": "1111111111111111111111111111111111111111111111111111111111111111",
+            "role": "video.left",
+            "path": "video/left_00000.mp4",
+            "media_type": "video/mp4",
+            "bytes": 30123456,
+            "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+          },
+          "right": {
+            "artifact_id": "2222222222222222222222222222222222222222222222222222222222222222",
+            "role": "video.right",
+            "path": "video/right_00000.mp4",
+            "media_type": "video/mp4",
+            "bytes": 30234567,
+            "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        }
+      }
+    ]
+  },
+  "imu": {
+    "artifact": {
+      "artifact_id": "3333333333333333333333333333333333333333333333333333333333333333",
+      "role": "imu.samples",
+      "path": "imu/imu.jsonl",
+      "media_type": "application/x-ndjson",
+      "bytes": 166400,
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    },
+    "sample_count": 6000,
+    "units": "raw_int16",
+    "coordinate_frame": "raw_device_axes"
+  },
+  "frames": {
+    "artifact": {
+      "artifact_id": "4444444444444444444444444444444444444444444444444444444444444444",
+      "role": "frames.index",
+      "path": "imu/frames.jsonl",
+      "media_type": "application/x-ndjson",
+      "bytes": 120240,
+      "sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+    },
+    "count": 900
+  },
+  "audio": {
+    "state": "recorded",
+    "requested_mode": "enabled",
+    "resolved_mode": "enabled",
+    "codec": "pcm_s16le",
+    "container": "wav",
+    "sample_format": "S16_LE",
+    "sample_rate": 48000,
+    "channels": 2,
+    "sample_count": 1440000,
+    "sync": {
+      "time_base": "host_monotonic",
+      "start_time_seconds": 0,
+      "end_time_seconds": 30,
+      "video_time_reference": "session_time_seconds"
+    },
+    "segments": [
+      {
+        "index": 0,
+        "start_sample": 0,
+        "end_sample": 1440000,
+        "start_time_seconds": 0,
+        "end_time_seconds": 30,
+        "pcm_payload_bytes": 5760000,
+        "wav_header_bytes": 44,
+        "artifact": {
+          "artifact_id": "6666666666666666666666666666666666666666666666666666666666666666",
+          "role": "audio.wav",
+          "path": "audio/audio.wav",
+          "media_type": "audio/wav",
+          "bytes": 5760044,
+          "sha256": "6666666666666666666666666666666666666666666666666666666666666666"
+        }
+      }
+    ]
+  },
+  "logs": [
+    {
+      "artifact_id": "5555555555555555555555555555555555555555555555555555555555555555",
+      "role": "log.capture",
+      "path": "logs/capture.log",
+      "media_type": "text/plain",
+      "bytes": 12034,
+      "sha256": "5555555555555555555555555555555555555555555555555555555555555555"
+    }
+  ],
+  "integrity": {
+    "verified_at": "2026-08-08T10:30:32.800+08:00",
+    "dropped_frames": 0,
+    "drop_events": [],
+    "quality_policy": {
+      "policy_id": "rdk-x5-lossless-v1",
+      "max_contiguous_dropped_frames": 0,
+      "max_total_dropped_frames": 0,
+      "max_drop_fraction": 0,
+      "window_seconds": 1,
+      "max_dropped_frames_per_window": 0
+    },
+    "media_write_throughput_bytes_per_second": 10925000,
+    "fatal_errors": []
+  }
+}

@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>YLX Transfer</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <div class="app">
+      <aside class="rail">
+        <div class="rail-brand">
+          <div class="mark">
+            <svg viewBox="0 0 24 24" fill="none">
+              <circle cx="12" cy="12" r="6.5" stroke="white" stroke-width="1.6" />
+              <circle cx="12" cy="12" r="2.2" fill="white" />
+            </svg>
+          </div>
+          <div class="word">
+            <div class="wordmark">YLX Transfer</div>
+            <div class="tagline">局域网采集数据管理</div>
+          </div>
+        </div>
+
+        <div class="rail-group-title eyebrow">工作区</div>
+        <button type="button" class="nav-item" id="mediaNavItem" data-active="true">
+          <span class="nav-icon">
+            <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+              <rect x="3" y="3" width="14" height="14" rx="2.5" stroke="currentColor" stroke-width="1.5" />
+              <path d="M6 7h8M6 10h8M6 13h5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+            </svg>
+          </span>
+          <span class="meta"><span class="id">介质导入</span><span class="status-text">内存卡与目录流水线</span></span>
+        </button>
+        <button type="button" class="nav-item" id="libraryNavItem" data-active="false">
+          <span class="nav-icon">
+            <svg viewBox="0 0 20 20" fill="none">
+              <rect x="2" y="4" width="16" height="12" rx="4" stroke="currentColor" stroke-width="1.6" />
+              <circle cx="14.5" cy="10" r="1.3" fill="currentColor" />
+            </svg>
+          </span>
+          <span class="meta"><span class="id">本地数据</span><span class="status-text">已下载的录制数据</span></span>
+          <span class="nav-badge" id="libraryBadge" style="display: none"></span>
+        </button>
+        <div class="rail-divider"></div>
+
+        <div class="rail-scan">
+          <span class="scan-pulse"></span><span class="eyebrow">局域网设备</span>
+          <span
+            class="mono"
+            id="connectedCount"
+            style="margin-left: auto; font-size: 10px; color: var(--text-tertiary)"
+          ></span>
+        </div>
+
+        <ul class="device-list scrollbar-thin" id="deviceList"></ul>
+        <button type="button" class="add-device-btn" id="addDeviceBtn">+ 手动添加设备</button>
+
+        <div class="rail-footer">
+          <button type="button" class="rail-setting" id="openDownloadRootBtn">
+            <span class="rail-setting-label">本机保存位置</span>
+            <span class="mono rail-setting-value" id="downloadRootLabel">读取中…</span>
+          </button>
+          <div class="switch-row">
+            <span>传输完成通知</span>
+            <button
+              type="button"
+              class="switch"
+              id="notifySwitch"
+              data-on="false"
+              aria-label="传输完成系统通知"
+            ></button>
+          </div>
+          <div class="theme-toggle" role="group" aria-label="主题切换">
+            <button type="button" data-theme-btn="dark">深色</button>
+            <button type="button" data-theme-btn="light">浅色</button>
+            <button type="button" data-theme-btn="system">系统</button>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="topbar" id="topbar"></div>
+        <div class="content scrollbar-thin" id="content"></div>
+        <div class="tray" id="tray" data-open="false" data-collapsed="false">
+          <div class="tray-head">
+            <div class="tray-head-summary">
+              <span class="eyebrow">传输队列</span>
+              <span class="mono" id="trayCount"></span>
+            </div>
+            <button
+              type="button"
+              class="tray-toggle"
+              id="trayToggleBtn"
+              aria-expanded="true"
+              aria-controls="trayBody"
+              aria-label="收起传输队列"
+              title="收起传输队列"
+              disabled
+            ></button>
+          </div>
+          <div class="tray-body scrollbar-thin" id="trayBody"></div>
+        </div>
+      </main>
+
+      <div class="overlay" id="pairingOverlay">
+        <div class="pairing-card">
+          <div class="ring-wrap">
+            <svg viewBox="0 0 84 84">
+              <circle class="ring-track" cx="42" cy="42" r="36"></circle>
+              <circle
+                class="ring-progress"
+                id="ringProgress"
+                cx="42"
+                cy="42"
+                r="36"
+                stroke-dasharray="226.1"
+                stroke-dashoffset="0"
+              ></circle>
+            </svg>
+            <div class="ring-center" id="ringSeconds">5</div>
+          </div>
+          <h3>正在连接设备</h3>
+          <p>正在连接 <span class="id" id="pairingDeviceId">YLX-A11C90F2</span></p>
+          <p class="hint">正在建立局域网会话</p>
+          <button class="btn btn-ghost" id="cancelPairing">取消</button>
+        </div>
+      </div>
+
+      <div class="overlay" id="addDeviceOverlay">
+        <div class="modal-card">
+          <h3>手动添加设备</h3>
+          <p class="modal-sub">输入局域网内设备的 IP 地址</p>
+          <div class="field">
+            <label>IP 地址</label><input type="text" id="manualIp" class="mono-input" placeholder="192.168.1.88" />
+          </div>
+          <div class="modal-actions">
+            <button class="btn btn-ghost" id="cancelAddDevice">取消</button>
+            <button class="btn btn-primary" id="submitAddDevice">连接</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="overlay" id="storageOverlay">
+        <div class="modal-card">
+          <h3>对象存储设置</h3>
+          <p class="modal-sub">配置后，本地数据可以上传备份到该存储桶</p>
+          <div class="field"><label>Endpoint</label><input type="text" id="storageEndpoint" class="mono-input" /></div>
+          <div class="field"><label>Bucket</label><input type="text" id="storageBucket" class="mono-input" /></div>
+          <div class="field">
+            <label>Access Key</label><input type="text" id="storageAccessKey" class="mono-input" />
+          </div>
+          <div class="field">
+            <label>Secret Key</label><input type="password" id="storageSecretKey" class="mono-input" />
+          </div>
+          <div class="field">
+            <label>路径前缀（可选）</label><input type="text" id="storagePrefix" class="mono-input" />
+          </div>
+          <div class="field">
+            <label>访问风格</label>
+            <select id="storageUrlStyle" class="mono-input">
+              <option value="virtualHost">Virtual-host（阿里云 OSS、AWS S3）</option>
+              <option value="path">Path（MinIO 等自建服务）</option>
+            </select>
+            <p class="field-hint">阿里云 OSS 只接受 Virtual-host；自建 MinIO 通常只接受 Path。</p>
+          </div>
+          <div class="field">
+            <label>本地下载目录</label>
+            <div style="display: flex; gap: 8px">
+              <input
+                type="text"
+                id="storageDownloadRoot"
+                class="mono-input"
+                placeholder="默认目录"
+                style="flex: 1; min-width: 0"
+              />
+              <button type="button" class="btn btn-ghost btn-sm" id="selectDownloadRootBtn">选择</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="resetDownloadRootBtn">默认</button>
+            </div>
+            <p class="field-hint" id="activeDownloadRoot"></p>
+          </div>
+          <div class="modal-actions-split">
+            <button class="btn btn-ghost btn-sm" id="testStorageBtn">测试连接</button>
+            <div style="display: flex; gap: 8px">
+              <button class="btn btn-ghost" id="cancelStorage">取消</button>
+              <button class="btn btn-primary" id="saveStorage">保存</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="overlay" id="downloadRootOverlay">
+        <div class="modal-card">
+          <h3>本机保存位置</h3>
+          <p class="modal-sub">Pi 数据下载到本机后会保存在这里</p>
+          <div class="field">
+            <label>下载目录</label>
+            <div style="display: flex; gap: 8px">
+              <input
+                type="text"
+                id="downloadRootInput"
+                class="mono-input"
+                placeholder="默认目录"
+                style="flex: 1; min-width: 0"
+              />
+              <button type="button" class="btn btn-ghost btn-sm" id="chooseDownloadRootBtn">选择</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="defaultDownloadRootBtn">默认</button>
+            </div>
+            <p class="field-hint" id="downloadRootActive"></p>
+          </div>
+          <div class="modal-actions">
+            <button class="btn btn-ghost" id="cancelDownloadRoot">取消</button>
+            <button class="btn btn-primary" id="saveDownloadRoot">保存</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="toast-stack" id="toastStack"></div>
+    </div>
+  </body>
+</html>

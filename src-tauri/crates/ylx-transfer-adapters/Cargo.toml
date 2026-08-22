@@ -1,0 +1,148 @@
+[package]
+name = "ylx-transfer-adapters"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+description = "YLX Transfer PC adapters crate for device, object-store, discovery, and credential integrations."
+
+[lib]
+name = "ylx_transfer_adapters"
+path = "src/lib.rs"
+
+[dependencies]
+# Workspace dependency on core so adapter stubs (and the real
+# credential_keyring/object_store_s3 adapters) can reference core ports and
+# domain types while sharing one dependency resolution graph.
+ylx-transfer-core = { workspace = true }
+
+# S3 adapter dependencies. Scoped to this crate; the shared workspace owns the
+# dependency lockfile.
+#
+# rusty-s3: Sans-IO SigV4 request signing/response-parsing for S3-
+# compatible endpoints (works with MinIO/path-style, not AWS-only). Does
+# not perform any network I/O itself.
+rusty-s3 = "0.10"
+# ureq: minimal blocking HTTP client (rustls by default, no system
+# OpenSSL, no tokio/async runtime) used to actually send the requests
+# rusty-s3 signs.
+ureq = "3.3"
+# Already a transitive dependency of rusty-s3; declared directly because
+# object_store_s3.rs's own public config type (S3ObjectStoreConfig) uses
+# url::Url.
+url = "2"
+
+# Credential-vault adapter dependencies:
+# real OS keyring access (macOS Keychain / Windows Credential Manager /
+# *nix Secret Service). `apple-native-keyring-store` is added on top of
+# the crate's default features (which already cover Windows + the
+# zbus-based, pure-Rust Linux Secret Service backend) so all three target
+# platforms have a native backend. Scoped only to this crate's
+# Cargo.toml — keyring remains adapter-only while shared versions come from
+# the root workspace dependency table.
+keyring = { version = "4.1.6", features = ["apple-native-keyring-store"] }
+# --- Commit 51 addition (credential_keyring.rs / pi_http.rs only) ---
+# `zeroize`: scrubs the in-memory vault's own backing strings and the
+# `Authorization: Bearer <connection token>` header value this crate
+# builds, matching the guarantee `ylx_transfer_core::secret::Secret` gives.
+# Already a transitive dependency of `keyring`/`rustls` at this version, so
+# this only promotes an already-vetted crate to a direct dependency.
+zeroize = { workspace = true }
+
+# Device API and discovery dependencies. `ureq`/`url` above are reused.
+#
+# serde/serde_json: JSON (de)serialization for the Pi wire protocol
+# (pairing/device/sessions/problem+json bodies). `ylx-transfer-core`
+# already depends on both for its own domain types' derives, but a crate
+# can only use a dependency it declares directly -- promoted here so
+# pi_http.rs can parse/build JSON itself, not just pass core's types
+# through unchanged.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# rustls / rustls-webpki (imported as `webpki`): pi_http.rs's TLS
+# fingerprint-pinning connector needs a custom `ServerCertVerifier` and
+# SubjectPublicKeyInfo extraction that `ureq`'s own `TlsConfig` does not
+# expose (see pi_http.rs's module doc comment "TLS" section for the full
+# rationale). Both are already transitive dependencies of `ureq`'s default
+# `rustls` feature at the *same* versions pinned here, so this adds no new
+# crate to the workspace's dependency graph -- only promotes two
+# already-vetted, already-built crates to direct dependencies.
+rustls = "0.23"
+webpki = { package = "rustls-webpki", version = "0.103" }
+# sha2: hashes the pinned certificate's SPKI to compare against the
+# configured fingerprint. Already a direct dependency of
+# `ylx-transfer-core` and a transitive dependency here
+# via `rusty-s3`/`keyring` already -- promoted directly for the same
+# already-vetted-crate reason as `rustls`/`webpki` above.
+sha2 = { workspace = true }
+# mdns-sd: discovery_mdns.rs's mDNS browser for `_ylx-capture._tcp.local.`
+# candidates (discovery-only, never a trust anchor -- ADR-DISC-001). Pure
+# Rust, no `avahi`/`mDNSResponder` system dependency required.
+mdns-sd = "0.13"
+# base64: decodes the PEM certificate body in
+# pi_http.rs::tls_pin_from_pem_certificate (used by
+# tests/pi_http_integration.rs to read the real Pi daemon's generated
+# certificate off disk and pin it, mirroring how a real out-of-band
+# fingerprint would be obtained). Already a transitive dependency (via
+# `rustls`/`ureq`/`rusty-s3`'s own graph) at this exact version.
+base64 = "0.22"
+# ring: production Ed25519 verification for the immutable publication
+# payload returned by the Pi. Already present at 0.17.x through rustls;
+# promoted to a direct dependency because publication_verifier.rs invokes
+# its signature API directly.
+ring = "0.17"
+# jiff: strict RFC 3339 parsing and instant ordering for signed publication
+# timestamps. Already present in the shared lockfile through keyring's dependency
+# graph; declared directly because publication_verifier.rs uses its API.
+jiff = { version = "0.2", default-features = false, features = ["std"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Removable-media native bridge: enumerates already-mounted volumes and uses
+# ConfigManager/SetupAPI only for identity and non-forced eject requests.
+windows = { version = "0.61.3", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_SystemServices",
+    "Win32_System_WindowsProgramming",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Removable-media native bridge: Foundation enumerates mounted volume URLs;
+# Disk Arbitration is linked directly for event invalidation and non-forced
+# eject. Keep these target-scoped so Linux/Windows builds do not pull ObjC.
+core-foundation-sys = "0.8.7"
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = [
+    "NSArray",
+    "NSDictionary",
+    "NSError",
+    "NSFileManager",
+    "NSString",
+    "NSURL",
+    "NSValue",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Native UDisks2 bridge in removable_media/linux.rs. Keep this direct and
+# target-scoped: Rust 2021 does not permit the adapter to import a transitive
+# zbus dependency. The bridge uses the blocking surface backed by zbus's
+# async-io runtime, so declare both features instead of relying on feature
+# unification with an unrelated dependency.
+zbus = { version = "5.18.0", default-features = false, features = ["async-io", "blocking-api"] }
+
+[dev-dependencies]
+# Re-declared with `test-support` so this crate's tests can run core's
+# shared `DownloadSource` contract suite
+# (`ylx_transfer_core::library::download_contract`) against the real
+# `PiDownloadSource`. Feature is dev-only; the normal dependency above is
+# unchanged.
+ylx-transfer-core = { workspace = true, features = ["test-support"] }
+# Test-only fake HTTP server for deterministic object_store_s3 unit tests.
+# The shared adapter contract also runs against MinIO in CI.
+tiny_http = { workspace = true }
+# Test-only fixture files for credential_keyring.rs's legacy-migration tests.
+tempfile = { workspace = true }
