@@ -1,0 +1,1 @@
+{"schema":"ylx.device-session.v2","imu":{"artifact":{"artifact_id":"2020202020202020202020202020202020202020202020202020202020202020","role":"imu.samples","path":"imu/imu.jsonl","media_type":"application/x-ndjson","bytes":0,"sha256":"2020202020202020202020202020202020202020202020202020202020202020"},"sample_count":0,"units":"raw_int16","coordinate_frame":"opencv_optical"}}

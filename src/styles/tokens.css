@@ -1,0 +1,129 @@
+/* Design tokens — Claude-brand warm palette (see docs/LAN_TRANSFER_PROTOCOL.md
+   §5.2 for why: dark mode reads as a native app's dark theme rather than a
+   web dashboard; light mode is a warm paper tone, not stark white). */
+
+@font-face {
+  font-family: "YLX Mono";
+  src: url("../assets/fonts/DejaVuSansMono.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  /* dark (default) */
+  --bg: #262421;
+  --bg-raised: #2d2b27;
+  --bg-card: #302e2a;
+  --bg-hover: #3a3733;
+  --bg-inset: #201e1b;
+  --sidebar: rgba(28, 27, 31, 0.86);
+  --border: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.12);
+  --text-primary: #f2efe9;
+  --text-secondary: #aba79f;
+  --text-tertiary: #77736b;
+
+  --accent-500: #e08a63;
+  --accent-600: #c96a45;
+  --accent-wash: rgba(224, 138, 99, 0.16);
+  --success-500: #83a374;
+  --success-wash: rgba(131, 163, 116, 0.16);
+  --danger-500: #cf6b60;
+  --danger-wash: rgba(207, 107, 96, 0.16);
+
+  --accent: var(--accent-500);
+  --accent-strong: var(--accent-600);
+  --accent-on: #211711;
+
+  --shadow-card: 0 1px 1px rgba(0, 0, 0, 0.14), 0 3px 8px -4px rgba(0, 0, 0, 0.2);
+  --shadow-pop: 0 16px 36px -14px rgba(0, 0, 0, 0.45);
+
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #faf9f5;
+    --bg-raised: #ffffff;
+    --bg-card: #ffffff;
+    --bg-hover: #f1efe6;
+    --bg-inset: #f0eee6;
+    --sidebar: rgba(250, 249, 245, 0.88);
+    --border: rgba(30, 26, 20, 0.08);
+    --border-strong: rgba(30, 26, 20, 0.14);
+    --text-primary: #262421;
+    --text-secondary: #6f6b63;
+    --text-tertiary: #a19c92;
+
+    --accent-500: #c96442;
+    --accent-600: #a94f30;
+    --accent-wash: rgba(201, 100, 66, 0.11);
+    --success-500: #57774a;
+    --success-wash: rgba(87, 119, 74, 0.1);
+    --danger-500: #b3453a;
+    --danger-wash: rgba(179, 69, 58, 0.1);
+
+    --accent: var(--accent-500);
+    --accent-strong: var(--accent-600);
+    --accent-on: #fdf6f2;
+
+    --shadow-card: 0 1px 1px rgba(40, 34, 24, 0.04), 0 2px 6px -3px rgba(40, 34, 24, 0.08);
+    --shadow-pop: 0 16px 36px -16px rgba(40, 34, 24, 0.22);
+    color-scheme: light;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #262421;
+  --bg-raised: #2d2b27;
+  --bg-card: #302e2a;
+  --bg-hover: #3a3733;
+  --bg-inset: #201e1b;
+  --sidebar: rgba(28, 27, 31, 0.86);
+  --border: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.12);
+  --text-primary: #f2efe9;
+  --text-secondary: #aba79f;
+  --text-tertiary: #77736b;
+  --accent-500: #e08a63;
+  --accent-600: #c96a45;
+  --accent-wash: rgba(224, 138, 99, 0.16);
+  --success-500: #83a374;
+  --success-wash: rgba(131, 163, 116, 0.16);
+  --danger-500: #cf6b60;
+  --danger-wash: rgba(207, 107, 96, 0.16);
+  --accent: var(--accent-500);
+  --accent-strong: var(--accent-600);
+  --accent-on: #211711;
+  --shadow-card: 0 1px 1px rgba(0, 0, 0, 0.14), 0 3px 8px -4px rgba(0, 0, 0, 0.2);
+  --shadow-pop: 0 16px 36px -14px rgba(0, 0, 0, 0.45);
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --bg: #faf9f5;
+  --bg-raised: #ffffff;
+  --bg-card: #ffffff;
+  --bg-hover: #f1efe6;
+  --bg-inset: #f0eee6;
+  --sidebar: rgba(250, 249, 245, 0.88);
+  --border: rgba(30, 26, 20, 0.08);
+  --border-strong: rgba(30, 26, 20, 0.14);
+  --text-primary: #262421;
+  --text-secondary: #6f6b63;
+  --text-tertiary: #a19c92;
+  --accent-500: #c96442;
+  --accent-600: #a94f30;
+  --accent-wash: rgba(201, 100, 66, 0.11);
+  --success-500: #57774a;
+  --success-wash: rgba(87, 119, 74, 0.1);
+  --danger-500: #b3453a;
+  --danger-wash: rgba(179, 69, 58, 0.1);
+  --accent: var(--accent-500);
+  --accent-strong: var(--accent-600);
+  --accent-on: #fdf6f2;
+  --shadow-card: 0 1px 1px rgba(40, 34, 24, 0.04), 0 2px 6px -3px rgba(40, 34, 24, 0.08);
+  --shadow-pop: 0 16px 36px -16px rgba(40, 34, 24, 0.22);
+  color-scheme: light;
+}

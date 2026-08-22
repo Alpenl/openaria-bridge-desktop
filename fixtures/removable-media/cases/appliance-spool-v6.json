@@ -1,0 +1,244 @@
+{
+  "fixture_schema": "ylx.removable_media.case_group.v1",
+  "input_kind": "ApplianceSpoolV6",
+  "base_tree": [
+    {
+      "path": "recordings/fixture-spool-v6/session.json",
+      "kind": "json",
+      "document": {
+        "schema_version": 6,
+        "session_id": "fixture-spool-v6",
+        "state": "encoding",
+        "captured_at": "2026-08-01T02:00:00Z",
+        "camera": {
+          "layout": "left_right_side_by_side",
+          "width": 3840,
+          "height": 1080,
+          "eye_width": 1920,
+          "source_fps": 60,
+          "output_fps": 30
+        },
+        "source_codec": "mjpeg",
+        "source_container": "fragmented_mp4"
+      }
+    },
+    {
+      "path": "recordings/fixture-spool-v6/capture.commit.json",
+      "kind": "json",
+      "document": {
+        "schema_version": 1,
+        "session_id": "fixture-spool-v6",
+        "state": "committed",
+        "native_capture_ok": true,
+        "mux_ok": true,
+        "preview_ok": true,
+        "source_segments": [
+          {
+            "index": 0,
+            "path": "spool/source_00000.mp4",
+            "closed": true,
+            "frame_count": 3,
+            "size_bytes": 36,
+            "sha256": "bb10fd204eab7438d6cf9dbc7fc72c80fcfa2dfde19da283e5eb8318d55ed2ee"
+          },
+          {
+            "index": 1,
+            "path": "spool/source_00001.mp4",
+            "closed": true,
+            "frame_count": 1,
+            "size_bytes": 33,
+            "sha256": "6abfa27f62c50673e5e18c3db284d21c12588641fe09c82fc07872cbb370d715"
+          }
+        ]
+      }
+    },
+    {
+      "path": "recordings/fixture-spool-v6/encoding.json",
+      "kind": "json",
+      "document": {
+        "schema_version": 1,
+        "session_id": "fixture-spool-v6",
+        "state": "encoding",
+        "source_inventory_closed": true,
+        "next_segment_index": 0,
+        "outputs": []
+      }
+    },
+    {
+      "path": "recordings/fixture-spool-v6/spool/segments.csv",
+      "kind": "utf8",
+      "content_utf8": "index,path,closed,frame_count,size_bytes,sha256\n0,spool/source_00000.mp4,true,3,36,bb10fd204eab7438d6cf9dbc7fc72c80fcfa2dfde19da283e5eb8318d55ed2ee\n1,spool/source_00001.mp4,true,1,33,6abfa27f62c50673e5e18c3db284d21c12588641fe09c82fc07872cbb370d715\n"
+    },
+    {
+      "path": "recordings/fixture-spool-v6/spool/source_00000.mp4",
+      "kind": "payload",
+      "payload_id": "spool-mjpeg-segment-00000"
+    },
+    {
+      "path": "recordings/fixture-spool-v6/spool/source_00001.mp4",
+      "kind": "payload",
+      "payload_id": "spool-mjpeg-short-tail-00001"
+    },
+    {
+      "path": "recordings/fixture-spool-v6/raw/frames.jsonl",
+      "kind": "utf8",
+      "content_utf8": "{\"frame_index\":0,\"capture_sequence\":0,\"timestamp_ns\":1000000000}\n{\"frame_index\":1,\"capture_sequence\":2,\"timestamp_ns\":1033333333}\n{\"frame_index\":2,\"capture_sequence\":4,\"timestamp_ns\":1066666666}\n{\"frame_index\":3,\"capture_sequence\":6,\"timestamp_ns\":1099999999}\n"
+    },
+    { "path": "recordings/fixture-spool-v6/raw/imu.jsonl", "kind": "payload", "payload_id": "imu-three-valid-samples" }
+  ],
+  "probe_evidence": [
+    {
+      "path": "spool/source_00000.mp4",
+      "codec": "mjpeg",
+      "container": "fragmented_mp4",
+      "layout": "left_right_side_by_side",
+      "width": 3840,
+      "height": 1080,
+      "fps": 30,
+      "frame_count": 3,
+      "duration_seconds": 0.1,
+      "closed": true,
+      "stub": true
+    },
+    {
+      "path": "spool/source_00001.mp4",
+      "codec": "mjpeg",
+      "container": "fragmented_mp4",
+      "layout": "left_right_side_by_side",
+      "width": 3840,
+      "height": 1080,
+      "fps": 30,
+      "frame_count": 1,
+      "duration_seconds": 0.033333333,
+      "closed": true,
+      "short_final_segment": true,
+      "stub": true
+    }
+  ],
+  "cases": [
+    {
+      "id": "spool-v6-valid-closed-short-tail",
+      "mutations": [],
+      "expected": {
+        "classification": "CommittedRawSpool",
+        "preflight_verdict": "ready_unsigned_requires_policy",
+        "admissible": true,
+        "provenance": "locally_validated_unsigned",
+        "normalization_eligible": true,
+        "automatic_upload_eligible": false,
+        "error_code": null,
+        "closed_segment_count": 2,
+        "short_final_segment_index": 1
+      }
+    },
+    {
+      "id": "spool-v6-missing-segment",
+      "mutations": [{ "operation": "remove_entry", "path": "recordings/fixture-spool-v6/spool/source_00001.mp4" }],
+      "expected": {
+        "classification": "RecoveryOnly",
+        "preflight_verdict": "corrupt",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "missing_source_segment",
+        "segment_index": 1
+      }
+    },
+    {
+      "id": "spool-v6-duplicate-segment",
+      "mutations": [
+        {
+          "operation": "replace_utf8",
+          "path": "recordings/fixture-spool-v6/spool/segments.csv",
+          "content_utf8": "index,path,closed,frame_count,size_bytes,sha256\n0,spool/source_00000.mp4,true,3,36,bb10fd204eab7438d6cf9dbc7fc72c80fcfa2dfde19da283e5eb8318d55ed2ee\n0,spool/source_00001.mp4,true,1,33,6abfa27f62c50673e5e18c3db284d21c12588641fe09c82fc07872cbb370d715\n"
+        }
+      ],
+      "expected": {
+        "classification": "RecoveryOnly",
+        "preflight_verdict": "corrupt",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "duplicate_segment_index",
+        "segment_index": 0
+      }
+    },
+    {
+      "id": "spool-v6-unclosed-tail",
+      "mutations": [
+        {
+          "operation": "replace_utf8",
+          "path": "recordings/fixture-spool-v6/spool/segments.csv",
+          "content_utf8": "index,path,closed,frame_count,size_bytes,sha256\n0,spool/source_00000.mp4,true,3,36,bb10fd204eab7438d6cf9dbc7fc72c80fcfa2dfde19da283e5eb8318d55ed2ee\n1,spool/source_00001.mp4,false,1,33,6abfa27f62c50673e5e18c3db284d21c12588641fe09c82fc07872cbb370d715\n"
+        },
+        { "operation": "remove_entry", "path": "recordings/fixture-spool-v6/capture.commit.json" }
+      ],
+      "expected": {
+        "classification": "RecoveryOnly",
+        "preflight_verdict": "recording_or_encoding_incomplete",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "source_segment_not_closed",
+        "segment_index": 1
+      }
+    },
+    {
+      "id": "spool-v6-capture-commit-conflict",
+      "mutations": [
+        {
+          "operation": "replace_json",
+          "path": "recordings/fixture-spool-v6/capture.commit.json",
+          "document": {
+            "schema_version": 1,
+            "session_id": "different-session",
+            "state": "committed",
+            "native_capture_ok": true,
+            "mux_ok": true,
+            "preview_ok": true,
+            "source_segments": []
+          }
+        }
+      ],
+      "expected": {
+        "classification": "RecoveryOnly",
+        "preflight_verdict": "corrupt",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "capture_commit_conflict"
+      }
+    },
+    {
+      "id": "spool-v6-encoding-interrupted",
+      "mutations": [
+        {
+          "operation": "replace_json",
+          "path": "recordings/fixture-spool-v6/encoding.json",
+          "document": {
+            "schema_version": 1,
+            "session_id": "fixture-spool-v6",
+            "state": "interrupted",
+            "source_inventory_closed": true,
+            "next_segment_index": 0,
+            "outputs": [],
+            "failure": "fixture interruption"
+          }
+        }
+      ],
+      "expected": {
+        "classification": "RecoveryOnly",
+        "preflight_verdict": "recording_or_encoding_incomplete",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "encoding_interrupted"
+      }
+    }
+  ]
+}

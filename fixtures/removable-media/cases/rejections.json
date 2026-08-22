@@ -1,0 +1,92 @@
+{
+  "fixture_schema": "ylx.removable_media.case_group.v1",
+  "input_kind": "RejectedOrRecoveryOnly",
+  "cases": [
+    {
+      "id": "recovery-active-interrupted",
+      "tree": [
+        {
+          "path": "recordings/fixture-interrupted/session.json",
+          "kind": "json",
+          "document": {
+            "schema_version": 6,
+            "session_id": "fixture-interrupted",
+            "state": "interrupted",
+            "integrity_ok": false,
+            "failure": "fixture power loss"
+          }
+        },
+        {
+          "path": "recordings/fixture-interrupted/spool/segments.csv",
+          "kind": "utf8",
+          "content_utf8": "index,path,closed,frame_count,size_bytes,sha256\n0,spool/source_00000.mp4,false,3,36,bb10fd204eab7438d6cf9dbc7fc72c80fcfa2dfde19da283e5eb8318d55ed2ee\n"
+        },
+        {
+          "path": "recordings/fixture-interrupted/spool/source_00000.mp4",
+          "kind": "payload",
+          "payload_id": "spool-mjpeg-segment-00000"
+        }
+      ],
+      "expected": {
+        "classification": "RecoveryOnly",
+        "preflight_verdict": "recording_or_encoding_incomplete",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "recording_interrupted"
+      }
+    },
+    {
+      "id": "recovery-malformed-session-json",
+      "tree": [
+        {
+          "path": "recordings/fixture-corrupt/session.json",
+          "kind": "utf8",
+          "content_utf8": "{\"schema_version\":6,\"session_id\":\"fixture-corrupt\",\"state\":"
+        }
+      ],
+      "expected": {
+        "classification": "Rejected",
+        "preflight_verdict": "corrupt",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "manifest_invalid_json"
+      }
+    },
+    {
+      "id": "recovery-unknown-major-schema",
+      "tree": [
+        {
+          "path": "fixture-unknown/capture.json",
+          "kind": "json",
+          "document": {
+            "schema": "ylx.stereo_imu.raw.v99",
+            "state": "complete",
+            "video": {
+              "encoding": "mjpeg",
+              "transport": "file",
+              "persistent": true,
+              "path": "stereo.mjpeg",
+              "size_bytes": 18
+            }
+          }
+        },
+        { "path": "fixture-unknown/stereo.mjpeg", "kind": "payload", "payload_id": "raw-mjpeg-three-frames" }
+      ],
+      "expected": {
+        "classification": "Rejected",
+        "preflight_verdict": "unsupported_schema",
+        "admissible": false,
+        "provenance": "unverified",
+        "normalization_eligible": false,
+        "automatic_upload_eligible": false,
+        "error_code": "unsupported_schema",
+        "observed_schema": "ylx.stereo_imu.raw.v99",
+        "must_not_guess_compatible_major": true
+      }
+    }
+  ]
+}

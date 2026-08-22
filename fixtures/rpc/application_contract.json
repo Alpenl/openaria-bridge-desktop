@@ -1,0 +1,313 @@
+{
+  "transfer": {
+    "key": "transfer-fixture-a",
+    "label": "capture-session-a",
+    "totalBytes": 4096,
+    "sentBytes": 1024,
+    "state": "running",
+    "error": null,
+    "retryable": false,
+    "direction": "down",
+    "targetLabel": "YLX-ABCDEF01"
+  },
+  "revisionedEvent": {
+    "name": "transfers:update",
+    "payload": {
+      "revision": 18,
+      "value": [
+        {
+          "direction": "down",
+          "error": null,
+          "key": "transfer-fixture-a",
+          "label": "capture-session-a",
+          "retryable": false,
+          "sentBytes": 1024,
+          "state": "running",
+          "targetLabel": "YLX-ABCDEF01",
+          "totalBytes": 4096
+        },
+        {
+          "direction": "down",
+          "error": null,
+          "key": "transfer-fixture-b",
+          "label": "capture-session-b",
+          "retryable": false,
+          "sentBytes": 512,
+          "state": "running",
+          "targetLabel": "YLX-ABCDEF01",
+          "totalBytes": 2048
+        }
+      ]
+    }
+  },
+  "snapshot": {
+    "revision": 18,
+    "value": {
+      "devices": {
+        "revision": 15,
+        "value": [
+          {
+            "id": "ylx-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "displayId": "YLX-ABCDEF01",
+            "ip": "192.0.2.10",
+            "state": "connected",
+            "lastSeen": "2026-08-03T10:10:11Z"
+          },
+          {
+            "id": "ylx-abcdef0198765432abcdef0198765432abcdef0198765432abcdef0198765432",
+            "displayId": "YLX-ABCDEF01",
+            "ip": "192.0.2.11",
+            "state": "idle",
+            "lastSeen": "2026-08-03T10:10:12Z"
+          }
+        ]
+      },
+      "library": {
+        "revision": 16,
+        "value": [
+          {
+            "deviceId": "ylx-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "deviceDisplayId": "YLX-ABCDEF01",
+            "sessionId": "session-fixture-a",
+            "dateLabel": "2026-08-03",
+            "downloadedAt": "2026-08-03T10:11:12Z",
+            "bytes": 2048,
+            "files": [
+              {
+                "fileId": "file-fixture-a",
+                "displayPath": "video/left.mp4",
+                "bytes": 2048,
+                "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+              }
+            ],
+            "complete": true,
+            "uploadStatus": "done",
+            "uploadRetryable": false,
+            "uploadedAt": "2026-08-03T10:12:13Z",
+            "uploadError": null
+          },
+          {
+            "deviceId": "ylx-abcdef0198765432abcdef0198765432abcdef0198765432abcdef0198765432",
+            "deviceDisplayId": "YLX-ABCDEF01",
+            "sessionId": "session-fixture-b",
+            "dateLabel": "2026-08-03",
+            "downloadedAt": "2026-08-03T10:13:12Z",
+            "bytes": 1024,
+            "files": [
+              {
+                "fileId": "file-fixture-b",
+                "displayPath": "video/right.mp4",
+                "bytes": 1024,
+                "sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+              }
+            ],
+            "complete": true,
+            "uploadStatus": "none",
+            "uploadRetryable": false,
+            "uploadedAt": null,
+            "uploadError": null
+          }
+        ]
+      },
+      "transfers": {
+        "revision": 18,
+        "value": [
+          {
+            "key": "transfer-fixture-a",
+            "label": "capture-session-a",
+            "totalBytes": 4096,
+            "sentBytes": 1024,
+            "state": "running",
+            "error": null,
+            "retryable": false,
+            "direction": "down",
+            "targetLabel": "YLX-ABCDEF01"
+          },
+          {
+            "key": "transfer-fixture-b",
+            "label": "capture-session-b",
+            "totalBytes": 2048,
+            "sentBytes": 512,
+            "state": "running",
+            "error": null,
+            "retryable": false,
+            "direction": "down",
+            "targetLabel": "YLX-ABCDEF01"
+          }
+        ]
+      },
+      "storage": {
+        "revision": 17,
+        "value": {
+          "endpoint": "https://oss-cn-beijing.aliyuncs.com",
+          "bucket": "ylx-recordings",
+          "prefix": "fixture",
+          "urlStyle": "virtualHost",
+          "downloadRoot": "/srv/ylx-recordings",
+          "activeDownloadRoot": "/srv/ylx-recordings",
+          "secretConfigured": false
+        }
+      }
+    }
+  },
+  "manualDevice": {
+    "revision": 22,
+    "value": {
+      "id": "ylx-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+      "displayId": "YLX-ABCDEF01",
+      "ip": "192.0.2.10",
+      "state": "connected",
+      "lastSeen": "2026-08-03T10:10:11Z"
+    }
+  },
+  "batchJobs": {
+    "results": [
+      {
+        "status": "success",
+        "item": "session-fixture-b",
+        "jobId": "download-job-fixture-b"
+      },
+      {
+        "status": "failure",
+        "item": "session-fixture-a",
+        "error": {
+          "code": "download_enqueue_failed",
+          "message": "设备离线",
+          "retryable": true,
+          "details": {
+            "deviceId": "ylx-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            "sessionId": "session-fixture-a"
+          }
+        }
+      }
+    ]
+  },
+  "sessionMutation": {
+    "revision": 19,
+    "value": {
+      "results": [],
+      "sessions": null,
+      "operationError": {
+        "code": "cleanup_catalog_unavailable",
+        "message": "无法读取设备会话清单",
+        "retryable": true,
+        "details": {
+          "deviceId": "ylx-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        }
+      }
+    }
+  },
+  "libraryMutation": {
+    "revision": 20,
+    "value": {
+      "results": [
+        {
+          "status": "success",
+          "item": "ylx-abcdef0198765432abcdef0198765432abcdef0198765432abcdef0198765432|session-fixture-b"
+        },
+        {
+          "status": "failure",
+          "item": "ylx-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789|session-fixture-a",
+          "error": {
+            "code": "library_delete_busy",
+            "message": "传输进行中，无法删除",
+            "retryable": true,
+            "details": {
+              "deviceId": "ylx-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+              "sessionId": "session-fixture-a"
+            }
+          }
+        }
+      ],
+      "library": [
+        {
+          "deviceId": "ylx-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+          "deviceDisplayId": "YLX-ABCDEF01",
+          "sessionId": "session-fixture-a",
+          "dateLabel": "2026-08-03",
+          "downloadedAt": "2026-08-03T10:11:12Z",
+          "bytes": 2048,
+          "files": [
+            {
+              "fileId": "file-fixture-a",
+              "displayPath": "video/left.mp4",
+              "bytes": 2048,
+              "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "complete": true,
+          "uploadStatus": "done",
+          "uploadRetryable": false,
+          "uploadedAt": "2026-08-03T10:12:13Z",
+          "uploadError": null
+        },
+        {
+          "deviceId": "ylx-abcdef0198765432abcdef0198765432abcdef0198765432abcdef0198765432",
+          "deviceDisplayId": "YLX-ABCDEF01",
+          "sessionId": "session-fixture-b",
+          "dateLabel": "2026-08-03",
+          "downloadedAt": "2026-08-03T10:13:12Z",
+          "bytes": 1024,
+          "files": [
+            {
+              "fileId": "file-fixture-b",
+              "displayPath": "video/right.mp4",
+              "bytes": 1024,
+              "sha256": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            }
+          ],
+          "complete": true,
+          "uploadStatus": "none",
+          "uploadRetryable": false,
+          "uploadedAt": null,
+          "uploadError": null
+        }
+      ]
+    }
+  },
+  "downloadedCleanupResult": {
+    "revision": 21,
+    "value": {
+      "eligible": [
+        {
+          "sessionId": "session-fixture-a",
+          "dateLabel": "2026-08-03",
+          "bytes": 2048
+        }
+      ],
+      "deleted": [],
+      "failed": [
+        {
+          "sessionId": "session-fixture-a",
+          "error": {
+            "code": "downloaded_cleanup_delete_failed",
+            "message": "设备拒绝删除已下载会话",
+            "retryable": false,
+            "details": {
+              "deviceId": "ylx-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+              "sessionId": "session-fixture-a"
+            }
+          }
+        }
+      ],
+      "skipped": [
+        {
+          "sessionId": "session-fixture-b",
+          "dateLabel": "2026-08-03",
+          "bytes": 1024,
+          "reason": "尚未完成对象存储备份"
+        }
+      ],
+      "sessions": []
+    }
+  },
+  "rpcError": {
+    "code": "invalid_input",
+    "message": "invalid sessionIds: must not be empty",
+    "retryable": false,
+    "details": {
+      "field": "sessionIds",
+      "reason": "must not be empty"
+    }
+  }
+}

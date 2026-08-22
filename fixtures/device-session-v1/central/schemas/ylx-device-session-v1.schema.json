@@ -1,0 +1,603 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ylx:schema:device-session:v1",
+  "title": "YLX Sealed Device Session Manifest v1",
+  "description": "The immutable capture-side success manifest written last after finalization, any placement-required transform, and device-side verification. Its presence identifies a sealed session; every consumer still independently verifies schema, integrity, invariants, and artifact bytes before use. Transform placement is defined by the deployed media contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "manifest_id",
+    "sealed",
+    "sealed_at",
+    "session_id",
+    "volume_id",
+    "capture_mode",
+    "display_name",
+    "device",
+    "time",
+    "take",
+    "camera",
+    "video",
+    "imu",
+    "frames",
+    "logs",
+    "integrity"
+  ],
+  "properties": {
+    "schema": {
+      "const": "ylx.device-session.v1"
+    },
+    "manifest_id": {
+      "$ref": "#/$defs/uuidV7",
+      "description": "Immutable identity of these exact manifest semantics; publication additionally binds the exact serialized bytes by SHA-256."
+    },
+    "sealed": {
+      "const": true,
+      "description": "A session manifest only represents successfully sealed output."
+    },
+    "sealed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "session_id": {
+      "$ref": "#/$defs/uuidV7"
+    },
+    "volume_id": {
+      "$ref": "#/$defs/uuidV4"
+    },
+    "capture_mode": {
+      "enum": ["production", "calibration"],
+      "description": "Capture intent. The deployed media contract selects which supported video layout production capture writes."
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "description": "Display-only human label; never use it as a directory key, object key, or session identity."
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device_id",
+        "device_label",
+        "hardware_fingerprint",
+        "platform",
+        "software_version",
+        "commit"
+      ],
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/uuidV4",
+          "description": "Canonical random machine identity."
+        },
+        "device_label": {
+          "type": "string",
+          "pattern": "^YLX-[0-9A-F]{8}$",
+          "description": "Display-only label."
+        },
+        "hardware_fingerprint": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "platform": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "software_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40,64}$"
+        }
+      }
+    },
+    "time": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started_at", "ended_at", "timezone", "duration_seconds"],
+      "properties": {
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "ended_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "timezone": {
+          "type": "string",
+          "pattern": "^[A-Za-z_]+(?:/[A-Za-z0-9_+.-]+)+$",
+          "description": "IANA time zone used to derive display_name."
+        },
+        "duration_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "duration_clock": {
+          "const": "host_monotonic",
+          "description": "When present, duration_seconds is measured between monotonic capture boundaries."
+        }
+      }
+    },
+    "take": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["take_id", "sequence", "continuation_of"],
+      "oneOf": [
+        {
+          "properties": {
+            "sequence": {
+              "const": 1
+            },
+            "continuation_of": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "sequence": {
+              "type": "integer",
+              "minimum": 2
+            },
+            "continuation_of": {
+              "$ref": "#/$defs/uuidV7"
+            }
+          }
+        }
+      ],
+      "properties": {
+        "take_id": {
+          "$ref": "#/$defs/uuidV7",
+          "description": "Shared UUIDv7 across all sessions in one logical take."
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "continuation_of": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/uuidV7"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "camera": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "width",
+        "height",
+        "eye_width",
+        "sensor_fps",
+        "frame_decimation",
+        "effective_fps",
+        "coordinate_frame"
+      ],
+      "properties": {
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "eye_width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sensor_fps": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "frame_decimation": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "nominal_fps": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Configured post-decimation target cadence; not an observed quality measurement."
+        },
+        "effective_fps": {
+          "type": "number",
+          "minimum": 0,
+          "description": "For measured-semantics manifests, retained frame count divided by capture duration."
+        },
+        "coordinate_frame": {
+          "const": "opencv_optical"
+        }
+      }
+    },
+    "video": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/splitEyesVideo"
+        },
+        {
+          "$ref": "#/$defs/rawSideBySideVideo"
+        }
+      ]
+    },
+    "imu": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact", "sample_count", "units", "coordinate_frame"],
+      "properties": {
+        "artifact": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/artifact"
+            },
+            {
+              "properties": {
+                "role": {
+                  "const": "imu.samples"
+                },
+                "media_type": {
+                  "const": "application/x-ndjson"
+                }
+              }
+            }
+          ]
+        },
+        "sample_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "units": {
+          "const": "raw_int16"
+        },
+        "coordinate_frame": {
+          "const": "opencv_optical"
+        }
+      }
+    },
+    "frames": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact", "count"],
+      "properties": {
+        "artifact": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/artifact"
+            },
+            {
+              "properties": {
+                "role": {
+                  "const": "frames.index"
+                },
+                "media_type": {
+                  "const": "application/x-ndjson"
+                }
+              }
+            }
+          ]
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "logs": {
+      "type": "array",
+      "description": "Device-side source logs. A source role such as log.transform remains ordinary source inventory and is distinct from the publication-only publication.transform-log evidence role.",
+      "items": {
+        "allOf": [
+          {
+            "$ref": "#/$defs/artifact"
+          },
+          {
+            "properties": {
+              "role": {
+                "pattern": "^log(?:[._-][a-z0-9]+)+$"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "integrity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verified_at",
+        "dropped_frames",
+        "drop_events",
+        "fatal_errors"
+      ],
+      "properties": {
+        "verified_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "dropped_frames": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "drop_events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/dropEvent"
+          }
+        },
+        "quality_policy": {
+          "$ref": "#/$defs/qualityPolicy"
+        },
+        "media_write_throughput_bytes_per_second": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "fatal_errors": {
+          "const": [],
+          "description": "A sealed success manifest cannot contain fatal errors; failure diagnostics belong in ylx.recording-state.v1."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "qualityPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy_id",
+        "max_contiguous_dropped_frames",
+        "max_total_dropped_frames",
+        "max_drop_fraction",
+        "window_seconds",
+        "max_dropped_frames_per_window"
+      ],
+      "properties": {
+        "policy_id": {"const": "rdk-x5-lossless-v1"},
+        "max_contiguous_dropped_frames": {"const": 0},
+        "max_total_dropped_frames": {"const": 0},
+        "max_drop_fraction": {"const": 0},
+        "window_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "max_dropped_frames_per_window": {"const": 0}
+      }
+    },
+    "uuidV7": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "Canonical lowercase UUIDv7."
+    },
+    "uuidV4": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "Canonical lowercase random UUIDv4."
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*[\\u0000-\\u001f\\u007f-\\u009f])(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/]+(?:/[^/]+)*$",
+      "allOf": [
+        {
+          "not": {
+            "pattern": "^(?:manifest\\.json|recording\\.json)(?:/|$)"
+          }
+        },
+        {
+          "not": {
+            "pattern": "(?:^|/)[^/]*\\.tmp(?:[._-][^/]*)?(?:/|$)"
+          }
+        }
+      ],
+      "description": "Normalized session-relative POSIX artifact path. Root control files and conventional .tmp names are reserved for the seal/state protocols."
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "role", "path", "media_type", "bytes", "sha256"],
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/sha256",
+          "description": "Content identity; MUST equal sha256."
+        },
+        "role": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$",
+          "maxLength": 96
+        },
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "media_type": {
+          "type": "string",
+          "pattern": "^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "stereoSegment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "start_frame",
+        "end_frame",
+        "start_time_seconds",
+        "end_time_seconds",
+        "artifacts"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Zero-based stereo segment-group index; group indices MUST be contiguous and ordered."
+        },
+        "start_frame": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Inclusive frame-record sequence in the post-decimation, pre-drop domain."
+        },
+        "end_frame": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Exclusive frame-record sequence in the post-decimation, pre-drop domain."
+        },
+        "start_time_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end_time_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "artifacts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["left", "right"],
+          "properties": {
+            "left": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/artifact"
+                },
+                {
+                  "properties": {
+                    "role": {
+                      "const": "video.left"
+                    },
+                    "media_type": {
+                      "const": "video/mp4"
+                    }
+                  }
+                }
+              ]
+            },
+            "right": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/artifact"
+                },
+                {
+                  "properties": {
+                    "role": {
+                      "const": "video.right"
+                    },
+                    "media_type": {
+                      "const": "video/mp4"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "splitEyesVideo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layout", "codec", "container", "segments"],
+      "properties": {
+        "layout": {
+          "const": "split-eyes"
+        },
+        "codec": {
+          "const": "h264"
+        },
+        "container": {
+          "const": "mp4"
+        },
+        "segments": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/stereoSegment"
+          }
+        }
+      }
+    },
+    "rawSideBySideVideo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["layout", "codec", "continuous", "artifact"],
+      "properties": {
+        "layout": {
+          "const": "raw-side-by-side"
+        },
+        "codec": {
+          "const": "mjpeg"
+        },
+        "continuous": {
+          "const": true
+        },
+        "artifact": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/artifact"
+            },
+            {
+              "properties": {
+                "role": {
+                  "const": "video.raw-side-by-side"
+                },
+                "media_type": {
+                  "const": "video/x-motion-jpeg"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "dropEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_frame", "end_frame", "at_time_seconds", "reason", "dropped"],
+      "properties": {
+        "start_frame": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Inclusive first omitted frame-record sequence in the post-decimation, pre-drop domain."
+        },
+        "end_frame": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Exclusive frame-record sequence after the gap in the post-decimation, pre-drop domain."
+        },
+        "at_time_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "reason": {
+          "const": "write_backpressure"
+        },
+        "dropped": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "MUST equal end_frame minus start_frame."
+        }
+      }
+    }
+  }
+}

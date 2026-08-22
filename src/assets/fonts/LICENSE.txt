@@ -1,0 +1,3 @@
+DejaVu Sans Mono is bundled from this system's fonts-dejavu-core package,
+licensed under the Bitstream Vera License + public domain additions.
+Full license text: https://dejavu-fonts.github.io/License.html

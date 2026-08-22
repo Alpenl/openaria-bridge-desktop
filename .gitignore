@@ -1,14 +1,30 @@
-__pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
-.ruff_cache/
-.venv/
-build/
-dist/
-.coverage
-htmlcov/
-*.db
-*.db-shm
-*.db-wal
-browser-artifacts/
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# First-run object-store credential bootstrap (composition.rs's
+# CREDENTIAL_BOOTSTRAP_FILE). It belongs in the app data directory, never
+# in the repository -- this entry exists so a stray copy cannot be
+# committed by accident. See ADR-CRED-001.
+credentials.json

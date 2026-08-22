@@ -1,0 +1,101 @@
+{
+  "schema": "ylx.device-session.v1",
+  "manifest_id": "01989f80-0001-7b2c-9d3e-4f5061728394",
+  "sealed": true,
+  "sealed_at": "2026-08-08T12:05:02+08:00",
+  "session_id": "01989f80-0000-7a1b-8c2d-3e4f50617283",
+  "volume_id": "6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+  "capture_mode": "calibration",
+  "display_name": "2026-08-08_12-00-00_YLX-30D5872D_CAL",
+  "device": {
+    "device_id": "550e8400-e29b-41d4-a716-446655440000",
+    "device_label": "YLX-30D5872D",
+    "hardware_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": "raspberry-pi-5",
+    "software_version": "0.10.0-dev.1",
+    "commit": "2db57ae68e04197397b8ac84f4d71548aa2fcb36"
+  },
+  "time": {
+    "started_at": "2026-08-08T12:00:00+08:00",
+    "ended_at": "2026-08-08T12:05:00+08:00",
+    "timezone": "Asia/Shanghai",
+    "duration_seconds": 300,
+    "duration_clock": "host_monotonic"
+  },
+  "take": {
+    "take_id": "01989f80-0000-7c3d-ae4f-5061728394a5",
+    "sequence": 1,
+    "continuation_of": null
+  },
+  "camera": {
+    "width": 3840,
+    "height": 1080,
+    "eye_width": 1920,
+    "sensor_fps": 60,
+    "frame_decimation": 1,
+    "nominal_fps": 60,
+    "effective_fps": 59,
+    "coordinate_frame": "opencv_optical"
+  },
+  "video": {
+    "layout": "raw-side-by-side",
+    "codec": "mjpeg",
+    "continuous": true,
+    "artifact": {
+      "artifact_id": "6666666666666666666666666666666666666666666666666666666666666666",
+      "role": "video.raw-side-by-side",
+      "path": "video/stereo.mjpeg",
+      "media_type": "video/x-motion-jpeg",
+      "bytes": 6600000000,
+      "sha256": "6666666666666666666666666666666666666666666666666666666666666666"
+    }
+  },
+  "imu": {
+    "artifact": {
+      "artifact_id": "7777777777777777777777777777777777777777777777777777777777777777",
+      "role": "imu.samples",
+      "path": "imu/imu.jsonl",
+      "media_type": "application/x-ndjson",
+      "bytes": 4120000,
+      "sha256": "7777777777777777777777777777777777777777777777777777777777777777"
+    },
+    "sample_count": 60000,
+    "units": "raw_int16",
+    "coordinate_frame": "opencv_optical"
+  },
+  "frames": {
+    "artifact": {
+      "artifact_id": "8888888888888888888888888888888888888888888888888888888888888888",
+      "role": "frames.index",
+      "path": "imu/frames.jsonl",
+      "media_type": "application/x-ndjson",
+      "bytes": 3100000,
+      "sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+    },
+    "count": 18000
+  },
+  "logs": [
+    {
+      "artifact_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "role": "log.transform",
+      "path": "logs/capture-transform.json",
+      "media_type": "application/json",
+      "bytes": 1536,
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+  ],
+  "integrity": {
+    "verified_at": "2026-08-08T12:05:01+08:00",
+    "dropped_frames": 0,
+    "drop_events": [],
+    "quality_policy": {
+      "policy_id": "rdk-x5-lossless-v1",
+      "max_contiguous_dropped_frames": 0,
+      "max_total_dropped_frames": 0,
+      "max_drop_fraction": 0,
+      "window_seconds": 1,
+      "max_dropped_frames_per_window": 0
+    },
+    "fatal_errors": []
+  }
+}

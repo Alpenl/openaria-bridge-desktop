@@ -1,56 +1,348 @@
-name: CI
+name: CI / Release
 
 on:
   push:
     branches: [main]
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: >-
+          Existing semantic-version tag to build and publish. Leave empty to
+          run CI against the selected branch without publishing a release.
+        required: false
+        default: ""
+        type: string
+      platforms:
+        description: >-
+          Desktop platforms to build and run the recovery contract on.
+          "ubuntu" skips the macOS and Windows lanes, which is for iterating on
+          a Linux-only change; it is not cross-platform verification, so a
+          change that ships still needs a full run.
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - ubuntu
 
 permissions:
   contents: read
 
+# One in-flight run per ref. A superseded push has nothing useful left to
+# say, and letting it finish only delays the run that replaced it.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  test:
-    runs-on: ${{ matrix.os }}
+  prepare:
+    name: resolve build metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      checkout_ref: ${{ steps.metadata.outputs.checkout_ref }}
+      is_release: ${{ steps.metadata.outputs.is_release }}
+      release_tag: ${{ steps.metadata.outputs.release_tag }}
+      platforms: ${{ steps.metadata.outputs.platforms }}
+    steps:
+      - name: Resolve build metadata
+        id: metadata
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+          REQUESTED_PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+
+          checkout_ref="${GITHUB_REF}"
+          release_tag=""
+
+          # A dispatch without a tag is a plain manual CI run against the
+          # selected ref, so only an explicitly requested tag redirects the
+          # checkout.
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${REQUESTED_TAG}" ]]; then
+            checkout_ref="${REQUESTED_TAG}"
+            release_tag="${REQUESTED_TAG}"
+          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            release_tag="${GITHUB_REF_NAME}"
+          fi
+
+          if [[ -n "${release_tag}" && ! "${release_tag}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must use the numeric SemVer form X.Y.Z; got '${release_tag}'." >&2
+            exit 1
+          fi
+
+          is_release=false
+          if [[ -n "${release_tag}" ]]; then
+            is_release=true
+          fi
+
+          # Only a manual dispatch may narrow the matrix, and never for a
+          # release: a published artifact is always built on all three.
+          platforms='["ubuntu-latest","macos-latest","windows-latest"]'
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" \
+                && "${REQUESTED_PLATFORMS}" == "ubuntu" \
+                && "${is_release}" == "false" ]]; then
+            platforms='["ubuntu-latest"]'
+          fi
+
+          {
+            echo "checkout_ref=${checkout_ref}"
+            echo "is_release=${is_release}"
+            echo "release_tag=${release_tag}"
+            echo "platforms=${platforms}"
+          } >> "${GITHUB_OUTPUT}"
+
+  frontend:
+    name: frontend (lint, typecheck, build)
+    needs: prepare
+    runs-on: ubuntu-latest
     timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run contracts:check
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build
+
+  # Rust checks for the single Cargo workspace. The root manifest owns the
+  # application, core crate, and adapter crate, so one all-targets/all-features
+  # gate covers production and test code together.
+  rust:
+    name: rust (fmt, clippy, test)
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+
+      # The outer crate links against the system webkit/gtk stack, so even
+      # `cargo clippy` on it needs these present.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev patchelf build-essential curl wget file libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: cargo fmt --check
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: cargo clippy
+        run: >-
+          cargo clippy --manifest-path src-tauri/Cargo.toml
+          --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: >-
+          cargo test --manifest-path src-tauri/Cargo.toml
+          --workspace --all-targets --all-features
+
+  object-store-minio:
+    name: hermetic object-store contract (MinIO)
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Run the pinned MinIO contract lane
+        env:
+          YLX_MINIO_IMAGE: minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+        run: bash src-tauri/crates/ylx-transfer-adapters/tests/support/run_minio_object_store_contract.sh
+
+  fs-recovery:
+    name: filesystem recovery (${{ matrix.os }})
+    needs: prepare
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.11", "3.13"]
+        os: ${{ fromJSON(needs.prepare.outputs.platforms) }}
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v6
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-      - name: Install project and dependencies
-        run: python -m pip install -e .
-      - name: Run tests
-        run: python -m unittest discover -s tests -v
-      - name: Check command entry point
-        run: ylx-transfer doctor --json
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
 
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Run filesystem recovery contract
+        run: >-
+          cargo test --manifest-path src-tauri/Cargo.toml
+          -p ylx-transfer-core --test fs_recovery_contract
+          --all-targets --all-features -- --nocapture
+
+  # Builds the full desktop app on all three target platforms. This is the
+  # actual cross-platform verification for this project — see
+  # docs/LAN_TRANSFER_PROTOCOL.md for why local builds on Linux dev boxes
+  # can't easily verify this themselves (webkit2gtk isn't always installed).
+  tauri:
+    name: tauri build (${{ matrix.platform }})
+    needs: [prepare, frontend, rust]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(needs.prepare.outputs.platforms) }}
+    runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v6
         with:
-          python-version: "3.13"
-          cache: pip
-      - name: Install build frontend
-        run: python -m pip install build
-      - name: Build wheel and source distribution
-        run: python -m build
-      - uses: actions/upload-artifact@v5
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev patchelf build-essential curl wget file libssl-dev
+
+      - uses: actions/setup-node@v6
         with:
-          name: ylx-transfer-${{ github.sha }}
-          path: dist/
+          node-version: 22
+          cache: npm
+
+      - name: Set bundle version from Release tag
+        if: needs.prepare.outputs.is_release == 'true'
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const path = "src-tauri/tauri.conf.json";
+          const config = JSON.parse(fs.readFileSync(path, "utf8"));
+
+          config.version = process.env.RELEASE_VERSION;
+          fs.writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+          NODE
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      # Formatting is platform-independent and already gated by the `rust`
+      # job; clippy and all-target tests are not -- cfg-gated paths differ per
+      # OS, which is the whole point of running this matrix.
+      - name: cargo clippy
+        run: >-
+          cargo clippy --manifest-path src-tauri/Cargo.toml
+          --workspace --all-targets --all-features -- -D warnings
+
+      - name: Rust workspace tests
+        run: >-
+          cargo test --manifest-path src-tauri/Cargo.toml
+          --workspace --all-targets --all-features
+
+      - name: tauri build
+        uses: tauri-apps/tauri-action@v0
+
+      - name: Upload Tauri artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: ylx-transfer-${{ matrix.platform }}
           if-no-files-found: error
-          retention-days: 7
+          path: |
+            src-tauri/target/release/bundle/**
+            src-tauri/target/release/ylx-transfer
+            src-tauri/target/release/ylx-transfer.exe
+
+  release:
+    name: publish GitHub Release
+    if: needs.prepare.outputs.is_release == 'true'
+    needs: [prepare, tauri]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: ylx-transfer-*
+          path: release-assets
+
+      - name: Create Release and upload installers
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          assets=()
+          while IFS= read -r -d '' asset; do
+            assets+=("${asset}")
+          done < <(
+            find release-assets -type f \
+              \( -name '*.AppImage' \
+                -o -name '*.deb' \
+                -o -name '*.rpm' \
+                -o -name '*.dmg' \
+                -o -name '*.msi' \
+                -o -name '*-setup.exe' \) \
+              -print0 | sort -z
+          )
+
+          if (( ${#assets[@]} == 0 )); then
+            echo "No packaged desktop installers were found in the build artifacts." >&2
+            exit 1
+          fi
+
+          printf 'Release assets:\n'
+          printf '  %s\n' "${assets[@]}"
+
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
+              --draft \
+              --generate-notes \
+              --title "Release ${RELEASE_TAG}" \
+              --verify-tag
+          fi
+
+          gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
+          gh release edit "${RELEASE_TAG}" \
+            --draft=false \
+            --prerelease=false \
+            --title "Release ${RELEASE_TAG}"
