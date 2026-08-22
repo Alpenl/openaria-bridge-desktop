@@ -1,8 +1,8 @@
 //! Shared data types for the YLX Transfer backend.
 //!
-//! These mirror `docs/LAN_TRANSFER_PROTOCOL.md` §4.4 (HTTP API response shapes)
-//! and the frontend's `src/types.ts` mirror. Field names are serialized as
-//! camelCase so the TypeScript side can consume them without translation.
+//! These wire DTOs are mirrored by the frontend's `src/types.ts`. Field names
+//! are serialized as camelCase so TypeScript can consume them without
+//! translation.
 
 use serde::{Deserialize, Deserializer, Serialize};
 use ylx_transfer_core::device::StoredDeviceIdentity;
@@ -92,8 +92,8 @@ impl<'de> Deserialize<'de> for SessionFile {
     }
 }
 
-/// A completed recording session, as returned by `GET /api/v1/sessions` in the
-/// real protocol (see docs §4.4). Only `state == "complete" && integrity_ok`
+/// A completed recording session, as returned by `GET /api/v1/sessions`.
+/// Only `state == "complete" && integrity_ok`
 /// sessions are ever surfaced here — the Pi-side filtering is assumed to have
 /// already happened before this struct is constructed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,9 +143,9 @@ pub enum UploadStatus {
     Failed,
 }
 
-/// A session that has been downloaded to local disk. Lives independently of
-/// the source device (see LAN_TRANSFER_PROTOCOL.md §5.3) — it must keep
-/// working even if the originating Pi is later deleted or offline.
+/// A session that has been downloaded to local disk. It lives independently
+/// of the source device and must keep working if that device is later deleted
+/// or offline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LibraryEntry {
@@ -385,9 +385,8 @@ pub enum StorageUrlStyle {
 /// it deliberately has NO `access_key`/`secret_key` fields anymore. Those
 /// were previously plain `String` fields here, which meant every save
 /// wrote raw S3 credentials straight into the app's on-disk JSON store in
-/// plaintext -- exactly the anti-pattern ADR-CRED-001 (see
-/// `docs/adr/ADR-PC-001-persistence.md` and
-/// `ylx-transfer-adapters::credential_keyring`) forbids. The real secret
+/// plaintext -- exactly the anti-pattern enforced by
+/// `ylx-transfer-adapters::credential_keyring`. The real secret
 /// now lives only in the OS credential vault (`Composition::vault`,
 /// `composition.rs`), addressed by a single fixed `CredentialKey` --
 /// never on this struct, never in `PersistedStore`. See `commands.rs`'s

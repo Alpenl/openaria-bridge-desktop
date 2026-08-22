@@ -160,12 +160,8 @@ pub struct SessionSummaryView {
     pub file_count: u64,
 }
 
-/// One entry in [`SessionDetailView::files`], mirroring the Pi's real wire
-/// shape for each element of `GET /sessions/{id}`'s `files[]` array
-/// exactly -- verified against `capture/src/ylx_capture/transfer/
-/// http_handlers.py`'s `_detail_to_wire` and `publication_index.py`'s
-/// `FileEntryView` in the sibling RP-YLX repo (read-only reference, never
-/// depended on directly -- this crate has zero dependency on that repo).
+/// One entry in [`SessionDetailView::files`], mirroring the Conductor wire
+/// shape for each element of `GET /sessions/{id}`'s `files[]` array exactly.
 /// `id` is the opaque `FileId` string that round-trips against
 /// `GET /sessions/{id}/files/{file_id}` (see [`DeviceActor::download_file_with`]/
 /// [`DeviceActor::head_file_with`]) -- never derive a download path from

@@ -1,26 +1,10 @@
-//! PC-00 core domain types — plan section 5.4 / section 16 "F6" freeze.
+//! Shared identifiers and wire-shaped publication domain types.
 //!
-//! This module is the real, frozen replacement for the W0-06 stub that
-//! used to live here (see git history — its doc comment explicitly said
-//! "the real domain module ... is owned by PC-00"). It defines:
-//!
-//! - Opaque identifier newtypes ([`DeviceId`], [`SessionId`], [`FileId`])
-//!   matching the id shapes the Pi transfer-daemon actually returns —
-//!   verified against the RP-YLX repo's machine-readable contract at
-//!   `capture/docs/transfer-api/v1/schemas/*.json` (canonical source per
-//!   plan section 10.2) rather than guessed from prose.
-//! - [`PublicationManifest`] and its nested types, mirroring
-//!   `publication-manifest.schema.json` field-for-field (`session_id`,
-//!   `revision`, `files[]` with `id`/`role`/`size_bytes`/`sha256`, and
-//!   `publication_signature`), so a real Pi response can deserialize
-//!   directly into this type with `serde` (see the `tests` module for a
-//!   round-trip against the RP-YLX fixture
-//!   `capture/docs/transfer-api/v1/fixtures/success/publication-manifest.json`).
-//!
-//! Device state ([`crate::device`]) and transfer job state
-//! ([`crate::transfer`]) live in their own sibling modules per the plan
-//! section 16 crate layout; this module only holds the shared identifiers
-//! and the wire-shaped publication manifest both of them reference.
+//! [`DeviceId`], [`SessionId`], and [`FileId`] preserve the opaque IDs
+//! returned by the Conductor Device API. [`PublicationManifest`] and its
+//! nested types mirror the frozen v1 producer contract field-for-field so a
+//! device response can deserialize directly with `serde`. The tests retain a
+//! producer fixture to prove exact wire compatibility.
 //!
 //! Timestamps (`captured_at`/`published_at`) are kept as opaque RFC 3339
 //! `String`s rather than a parsed date-time type — this crate does not
@@ -132,8 +116,8 @@ pub struct PublicationSignature {
 
 /// Canonical durable publication manifest for one recording session,
 /// mirroring `publication-manifest.schema.json` (schema major version 1)
-/// field-for-field. See `tests::publication_manifest_matches_rp_ylx_fixture`
-/// for a round-trip against the real RP-YLX fixture JSON.
+/// field-for-field. See `tests::publication_manifest_matches_conductor_fixture`
+/// for a round-trip against a frozen producer fixture.
 ///
 /// Per the schema's `x-ylx-versioning` rule, a consumer MUST fail closed
 /// (reject) on any `schema_version` it doesn't know and on any missing
@@ -762,12 +746,10 @@ fn require_len(field: &'static str, expected: usize, actual: usize) -> Result<()
 mod tests {
     use super::*;
 
-    /// Verbatim copy of
-    /// `capture/docs/transfer-api/v1/fixtures/success/publication-manifest.json`
-    /// from the RP-YLX repo (the canonical source per plan section 10.2) —
-    /// proves this type deserializes a real Pi-produced manifest, not just
-    /// a hand-rolled one that happens to match our own field names.
-    const RP_YLX_FIXTURE: &str = r#"{
+    /// Frozen producer fixture proving this type deserializes a real
+    /// device-produced manifest, not just a document built from its own field
+    /// names.
+    const CONDUCTOR_FIXTURE: &str = r#"{
       "schema_version": 1,
       "session_id": "sess-0001",
       "revision": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -804,9 +786,9 @@ mod tests {
     }"#;
 
     #[test]
-    fn publication_manifest_matches_rp_ylx_fixture() {
+    fn publication_manifest_matches_conductor_fixture() {
         let manifest: PublicationManifest =
-            serde_json::from_str(RP_YLX_FIXTURE).expect("real Pi fixture deserializes");
+            serde_json::from_str(CONDUCTOR_FIXTURE).expect("real Pi fixture deserializes");
 
         assert_eq!(manifest.schema_version, 1);
         assert!(manifest.has_known_schema_version());
@@ -821,7 +803,7 @@ mod tests {
     #[test]
     fn publication_manifest_round_trips_through_json() {
         let manifest: PublicationManifest =
-            serde_json::from_str(RP_YLX_FIXTURE).expect("fixture deserializes");
+            serde_json::from_str(CONDUCTOR_FIXTURE).expect("fixture deserializes");
         let json = serde_json::to_string(&manifest).expect("manifest serializes");
         let round_tripped: PublicationManifest =
             serde_json::from_str(&json).expect("re-deserializes");
@@ -831,7 +813,7 @@ mod tests {
     #[test]
     fn unknown_major_schema_version_is_flagged_for_fail_closed_rejection() {
         let mut manifest: PublicationManifest =
-            serde_json::from_str(RP_YLX_FIXTURE).expect("fixture deserializes");
+            serde_json::from_str(CONDUCTOR_FIXTURE).expect("fixture deserializes");
         manifest.schema_version = 2;
         assert!(
             !manifest.has_known_schema_version(),

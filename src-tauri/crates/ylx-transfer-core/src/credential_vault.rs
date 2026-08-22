@@ -1,32 +1,11 @@
-//! `CredentialVaultPort` — SPIKE-PC-CRED provisional port (pre-PC-00/PC-07).
+//! Credential-vault contract for secrets that must never enter application
+//! persistence or frontend DTOs.
 //!
-//! # Status: spike, not frozen
+//! The port separates existence checks from value access, uses a redacted
+//! secret type, and exposes rotation as a named operation so callers cannot
+//! silently degrade to plaintext storage.
 //!
-//! This module is an **explicitly authorized, out-of-sequence spike**
-//! (plan section 9.3's last paragraph, section 10.1's `ADR-CRED-001` row,
-//! section 6.1 invariant 13). It is **not** task PC-07. The plan normally
-//! gates real PC-07 credential-vault work behind PC-00 (core scaffold/
-//! ports), which is itself gated behind Wave 2's Pi API being formally
-//! frozen. The coordinator approved doing this piece early because OS
-//! keyring access does not need to know Pi's wire protocol at all — it
-//! only needs a generic secret-storage port.
-//!
-//! **The real PC-00 will define the frozen port shape; the real PC-07 will
-//! evaluate, adapt, or replace everything in this module.** Nothing here
-//! is wired into any production Tauri command (`src-tauri/src/{lib,
-//! commands}.rs`) — see `ylx-transfer-adapters::credential_keyring` for the
-//! adapter that implements this trait, also marked SPIKE-level.
-//!
-//! `CredentialVaultPort` is the secret-vault contract for this spike. It
-//! explicitly calls for: (1) a redacted secret
-//! newtype that resists accidental logging, (2) a raw-secret accessor kept
-//! separate from an existence-only check so callers that don't need the
-//! secret value can't accidentally acquire it, and (3) rotate as a named
-//! operation distinct from `set` (todo for the real port: rotate may want
-//! different audit semantics, e.g. keep-previous-as-backup, so it's kept
-//! as its own trait method rather than a caller-side `set` alias).
-//!
-//! # Design choices worth flagging for the real port review
+//! # Design choices
 //!
 //! - **Key type**: [`CredentialKey`] wraps a `String` rather than being a
 //!   bare `&str` everywhere, so call sites can't accidentally pass a raw
@@ -42,15 +21,12 @@
 //! - **Existence vs. value**: [`CredentialVaultPort::status`] returns only
 //!   a `secret_configured: bool`-shaped [`SecretStatus`]; only
 //!   [`CredentialVaultPort::expose_secret`] can produce a raw [`Secret`].
-//!   This matches plan section 13's PC-07 merge gate: "getter只返回
-//!   `secret_configured`".
+//!   This keeps status-only UI paths from acquiring raw credentials.
 //! - **No plaintext fallback, ever**: [`CredentialVaultError`] has no
 //!   "degraded/plaintext" variant. Every error variant is a hard failure
 //!   the caller must handle explicitly; there is no code path in this
 //!   trait's contract that allows silently writing an unencrypted copy of
-//!   a secret when the backend is unavailable or locked (plan section
-//!   10.1 `ADR-CRED-001` "未决时禁止：secret 回显/明文 fallback"; section
-//!   6.1 invariant 13).
+//!   a secret when the backend is unavailable or locked.
 
 use std::fmt;
 
@@ -97,8 +73,7 @@ pub use crate::secret::Secret;
 
 /// Existence-only view of a secret — never carries the raw value.
 /// This is what callers that only need "is this configured?" (e.g. a UI
-/// checkbox, a "storage profile complete" check) should ask for, per
-/// plan section 13's PC-07 merge gate ("getter只返回 `secret_configured`").
+/// checkbox or a "storage profile complete" check) should ask for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SecretStatus {
     pub secret_configured: bool,
@@ -161,7 +136,7 @@ pub trait CredentialVaultPort: Send + Sync {
     /// Remove a stored secret. Deleting a key that doesn't exist is not
     /// itself an error condition callers need to special-case beyond
     /// `NotFound` if the implementation chooses to surface it that way;
-    /// implementations in this spike treat "already absent" as success
+    /// implementations treat "already absent" as success
     /// (idempotent delete) — see adapter doc comments for the exact
     /// per-backend behavior.
     fn delete_secret(&self, key: &CredentialKey) -> Result<(), CredentialVaultError>;

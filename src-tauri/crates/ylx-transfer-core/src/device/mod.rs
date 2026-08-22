@@ -117,16 +117,11 @@ pub enum ConnectionState {
     },
 }
 
-/// Read-only mirror of the Pi's own capture-activity domain, per plan 5.4:
+/// Read-only mirror of the Conductor capture-activity domain:
 /// `idle | starting | recording | stopping | error | unknown`. Exact value
-/// set and wire spelling verified against two RP-YLX ground-truth sources:
-/// `device-info.schema.json`'s `capture_activity` enum (the authenticated
-/// `GET /api/v1/device` response PC actually receives) and
-/// `ylx_capture.transfer.capture_bridge.CaptureActivityState`, the Python
-/// enum the Pi side derives that JSON value from. This is deliberately a
-/// coarser, PC-side *view* of that same domain — PC never writes to it
-/// (plan 3.2 non-goal: no start/stop/select-target capability), only
-/// observes it.
+/// set and wire spelling match the authenticated `GET /api/v1/device`
+/// response. This is deliberately a coarser, desktop-side view of the same
+/// domain: the desktop observes capture activity but does not mutate it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureActivityState {

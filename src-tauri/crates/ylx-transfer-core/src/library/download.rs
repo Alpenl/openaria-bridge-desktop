@@ -1,18 +1,8 @@
-//! `download` — SPIKE-PC-DOWNLOAD (pre-PC-00/PC-04 preparatory spike).
+//! Safe, resumable local download engine.
 //!
-//! ## Status
-//!
-//! This is **not** the frozen PC-04 `LocalLibrary`/download engine. Per plan
-//! section 16, the real port/domain shape is owned by PC-00 (freeze `F6`)
-//! and the real download engine + `LocalLibrary` are PC-04, both gated
-//! behind Wave 2's Pi API freeze. This spike was explicitly authorized to
-//! run early (mirroring `SPIKE-PC-S3` / `SPIKE-PC-CRED` / the W0-06
-//! persistence spike) because target-path safety, `.part`/journal
-//! mechanics, Range-response handling, atomic commit, and crash recovery
-//! (plan section 9.2 steps 2-6, section 10.3) do not require knowing Pi's
-//! real wire format — only a generic [`DownloadSource`] abstraction. PC-00/
-//! The production transfer coordinator now depends on this module's path,
-//! Range, hash, atomic-commit, and publication-verifier contracts.
+//! The production transfer coordinator uses this module for target-path
+//! validation, range handling, hash verification, atomic commit, publication
+//! verification, and crash recovery through a generic [`DownloadSource`].
 //!
 //! ## Publication authenticity (plan 9.2 point 7)
 //!
@@ -24,7 +14,7 @@
 //! `ylx-transfer-adapters`, keeping this core crate independent of a crypto
 //! backend. Test-only pass/fail fakes remain available under `cfg(test)`.
 //!
-//! ## What this DOES implement (plan section 9.2 steps 1-6, section 10.3)
+//! ## Download contract
 //!
 //! 1. [`derive_target_path_for_file`] — a pure, paranoid function deriving
 //!    a filesystem path from opaque device/session IDs and the verified Pi
@@ -59,19 +49,17 @@
 //! 4. [`download_file`] fsyncs the `.part` file and atomically renames it
 //!    into place only after both size AND hash verify; [`commit_session`]
 //!    fsyncs the session directory and only then returns a
-//!    [`LocalLibraryEntry`] in [`LocalLibraryState::Committed`] — modeled
-//!    as an in-memory state transition tests can observe, not a real
-//!    `LocalLibrary` DB write (that is PC-01/PC-05's job — see below).
+//!    [`LocalLibraryEntry`] in [`LocalLibraryState::Committed`]. The
+//!    coordinator persists the resulting durable state.
 //! 5. [`recover_resume_offset`] implements the crash-recovery contract:
 //!    given a `.part` file of real length `L` and a journal claiming
 //!    (possibly desynced) confirmed offset `J`, the trusted resume point is
 //!    always `min(L, J)`, with any excess on-disk tail beyond that point
 //!    truncated before resuming.
 //!
-//! ## Journal granularity (a documented spike-level design choice)
+//! ## Journal granularity
 //!
-//! The task card allows "a simple sidecar file... or in-memory + fsync'd
-//! write — your call, document it." This spike checkpoints the journal
+//! The engine checkpoints the journal
 //! **once per HTTP response, plus every [`JOURNAL_CHECKPOINT_INTERVAL`]
 //! bytes within a single very large response** (fsync the `.part` file's
 //! new bytes, then durably rewrite the journal) rather than after every
@@ -79,21 +67,21 @@
 //! contract even between checkpoints: [`recover_resume_offset`]'s `min(L,
 //! J)` logic only ever *trusts less* than what is truly durable — a crash
 //! between checkpoints costs some re-download, never data corruption or a
-//! false "confirmed" claim. A real PC-04/PC-05 integrating with the actual
-//! durable job schema PC-01 eventually freezes may choose a different
+//! false "confirmed" claim. Callers may choose a different durable job
 //! checkpoint cadence; nothing here depends on this specific interval.
 //!
-//! ## What is NOT implemented here (explicitly deferred)
+//! ## Layer boundaries
 //!
-//! - **Real publication-signature verification** — see above.
+//! - The concrete Ed25519 backend lives in `ylx-transfer-adapters`; this core
+//!   module owns only the verification seam and commit policy.
 //! - **Durable job-store integration.** [`DownloadJournal`] remains this
 //!   module's self-contained sidecar-file journal. The transfer persistence
 //!   layer owns the durable job/checkpoint rows; an integration layer may
 //!   project the same fields (confirmed offset, expected size, expected
 //!   SHA-256, and ETag) into that schema without changing the download
 //!   protocol.
-//! - **Coordinator/queue/concurrency (PC-05), production Pi HTTP client
-//!   (PC-03), Tauri wiring, and any simulation/demo code.**
+//! - Queueing/concurrency, the production Device API client, and Tauri wiring
+//!   live in their owning modules.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -466,8 +454,8 @@ pub enum CheckpointError {
 
 /// Durable sidecar recording what has actually been confirmed written to a
 /// `.part` file, plus the expectations the eventual commit must satisfy.
-/// See the module doc comment ("Journal granularity") for the write
-/// cadence and the "not wired to real persistence" disclosure.
+/// See the module doc comment ("Journal granularity") for the write cadence
+/// and persistence boundary.
 ///
 /// # What a checkpoint means (issue #1, commit 31)
 ///
@@ -748,9 +736,8 @@ pub struct RequestedRange {
     pub if_match_etag: Option<String>,
 }
 
-/// The outbound seam this module is built against. A production
-/// implementation (future PC-03/PC-04 work) would speak real HTTP to a Pi;
-/// this spike's tests use an in-memory fake ([`tests` module]) plus one
+/// The outbound seam this module is built against. The production adapter
+/// speaks HTTP to a device; tests use an in-memory fake ([`tests` module]) plus one
 /// integration test against a real loopback HTTP server
 /// (`tests/download_http_spike.rs`) to prove the wire-level parsing.
 ///
@@ -1444,11 +1431,8 @@ impl PublicationVerifier for AlwaysFailVerifierStub {
 // 8. Session-level commit (plan 9.2 step 5, second half)
 // =====================================================================
 
-/// A simple in-memory model of a `LocalLibrary` entry — **not** a real DB
-/// write. Real persistence of this state is PC-01 (durable job schema) /
-/// PC-05 (`TransferCoordinator`) work; this type only lets this spike's
-/// tests observe the state transition plan section 6.1 invariant 12
-/// requires ("PC 只在本地全部 hash 验证并原子提交后标记 downloaded").
+/// In-memory result of an atomic local-library commit. The production
+/// coordinator persists this result only after every file hash has verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalLibraryState {
     Committed,

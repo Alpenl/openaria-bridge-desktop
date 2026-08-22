@@ -207,9 +207,8 @@ jobs:
           --all-targets --all-features -- --nocapture
 
   # Builds the full desktop app on all three target platforms. This is the
-  # actual cross-platform verification for this project — see
-  # docs/LAN_TRANSFER_PROTOCOL.md for why local builds on Linux dev boxes
-  # can't easily verify this themselves (webkit2gtk isn't always installed).
+  # actual cross-platform verification: a Linux workstation cannot exercise
+  # the macOS and Windows cfg-gated code or native installer packaging.
   tauri:
     name: tauri build (${{ matrix.platform }})
     needs: [prepare, frontend, rust]

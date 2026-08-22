@@ -1,24 +1,9 @@
 //! Library-facing seams for safe local artifacts, staged publication,
 //! downloads, and object-store uploads.
-//!
-//! `object_store_port` is the one real (non-placeholder) addition here,
-//! from task SPIKE-PC-S3 — an explicitly authorized early spike for the
-//! S3/ObjectStore seam (plan section 9.3), run ahead of PC-00/PC-06
-//! because it does not depend on the Pi wire protocol. See that module's
-//! doc comment for full status/scope. It lives under `library/` rather
-//! than in `ports.rs` because it is domain-shaped (many upload/receipt
-//! types, not just a get/set/delete secret seam) and because `domain/`,
-//! `device/`, and `transfer/` are other future tasks' territory that
-//! SPIKE-PC-S3 was not authorized to touch.
 
 pub mod object_store_port;
 
-/// `download` is a second real (non-placeholder) addition here, from task
-/// SPIKE-PC-DOWNLOAD — an explicitly authorized early spike for the
-/// download-engine seam (plan section 9.2), run ahead of PC-00/PC-04 for
-/// the same reason `object_store_port` was: it does not depend on Pi's
-/// real wire format, only a generic `DownloadSource` abstraction. See that
-/// module's doc comment for full status/scope.
+/// Safe resumable downloads behind a generic source abstraction.
 pub mod download;
 
 /// `artifact` (issue #1, commit 32) is the single judge of what a job

@@ -1,7 +1,6 @@
 //! Structured, typed persistence errors.
 //!
-//! W0-06 merge gate: the spike must not continue "扩展单一忽错 JSON store"
-//! (silently swallowing persistence errors). Every fallible operation in
+//! Persistence failures must never be silently swallowed. Every fallible operation in
 //! this module returns one of these variants instead of `.ok()` /
 //! `let _ =` — see `state.rs` in the existing Tauri app for the pattern
 //! this is explicitly *not* allowed to repeat.
@@ -51,7 +50,7 @@ pub enum PersistenceError {
     #[error("store is busy (locked by another connection)")]
     Busy,
 
-    /// SPIKE-PC-JOURNAL: a write was rejected because it would violate a
+    /// A write was rejected because it would violate a
     /// domain-level invariant the caller should have checked first —
     /// duplicate idempotency key on job insert, or an illegal job-state
     /// transition edge (`schema::is_valid_transition`). Distinct from
@@ -78,7 +77,7 @@ pub enum PersistenceError {
         supported: u32,
     },
 
-    /// SPIKE-PC-JOURNAL: the caller referenced a row (e.g. a `job_id`)
+    /// The caller referenced a row (e.g. a `job_id`)
     /// that does not exist. Distinct from `Sqlite`'s
     /// `QueryReturnedNoRows` (a raw driver-level signal) so callers can
     /// match on a stable, typed variant instead of a query-shape detail.

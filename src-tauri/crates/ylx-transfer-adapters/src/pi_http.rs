@@ -1,26 +1,13 @@
-//! `PiHttpClient` -- PC-03's real HTTPS client for the Pi transfer-daemon
-//! (plan section 16 "PC-03 Pi HTTPS 与 mDNS adapters", wire contract frozen
-//! by plan section 10.2 / `capture/docs/transfer-api/v1/openapi.json` in
-//! the sibling RP-YLX repo).
+//! HTTPS client for the Conductor Device Session API.
 //!
-//! This is a **real** client against a **real** server: the Pi-side
-//! `ylx-transferd` daemon (`capture/src/ylx_capture/transfer_daemon_cli.py`
-//! in RP-YLX, composed by `capture/src/ylx_capture/transfer/composition.py`)
-//! already exists, already runs, and already has its own end-to-end test
-//! suite (`capture/tests/test_transfer_daemon_e2e.py`). Every endpoint path,
-//! status code, and JSON shape below was verified against that daemon's own
-//! handler source (`capture/src/ylx_capture/transfer/http_handlers.py`),
-//! its OpenAPI document, and its `tests/transfer-api/v1/fixtures/**`
-//! fixtures -- not guessed from prose. `tests/pi_http_integration.rs` in
-//! this crate spawns the real Python daemon as a subprocess and proves a
-//! real cross-language wire round trip; see that file's module doc comment
-//! for exactly what is and is not covered.
+//! Endpoint paths, status codes, and JSON shapes match the frozen v1 wire
+//! contract. Adapter and contract tests cover parsing, error mapping, TLS pin
+//! enforcement, and the cross-language request/response boundary.
 //!
 //! # TLS: fingerprint pinning, not full CA validation (deliberate, v1 scope)
 //!
-//! The Pi daemon's TLS certificate is self-signed per device
-//! (`capture/src/ylx_capture/transfer/tls_identity.py`, ADR-SEC-002): there
-//! is no CA to chain-validate against, by design -- the trust anchor is
+//! Each device uses a self-signed TLS certificate. There is no CA to
+//! chain-validate against by design: the trust anchor is
 //! meant to be the human-verified SAS (Short Authentication String) at
 //! pairing time, not a certificate authority. This client's [`PiTlsPin`]
 //! therefore pins the exact SHA-256 hash of the certificate's DER-encoded
@@ -47,8 +34,8 @@
 //! bespoke `Connector`/rustls `ClientConfig` directly into `ureq` via
 //! `Agent::with_parts` (a documented, if "not yet semver-stable",
 //! `ureq::unversioned` extension point) rather than working around that gap
-//! with a weaker setting. See `DEPENDENCY_REQUEST.md` for the
-//! `rustls`/`rustls-webpki` additions this required.
+//! with a weaker setting. The direct `rustls`/`rustls-webpki` dependencies
+//! provide this verifier surface.
 //!
 //! Because hostname/SAN checks are skipped, this client dials the Pi
 //! directly by IP:port (exactly like the real Python E2E test's
@@ -65,11 +52,8 @@
 //!
 //! # Error mapping
 //!
-//! Every non-2xx response is expected to be `application/problem+json`
-//! (plan 10.4 / `capture/docs/transfer-api/v1/schemas/problem.schema.json`).
-//! [`PiApiErrorCode`] mirrors the wire `code` registry exactly (verified
-//! against `capture/src/ylx_capture/transfer/models.py`'s
-//! `TransferErrorCode` enum, the Pi-side source of truth) and callers MUST
+//! Every non-2xx response is expected to be `application/problem+json`.
+//! [`PiApiErrorCode`] mirrors the frozen wire `code` registry and callers MUST
 //! branch on it, never on `detail` (a free-form human string) -- matching
 //! the schema's own documented contract. A response that claims a non-2xx
 //! status but does not actually parse as a problem+json body (e.g. a
@@ -260,9 +244,7 @@ pub struct PiHttpClientConfig {
 // =====================================================================
 
 /// Stable, wire-level error codes from `problem+json`'s `code` field.
-/// Exact string set verified against
-/// `capture/src/ylx_capture/transfer/models.py`'s `TransferErrorCode`
-/// (the Pi-side source of truth) -- see module doc comment.
+/// The exact string set matches the Conductor v1 contract.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PiApiErrorCode {
     InvalidRequest,
@@ -410,8 +392,7 @@ impl std::error::Error for PiHttpError {}
 // Wire DTOs
 // =====================================================================
 
-/// Raw wire shape of `application/problem+json`
-/// (`capture/docs/transfer-api/v1/schemas/problem.schema.json`).
+/// Raw wire shape of the v1 `application/problem+json` response.
 #[derive(Debug, Deserialize)]
 struct ProblemDetails {
     // Parsed to keep the wire contract strict, but deliberately not exposed
@@ -609,9 +590,8 @@ pub(crate) struct SessionsPage {
 /// One entry in `GET /api/v1/sessions/{id}`'s `files[]` array -- present
 /// only in the *detail* response (`GET /sessions/{id}`, singular), never in
 /// `GET /sessions`'s list items (see [`SessionSummary`]'s doc comment).
-/// Mirrors `capture/src/ylx_capture/transfer/http_handlers.py`'s
-/// `_detail_to_wire`/`publication_index.py`'s `FileEntryView` in the
-/// sibling RP-YLX repo exactly: `id`/`display_path`/`role`/`size_bytes`/
+/// Mirrors the Conductor detail response exactly:
+/// `id`/`display_path`/`role`/`size_bytes`/
 /// `sha256`/`media_type`, snake_case, all six fields always present
 /// (never optional/null on this endpoint -- a session only becomes
 /// visible here once every file's `sha256`/`media_type` is fully computed
@@ -1385,7 +1365,7 @@ impl PiHttpClient {
         // engages (its `!details.needs_tls()` early-return), so the TLS
         // pin never has to be real here. This keeps the request/response
         // mapping tests independent of standing up real TLS, matching the
-        // SPIKE-PC-S3 `object_store_s3.rs` test pattern this module reuses.
+        // loopback-server test pattern used by `object_store_s3.rs`.
         let control_connector = ()
             .chain(TcpConnector::default())
             .chain(PinnedTlsConnector::new([0u8; 32]).expect("dummy pin parses"));
@@ -2123,8 +2103,8 @@ fn parse_content_range(value: &str) -> Result<ContentRange, PiHttpError> {
 #[cfg(test)]
 mod tests {
     //! Unit tests against a real `tiny_http` fake server on loopback,
-    //! reusing the exact pattern `object_store_s3.rs`'s tests established
-    //! (SPIKE-PC-S3): a real socket, real HTTP/1.1 wire bytes, a scripted
+    //! reusing the exact pattern `object_store_s3.rs`'s tests established:
+    //! a real socket, real HTTP/1.1 wire bytes, a scripted
     //! response per request. Deliberately plain `http://`, not `https://`
     //! -- `PinnedTlsConnector` no-ops for a non-TLS scheme (see
     //! `new_insecure_for_test`'s doc comment), so these tests exercise this
@@ -2991,20 +2971,9 @@ mod tests {
     }
 
     /// Transport-layer coverage for the complete `GET /sessions/{id}` DTO,
-    /// including the required publication-envelope fields and real
-    /// `files[]` inventory shape returned by
-    /// `capture/src/ylx_capture/transfer/http_handlers.py`'s
-    /// `_detail_to_wire` in the sibling RP-YLX repo (session_id/revision/
-    /// captured_at/published_at/duration_seconds/total_bytes/video_bytes/
-    /// file_count/files[]), and each file entry mirrors
-    /// `publication_index.py`'s `FileEntryView`
-    /// (id/display_path/role/size_bytes/sha256/media_type) -- the same six
-    /// fields verified against
-    /// `capture/docs/transfer-api/v1/fixtures/success/publication-manifest.json`'s
-    /// `f-0001` entry and
-    /// `capture/docs/transfer-api/v1/schemas/publication-manifest.schema.json`'s
-    /// `fileEntry` definition in that repo (read-only reference, not
-    /// depended on directly). The cryptographic content is deliberately a
+    /// including the required publication envelope and `files[]` inventory.
+    /// Each file has the six frozen fields
+    /// `id/display_path/role/size_bytes/sha256/media_type`. The cryptographic content is deliberately a
     /// placeholder here because this method only parses transport JSON;
     /// `pi_client_port` tests exercise real signatures and fail-closed
     /// identity/schema/inventory validation.

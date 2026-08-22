@@ -1118,7 +1118,7 @@ pub struct Composition {
     /// session-only `InMemoryCredentialVault` fallback. Never a plaintext
     /// file, under any condition (`CredentialVaultPort`'s own contract).
     vault: Arc<dyn CredentialVaultPort>,
-    /// Where PC-04/SPIKE-PC-DOWNLOAD's real download commit path writes
+    /// Where the production download commit path writes
     /// verified files (`library_root/{device_id}/{session_id}/{file_id}`,
     /// see `library::download::derive_target_path`) -- the same root
     /// `CoordinatorConfig::library_root` above uses, captured here too so

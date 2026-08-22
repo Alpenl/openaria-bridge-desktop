@@ -15,10 +15,8 @@ path = "src/lib.rs"
 # domain types while sharing one dependency resolution graph.
 ylx-transfer-core = { workspace = true }
 
-# --- SPIKE-PC-S3 additions (object_store_s3.rs only) ---
-# See DEPENDENCY_REQUEST.md at the repo root for the full package/license/
-# offline-build write-up. Scoped only to this crate's own manifest, per
-# the task card — the shared workspace owns the dependency lockfile.
+# S3 adapter dependencies. Scoped to this crate; the shared workspace owns the
+# dependency lockfile.
 #
 # rusty-s3: Sans-IO SigV4 request signing/response-parsing for S3-
 # compatible endpoints (works with MinIO/path-style, not AWS-only). Does
@@ -33,9 +31,7 @@ ureq = "3.3"
 # url::Url.
 url = "2"
 
-# --- SPIKE-PC-CRED additions (credential_keyring.rs only) ---
-# (pre-PC-00/PC-07, coordinator-approved early spike — see
-# credential_keyring.rs module doc comment and DEPENDENCY_REQUEST.md):
+# Credential-vault adapter dependencies:
 # real OS keyring access (macOS Keychain / Windows Credential Manager /
 # *nix Secret Service). `apple-native-keyring-store` is added on top of
 # the crate's default features (which already cover Windows + the
@@ -52,9 +48,7 @@ keyring = { version = "4.1.6", features = ["apple-native-keyring-store"] }
 # this only promotes an already-vetted crate to a direct dependency.
 zeroize = { workspace = true }
 
-# --- PC-03 additions (pi_http.rs and discovery_mdns.rs only) ---
-# See DEPENDENCY_REQUEST.md for the full write-up. `ureq`/`url` above are
-# reused as-is (already present via SPIKE-PC-S3); everything below is new.
+# Device API and discovery dependencies. `ureq`/`url` above are reused.
 #
 # serde/serde_json: JSON (de)serialization for the Pi wire protocol
 # (pairing/device/sessions/problem+json bodies). `ylx-transfer-core`
@@ -76,7 +70,7 @@ rustls = "0.23"
 webpki = { package = "rustls-webpki", version = "0.103" }
 # sha2: hashes the pinned certificate's SPKI to compare against the
 # configured fingerprint. Already a direct dependency of
-# `ylx-transfer-core` (SPIKE-PC-DOWNLOAD) and a transitive dependency here
+# `ylx-transfer-core` and a transitive dependency here
 # via `rusty-s3`/`keyring` already -- promoted directly for the same
 # already-vetted-crate reason as `rustls`/`webpki` above.
 sha2 = { workspace = true }
@@ -147,9 +141,8 @@ zbus = { version = "5.18.0", default-features = false, features = ["async-io", "
 # `PiDownloadSource`. Feature is dev-only; the normal dependency above is
 # unchanged.
 ylx-transfer-core = { workspace = true, features = ["test-support"] }
-# Test-only fake HTTP server for object_store_s3.rs's adapter tests (no
-# MinIO available in this sandbox — see module docs / DEPENDENCY_REQUEST.md
-# for what this does and does not prove). Never used outside `#[cfg(test)]`.
+# Test-only fake HTTP server for deterministic object_store_s3 unit tests.
+# The shared adapter contract also runs against MinIO in CI.
 tiny_http = { workspace = true }
 # Test-only fixture files for credential_keyring.rs's legacy-migration tests.
 tempfile = { workspace = true }

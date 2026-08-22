@@ -1,4 +1,4 @@
-//! SPIKE-PC-DOWNLOAD integration test: prove `library::download`'s
+//! Integration test proving `library::download`'s
 //! Range-response interpretation against **real bytes on a real loopback
 //! HTTP/1.1 socket**, not just hand-crafted header strings passed directly
 //! to `interpret_range_response` (see the unit tests in

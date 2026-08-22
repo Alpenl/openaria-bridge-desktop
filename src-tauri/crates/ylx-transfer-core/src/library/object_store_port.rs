@@ -1,29 +1,9 @@
-//! `ObjectStorePort` — SPIKE-PC-S3 (pre-PC-00/PC-06 preparatory spike).
+//! Object-store contract for durable multipart upload and verification.
 //!
-//! ## Status
-//!
-//! This is **not** the frozen PC-06 port. Per plan section 12.1, the real
-//! `ObjectStore port` shape is owned by PC-00 (freeze `F6`) and the real
-//! production adapter is owned by PC-06 (plan section 16), both gated
-//! behind Wave 2's Pi API freeze. This spike was explicitly authorized to
-//! run early because the S3-facing seam does not need to know the Pi wire
-//! protocol at all — only a generic object-store abstraction (multipart
-//! upload/verify) — mirroring the W0-06 persistence spike
-//! (`docs/adr/ADR-PC-001-persistence.md`) and the CAP-02/CAP-05
-//! spike-then-production pattern on the RP-YLX side. PC-00/PC-06 may
-//! revise every type and method signature here; nothing in this module is
-//! wired into any production Tauri command, and nothing outside this
-//! spike's own tests depends on it.
-//!
-//! ## What this is for (plan section 9.3)
-//!
-//! > ObjectStore port provides memory/mock adapter; production adapter
-//! > supports S3-compatible endpoint and multipart. multipart upload ID,
-//! > completed part ETags and source hash must be durable, supporting
-//! > crash resume and cancel/abort. multipart ETag must not be treated as
-//! > a file's MD5 — upload SHA-256 as metadata, verify bytes/metadata/
-//! > version-id/ETag via HEAD after completion. Only after all objects and
-//! > the final manifest are verified is `object_store_verified` written.
+//! Implementations preserve upload IDs, completed part ETags, and source
+//! hashes for crash recovery. Multipart ETags are transport receipts, never
+//! content hashes: verification binds the completion receipt to object bytes,
+//! metadata, version ID, and ETag before a caller may mark an upload durable.
 //!
 //! Two properties this module is deliberately built around:
 //!
@@ -44,25 +24,16 @@
 //!    `verify_object`. It is completely independent of the multipart
 //!    ETag's own bookkeeping.
 //!
-//! ## Durability shape (plan 9.3 item 3), not persistence itself
+//! ## Durability shape
 //!
-//! [`MultipartUploadRecord`] is the shape a future persistence layer
-//! (the application's/transfer's SQLite stores, or PC-01's durable journal
-//! schema) could serialize as one row without redesigning these types — see
-//! `docs/adr/ADR-PC-001-persistence.md` for the sibling spike this is
-//! meant to plug into later. **No actual persistence integration happens
-//! in this crate**: nothing here reads or writes SQLite/JSON. Wiring a
-//! real adapter's in-progress-upload state to durable storage (so it
-//! survives an app restart, not just an in-process retry) is PC-01/PC-06
-//! work, out of this spike's scope.
+//! [`MultipartUploadRecord`] is the serializable handoff between this pure
+//! domain port and the application's durable transfer store. This module does
+//! not perform SQLite or JSON I/O itself.
 //!
-//! ## Crash-resume contract (plan 9.3 item 3 / test requirement)
+//! ## Crash-resume contract
 //!
-//! A genuine `ListMultipartUploads`/`ListParts`-based resume (discovering
-//! and continuing an in-progress upload after the process that started it
-//! is gone) is **not implemented** in this spike — that is real PC-06
-//! work. What this spike *does* guarantee, and test, is the safe fallback
-//! shape:
+//! The port does not discover abandoned multipart uploads with
+//! `ListMultipartUploads`/`ListParts`. It guarantees and tests a safe fallback:
 //!
 //! - [`ObjectStorePort::abort_multipart_upload`] always leaves the object
 //!   store in a clean state (no orphaned parts, no orphaned upload id) —
@@ -321,11 +292,9 @@ pub enum MultipartUploadStatus {
     Aborted,
 }
 
-/// A snapshot of one multipart upload's progress, shaped so a future
-/// persistence layer could serialize it as a single row (`upload_id` as
-/// primary key, `completed_parts` as a JSON column or a child table) —
-/// see module docs. This spike only constructs it in memory / for tests;
-/// it is never read from or written to disk here.
+/// A snapshot of one multipart upload's progress, shaped for durable storage
+/// as a single row (`upload_id` as primary key, `completed_parts` as a JSON
+/// column or child table). This pure domain module performs no disk I/O.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MultipartUploadRecord {
     pub key: ObjectKey,
@@ -1319,7 +1288,7 @@ mod tests {
 
         // "restart": the client has lost its in-memory upload progress
         // and, per the module docs, does not attempt true resume in this
-        // spike — it aborts and starts fresh.
+        // fallback path: it aborts and starts fresh.
         store
             .abort_multipart_upload(&handle)
             .expect("abort cleans up");
@@ -1458,8 +1427,8 @@ mod tests {
         assert_eq!(record.status, MultipartUploadStatus::InProgress);
         assert_eq!(record.completed_parts.len(), 1);
 
-        // Prove the shape actually round-trips through serde — this is
-        // what a future persistence layer would rely on.
+        // Prove the shape round-trips through serde; durable persistence
+        // relies on that contract.
         let json = serde_json::to_string(&record).expect("record serializes");
         let round_tripped: MultipartUploadRecord =
             serde_json::from_str(&json).expect("record deserializes");

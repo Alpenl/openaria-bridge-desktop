@@ -1,9 +1,8 @@
 # Removable-media golden fixtures
 
-This directory freezes the small, deterministic input contracts described by
-`docs/REMOVABLE_MEDIA_IMPORT_AND_VIDEO_NORMALIZATION.md`. The fixtures are
-for scanner, admission, provenance, recovery, and hash/path tests. They do
-not contain production recordings or personally identifying data.
+This directory freezes small, deterministic input contracts for scanner,
+admission, provenance, recovery, and hash/path tests. The fixtures do not
+contain production recordings or personally identifying data.
 
 ## What is in the fixture set
 

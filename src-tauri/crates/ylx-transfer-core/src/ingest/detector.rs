@@ -499,7 +499,7 @@ impl SignedPublicationV1Detector {
                 ),
             );
         }
-        // RP-YLX v1 carries its signature inline. Presence of the inline
+        // Conductor v1 carries its signature inline. Presence of the inline
         // envelope means this is a signed-profile candidate even before the
         // PC can resolve its external device registry; it must never fall
         // through to unsigned admission due to a malformed envelope.

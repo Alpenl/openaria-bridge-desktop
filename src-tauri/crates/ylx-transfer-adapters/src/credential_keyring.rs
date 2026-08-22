@@ -1,47 +1,10 @@
-//! `credential_keyring` — SPIKE-PC-CRED provisional adapter (pre-PC-00/PC-07).
+//! OS credential-vault adapter used by the desktop composition root.
 //!
-//! # Status: spike, not frozen, NOT wired into production
-//!
-//! This module is an **explicitly authorized, out-of-sequence spike**
-//! (plan section 9.3's last paragraph, section 10.1's `ADR-CRED-001` row,
-//! section 6.1 invariant 13). It is **not** task PC-07 — the plan
-//! normally gates real PC-07 credential-vault work behind PC-00 (core
-//! scaffold/ports), itself gated behind Wave 2's Pi API freeze. This work
-//! was pulled forward because OS keyring access does not need to know
-//! Pi's wire protocol at all — only a generic
-//! [`ylx_transfer_core::credential_vault::CredentialVaultPort`]. Nothing
-//! in this module is called from `src-tauri/src/{lib,commands}.rs` or any
-//! other production Tauri command path. The real PC-00/PC-07 will
-//! evaluate, adapt, or replace this adapter and its trait shape once the
-//! port is formally frozen.
-//!
-//! This module provides the OS-keyring implementation of
-//! `CredentialVaultPort`, plus deterministic in-memory/failing fakes and
-//! the legacy plaintext migration source used by tests and callers.
-//!
-//! # What's real vs. what's simulated in this spike
-//!
-//! - The production adapter ([`OsKeyringCredentialVault`]) uses the real
-//!   `keyring` crate (see `DEPENDENCY_REQUEST.md` for the dependency
-//!   review) and, when a usable OS keyring backend is present, talks to
-//!   the real platform secret store.
-//! - **Sandbox reality check (see this task's final report for the full
-//!   write-up):** this development sandbox has a D-Bus session bus and a
-//!   `gnome-keyring-daemon --components=secrets` running, so a Secret
-//!   Service *is* present — but its default collection is **locked** and
-//!   there is no interactive prompt agent to unlock it non-interactively.
-//!   That means this spike could observe a real `NoStorageAccess`-shaped
-//!   failure from the real backend (exercised in
-//!   `real_backend_probe_reports_status_or_locked_honestly`, which is
-//!   `#[ignore]`d by default because it depends on host D-Bus/keyring
-//!   state that varies by machine — see that test's doc comment for how
-//!   to run it), but a full real-backend set/get/delete round trip is
-//!   **not** exercised in the default `cargo test` run. The primary test
-//!   suite below exercises [`InMemoryCredentialVault`] (the fake) for the
-//!   round-trip/redaction/migration guarantees, and a dedicated
-//!   [`AlwaysFailingCredentialVault`] fake for the "backend
-//!   unavailable/locked never falls back to plaintext" guarantee — both
-//!   are honest, deterministic, and don't depend on host D-Bus state.
+//! [`OsKeyringCredentialVault`] delegates to the platform secret store through
+//! `keyring`. Deterministic in-memory and failing implementations cover the
+//! shared contract, redaction, and legacy plaintext migration paths. A separate
+//! ignored probe can exercise the host keyring because availability and unlock
+//! state are machine-dependent.
 //!
 //! # No plaintext fallback, ever
 //!
@@ -65,9 +28,7 @@ use zeroize::Zeroizing;
 
 /// Production adapter backed by the real OS keyring via the `keyring`
 /// crate (v1-compat API: macOS Keychain, Windows Credential Manager,
-/// *nix Secret Service via `zbus`). See module doc comment and this
-/// task's final report for what was and wasn't actually exercised
-/// against a live backend in this sandbox.
+/// *nix Secret Service via `zbus`).
 ///
 /// Entries are addressed as `(service, key.as_str())`, where `service` is
 /// fixed per-vault-instance (e.g. `"ylx-transfer"`) so multiple logical
@@ -766,7 +727,7 @@ mod tests {
     #[test]
     #[ignore = "depends on host D-Bus/Secret-Service/keyring state; run manually with --ignored"]
     fn real_backend_probe_reports_status_or_locked_honestly() {
-        let vault = OsKeyringCredentialVault::new("ylx-transfer-spike-pc-cred-probe");
+        let vault = OsKeyringCredentialVault::new("openaria-bridge-keyring-probe");
         let k = key("probe-key-do-not-use-in-production");
 
         match vault.set_secret(&k, Secret::new("probe-value")) {

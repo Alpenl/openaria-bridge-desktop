@@ -1,48 +1,20 @@
-//! `S3ObjectStore` — SPIKE-PC-S3 (pre-PC-00/PC-06 preparatory spike).
+//! Production S3-compatible [`ObjectStorePort`] adapter.
 //!
-//! # SPIKE / provisional — read before touching this file
+//! The desktop composition root uses this implementation for multipart
+//! uploads and completion-bound verification. Unit tests exercise real SigV4
+//! HTTP traffic against a deterministic loopback server; the shared contract
+//! suite also runs against MinIO in CI.
 //!
-//! This is **not** the frozen PC-06 deliverable. It is an explicitly
-//! authorized early spike, run ahead of the plan's normal gating (PC-06 is
-//! plan-gated behind PC-00's core scaffold, which is itself gated behind
-//! Wave 2's Pi API freeze — none of which has happened yet). The
-//! authorization rests on one specific fact: the S3/ObjectStore seam does
-//! not need to know anything about the Pi wire protocol, unlike almost
-//! every other Wave-3 PC task — only a generic object-store abstraction.
-//! This mirrors the already-committed W0-06 persistence spike
-//! (`docs/adr/ADR-PC-001-persistence.md`, `ylx-transfer-core/src/persistence/`)
-//! and the RP-YLX-side CAP-02/CAP-05 spike-then-production pattern.
-//!
-//! Consequences of that status:
-//!
-//! - The trait this file implements
-//!   (`ylx_transfer_core::library::object_store_port::ObjectStorePort`) is
-//!   itself a spike artifact — see that module's doc comment. PC-00/PC-06
-//!   may revise every signature here.
-//! - **Nothing in this file is wired into any production Tauri command.**
-//!   `src-tauri/src/{lib.rs,commands.rs}` do not reference this module.
-//! - No MinIO or real S3-compatible server is available in the sandbox
-//!   this spike was built in. The tests in this file exercise real
-//!   signing and real HTTP over a real loopback socket against a
-//!   self-hosted fake HTTP server (`tiny_http`, dev-dependency only) —
-//!   this proves the adapter's *request/response wire-format logic* is
-//!   self-consistent, but it is **not** independent verification against
-//!   a real S3-compatible implementation's SigV4 validator. That
-//!   remaining gap is explicitly PC-06/PC-12's job (plan section 16 PC-06
-//!   merge gate: "MinIO 绿色").
-//!
-//! # What this implements (plan section 9.3)
+//! # What this implements
 //!
 //! `CreateMultipartUpload` → `UploadPart` (per part) → `CompleteMultipartUpload`
 //! → `HeadObject`-based `verify_object`, plus `AbortMultipartUpload` for
 //! cleanup. Uses [`rusty_s3`] (a Sans-IO SigV4 signing library — it builds
 //! and signs presigned URLs but performs no I/O itself) to do the actual
 //! request signing, and [`ureq`] (a small blocking HTTP client, rustls by
-//! default, no async runtime) to send them. See `DEPENDENCY_REQUEST.md`
-//! at the repo root for the full trade-off write-up on both choices,
-//! including why `aws-sdk-s3` was not chosen (async-only, heavier, and
-//! more AWS-specific than this "S3-compatible endpoint" requirement
-//! calls for).
+//! default, no async runtime) to send them. This keeps the adapter blocking
+//! and endpoint-neutral without bringing an asynchronous AWS runtime into the
+//! desktop process.
 //!
 //! `source_sha256` (plan 9.3: "上传 SHA-256 metadata") is sent as the
 //! `x-amz-meta-source-sha256` object metadata header at
@@ -165,9 +137,8 @@ pub struct S3ObjectStoreConfig {
 
 impl fmt::Debug for S3ObjectStoreConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Deliberately redact secret_key — this type must stay safe to
-        // Debug-print in logs/error messages (plan invariant 13: "S3
-        // secret 不落日志").
+        // Deliberately redact secret_key so this type remains safe to
+        // Debug-print in logs and error messages.
         f.debug_struct("S3ObjectStoreConfig")
             .field("endpoint", &self.endpoint)
             .field("bucket", &self.bucket)
@@ -180,8 +151,7 @@ impl fmt::Debug for S3ObjectStoreConfig {
     }
 }
 
-/// Production S3-compatible `ObjectStorePort` adapter. See module docs
-/// for spike status and test coverage caveats.
+/// Production S3-compatible `ObjectStorePort` adapter.
 pub struct S3ObjectStore {
     bucket: Bucket,
     credentials: Credentials,
@@ -559,8 +529,7 @@ enum ErrorContext<'a> {
 /// Minimal, deliberately non-general XML tag extraction for S3's fixed,
 /// well-known error/response tag set (`<Code>`, `<Message>`, `<ETag>`).
 /// Not a real XML parser: no namespace handling, no entity decoding, no
-/// nested-tag disambiguation. This is a conscious trade-off (see
-/// `DEPENDENCY_REQUEST.md`) to avoid adding a second XML dependency
+/// nested-tag disambiguation. This deliberately avoids a second XML dependency
 /// alongside `rusty_s3`'s own bundled `instant-xml` (which is not
 /// exposed for arbitrary parsing, only for the two response shapes
 /// `rusty_s3` itself defines).
@@ -1103,11 +1072,9 @@ mod tests {
     //! header propagation) and response parsing (success XML, error XML,
     //! HEAD headers) are internally correct and self-consistent.
     //!
-    //! What this does **not** prove: that a real S3-compatible server
-    //! (MinIO, AWS) actually accepts these exact signed requests as
-    //! valid — `tiny_http` does not implement SigV4 verification, it
-    //! just records what it received and returns a scripted response.
-    //! No MinIO instance is available in this sandbox. See module docs.
+    //! `tiny_http` does not implement SigV4 verification, so the separate
+    //! shared adapter contract runs against MinIO in CI to cover an
+    //! independent S3-compatible validator.
 
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};

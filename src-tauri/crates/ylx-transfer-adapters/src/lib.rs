@@ -1,7 +1,5 @@
-//! `ylx-transfer-adapters` — started as the W0-06 workspace-layout spike
-//! (every module a stub, no production dependency), now backed by real
-//! production adapters for network, storage, credentials, and publication
-//! authenticity:
+//! Production adapters for Device API networking, storage, credentials,
+//! removable media, and publication authenticity:
 //!
 //! - `pi_http` (PC-03): real HTTPS client for the Pi transfer-daemon
 //!   (`ureq` + a fingerprint-pinned `rustls` `ClientConfig`). See that
@@ -9,9 +7,9 @@
 //! - `discovery_mdns` (PC-03): real `mdns-sd`-backed browser for
 //!   `_ylx-capture._tcp.local.` candidates — discovery-only, never a trust
 //!   anchor (ADR-DISC-001); see that module's doc comment for scope.
-//! - `object_store_s3` (SPIKE-PC-S3): real S3-compatible multipart-upload
+//! - `object_store_s3`: real S3-compatible multipart-upload
 //!   adapter (`rusty-s3` + `ureq`).
-//! - `credential_keyring` (SPIKE-PC-CRED): real OS keyring adapter
+//! - `credential_keyring`: real OS keyring adapter
 //!   (`keyring`).
 //! - `pi_client_port` (PC-02): direct pairing, authenticated-device,
 //!   session-catalog, and download capability implementations for the real

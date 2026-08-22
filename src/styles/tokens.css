@@ -1,6 +1,5 @@
-/* Design tokens — Claude-brand warm palette (see docs/LAN_TRANSFER_PROTOCOL.md
-   §5.2 for why: dark mode reads as a native app's dark theme rather than a
-   web dashboard; light mode is a warm paper tone, not stark white). */
+/* Warm desktop palette: dark mode reads as a native application rather than
+   a web dashboard, while light mode uses a restrained paper-white surface. */
 
 @font-face {
   font-family: "YLX Mono";

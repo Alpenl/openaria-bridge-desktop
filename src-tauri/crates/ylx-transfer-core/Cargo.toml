@@ -29,8 +29,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 jsonschema = { version = "0.50", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
-# --- SPIKE-PC-DOWNLOAD addition (library/download.rs only) ---
-# See DEPENDENCY_REQUEST.md for the full write-up. `sha2` is pure Rust (no
+# `sha2` is pure Rust (no
 # C toolchain, unlike `rusqlite`'s `bundled` feature), used only to compute
 # the real SHA-256 of a finished `.part` file before it is atomically
 # committed — this is a genuine security-relevant integrity check (plan
@@ -60,11 +59,9 @@ zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# --- SPIKE-PC-DOWNLOAD addition (library/download.rs's #[cfg(test)]
-# module and tests/download_http_spike.rs only) ---
+# Used by library/download.rs's tests and tests/download_http_spike.rs.
 # Test-only fake HTTP server, same crate/version/license already accepted
-# for ylx-transfer-adapters by SPIKE-PC-S3 (see DEPENDENCY_REQUEST.md for
-# the original write-up) — used here only to prove the Range-response
+# for ylx-transfer-adapters — used here only to prove the Range-response
 # parsing logic against real bytes on a real loopback socket, not just
 # hand-crafted header strings. Never compiled into a non-test build.
 tiny_http = { workspace = true }

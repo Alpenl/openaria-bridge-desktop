@@ -1,16 +1,11 @@
-//! `MdnsDiscovery` -- PC-03's mDNS candidate browser for
-//! `_ylx-capture._tcp.local.` (plan section 16 "PC-03 Pi HTTPS 与 mDNS
-//! adapters").
+//! mDNS candidate browser for `_ylx-capture._tcp.local.`.
 //!
 //! # Scope: deliberately minimal (this task's own brief)
 //!
-//! The task card is explicit that this side should stay small: PI-06 (the
-//! Pi-side advertiser, `capture/src/ylx_capture/transfer/discovery.py`'s
-//! `ZeroconfMdnsRegistrar` in the sibling RP-YLX repo) already proved the
-//! wire protocol works; this module only needs to browse for it and hand
-//! back a list of *candidates* -- it does not attempt resolution retry
+//! This module browses the Conductor-advertised service and returns a list of
+//! *candidates*. It does not attempt resolution retry
 //! policy, TTL/staleness tracking beyond "did we see a removal event", or
-//! any kind of ranking/preference logic. A future task can build that on
+//! any kind of ranking/preference logic. A caller can build that on
 //! top of [`MdnsDiscovery::poll_events`]'s output if/when it's actually
 //! needed.
 //!
@@ -57,10 +52,9 @@
 //!
 //! [`MdnsDiscovery::start`] constructs a real `mdns-sd` `ServiceDaemon` and
 //! issues a real `browse()` call -- this is not a fake. However, this
-//! sandbox environment's network namespace was not verified to support
-//! real multicast (no actual `_ylx-capture._tcp.local.` advertiser was
-//! reachable to resolve against; PI-06's advertiser lives in a different
-//! process/repo and was not run alongside this task). The tests in this
+//! default test environment is not required to support real multicast (a
+//! live `_ylx-capture._tcp.local.` advertiser is not started by the test
+//! suite). The tests in this
 //! module therefore split into two honest categories: (1) real,
 //! non-`#[ignore]`d unit tests of the pure `ServiceInfo` -> [`MdnsCandidate`]
 //! mapping, the URL-composition helpers, and the poll/teardown state
@@ -81,9 +75,7 @@ use std::time::Duration;
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 
-/// The Pi transfer-daemon's mDNS service type, matching PI-06's advertiser
-/// (`capture/src/ylx_capture/transfer/discovery.py`'s
-/// `ZeroconfMdnsRegistrar`) verbatim.
+/// The Conductor Device API's mDNS service type.
 pub const YLX_CAPTURE_SERVICE_TYPE: &str = "_ylx-capture._tcp.local.";
 
 /// One unauthenticated mDNS candidate. See module doc comment's

@@ -1,10 +1,5 @@
-//! PC-05: `TransferCoordinator` — the durable, bounded-concurrency job
-//! scheduler that ties PC-00 (tagged job state), the journal spike
-//! (durable transitions/reconcile), the download spike
-//! (`DownloadSource`/`download_file`/`commit_session`), and PC-02
-//! (`DeviceActor`'s connection/capture-activity state) together into one
-//! working scheduler. See plan section 16 "PC-05 Durable
-//! TransferCoordinator".
+//! Durable, bounded-concurrency transfer scheduler connecting device state,
+//! download sources, local commit, and persistent job reconciliation.
 //!
 //! # Collaborator seams (why no direct `DeviceActor`/`PiHttpClient` type
 //! appears anywhere in this file)

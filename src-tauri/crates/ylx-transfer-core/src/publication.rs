@@ -81,7 +81,7 @@ fn rejected(message: impl Into<String>) -> PublicationTrustError {
     PublicationTrustError::Rejected(message.into())
 }
 
-/// Parse an RP-YLX JSON document without accepting JSON's duplicate-key or
+/// Parse a Conductor publication document without accepting JSON's duplicate-key or
 /// non-finite-number extensions.  This is intentionally performed before
 /// serde_json builds a map, since a map would otherwise silently retain the
 /// final value of a duplicate key.
@@ -130,7 +130,7 @@ fn validate_surrogate_escapes(text: &str) -> Result<(), PublicationTrustError> {
     Ok(())
 }
 
-/// RP-YLX v1 signature bytes: compact, recursively key-sorted ASCII JSON,
+/// Conductor v1 signature bytes: compact, recursively key-sorted ASCII JSON,
 /// omitting only the top-level `publication_signature` field.
 pub fn canonicalize_rp_manifest(manifest: &Value) -> Result<Vec<u8>, PublicationTrustError> {
     let object = manifest

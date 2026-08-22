@@ -1,36 +1,10 @@
 //! SQLite schema and migrations for the durable transfer store.
 //!
-//! **Status: pre-PC-00/PC-01 spike, explicitly out-of-sequence-authorized**
-//! (see the task card that produced this file). W0-06 (`sqlite_store.rs`)
-//! already answered the *engine* question (SQLite over JSON) with a
-//! generic whole-snapshot `library_entries`/`storage_config` KV store. This
-//! module goes one level more concrete: the actual multi-table schema the
-//! real PC-01 deliverable needs for the tagged transfer-job state machine
-//! (plan section 5.4), the download commit protocol (section 9.2), and the
-//! S3 upload receipt (section 9.3).
-//!
-//! This schema is provisional. It has **not** been reviewed against the
-//! real domain model, because that domain model does not exist yet — PC-00
-//! (core scaffold, tagged Device/Connection/Transfer/Local/Backup enums)
-//! has not run. Once PC-00 freezes the real types, PC-01 should treat this
-//! file as a starting draft to revise, not a frozen contract. In
-//! particular:
-//!
-//! - `device_id` / `session_id` / `file_id` are plain `TEXT` here (matching
-//!   W0-06's existing `LibraryEntryRecord` convention in `snapshot.rs`),
-//!   not `domain::DeviceId`/`SessionId` newtypes — this module deliberately
-//!   does not depend on `crate::domain` (PC-00's territory) or
-//!   `crate::library` (SPIKE-PC-DOWNLOAD's territory) to avoid coupling a
-//!   spike to other in-flight spikes' internal shapes.
-//! - "storage profile" (S3 provider/bucket/endpoint) is **not** duplicated
-//!   here — it already exists as `sqlite_store::MIGRATIONS`'s
-//!   `storage_config` table. This spike only adds the five tables its task
-//!   card lists by name: `library`, `files`, `jobs`, `checkpoints`,
-//!   `receipts`.
-//! - The job-state transition graph in this file (`is_valid_transition`)
-//!   is a reasonable, documented *first draft* covering the tagged enum in
-//!   plan section 5.4, not a graph PC-05 (the real coordinator) has signed
-//!   off on.
+//! The forward-only schema records library entries, file inventories, jobs,
+//! checkpoints, and object-store receipts used by the production transfer
+//! coordinator. Device, session, and file IDs remain opaque `TEXT` values at
+//! this persistence boundary. Storage-profile settings stay in the existing
+//! `storage_config` table rather than being duplicated here.
 //!
 //! ## No secrets in this schema
 //!
@@ -39,9 +13,7 @@
 //! *server-observed, non-secret* identifiers (an HTTP ETag, an S3 version
 //! ID, a HEAD-response digest) — proof that a transfer happened, never a
 //! credential that could authenticate a new request. Raw credentials stay
-//! in SPIKE-PC-CRED's vault (`credential_vault.rs`); only opaque
-//! non-secret references belong here, matching ADR-PC-001's "Secrets ...
-//! never get a column in this schema" consequence. See
+//! in the credential vault; only opaque non-secret references belong here. See
 //! `journal_spike::schema_has_no_secret_columns` for the machine-checked
 //! version of this claim.
 
@@ -1037,10 +1009,7 @@ impl JobStateTag {
     /// `Cancelled` are terminal in this draft graph: a retry after failure
     /// is modeled as a *new* job (fresh `idempotency_key`, e.g. a new
     /// revision attempt), not a resurrection of the old row -- this keeps
-    /// "one job, one lifecycle, one row" simple for the spike. PC-05 may
-    /// decide a real in-place `failed -> queued` retry edge is worth
-    /// adding; that is an explicit, documented deviation point, not an
-    /// oversight.
+    /// "one job, one lifecycle, one row" invariant explicit.
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -1049,10 +1018,8 @@ impl JobStateTag {
     }
 }
 
-/// Provisional transition graph for the plan 5.4 tagged job enum. See the
-/// module doc for why this is a first draft, not a PC-05-reviewed
-/// contract. Every edge here is intentional (has a plan-section-grounded
-/// reason), not exhaustive of everything a future coordinator might add.
+/// Persisted transition graph for the compatibility job tables. Every edge is
+/// intentional; terminal rows are immutable and retries receive a new job.
 pub fn is_valid_transition(from: JobStateTag, to: JobStateTag) -> bool {
     use JobStateTag::*;
     if from.is_terminal() {
