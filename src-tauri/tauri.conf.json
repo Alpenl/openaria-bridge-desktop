@@ -26,7 +26,14 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": false,
     "targets": "all",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc5OTcyODA3RDJGNDc4QjAKUldTd2VQVFNCeWlYZWU0ZElkMndCVWpubXE1NExwSEpqK1FsRkFBK29GNWo0b09PbUkwcGJ2a08K",
+      "endpoints": ["https://github.com/Alpenl/openaria-bridge-desktop/releases/latest/download/latest.json"]
+    }
   }
 }

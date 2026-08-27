@@ -64,6 +64,8 @@ libc = "0.2"
 # PC-08: the production core and adapter crates are members of this workspace.
 ylx-transfer-core = { workspace = true }
 ylx-transfer-adapters = { path = "crates/ylx-transfer-adapters" }
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 
 [dev-dependencies]
 # Startup failpoint tests need an independent SQLite connection to hold a

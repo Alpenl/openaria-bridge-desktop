@@ -63,6 +63,10 @@
               aria-label="传输完成系统通知"
             ></button>
           </div>
+          <button type="button" class="rail-setting" id="openUpdateBtn">
+            <span class="rail-setting-label">应用更新</span>
+            <span class="mono rail-setting-value">在应用内完成</span>
+          </button>
           <div class="theme-toggle" role="group" aria-label="主题切换">
             <button type="button" data-theme-btn="dark">深色</button>
             <button type="button" data-theme-btn="light">浅色</button>
@@ -203,6 +207,27 @@
           <div class="modal-actions">
             <button class="btn btn-ghost" id="cancelDownloadRoot">取消</button>
             <button class="btn btn-primary" id="saveDownloadRoot">保存</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="overlay" id="updateOverlay">
+        <div class="modal-card">
+          <h3>应用更新</h3>
+          <p class="modal-sub">检查、下载并安装 Open Aria Bridge 更新</p>
+          <div class="update-panel">
+            <div class="update-row"><span>当前版本</span><span class="mono" id="updateCurrentVersion">未知</span></div>
+            <div class="update-row"><span>可用版本</span><span class="mono" id="updateAvailableVersion">无</span></div>
+            <div class="update-status" id="updateStatusText">尚未检查</div>
+            <div class="update-progress mono" id="updateProgress" hidden></div>
+            <pre class="update-notes" id="updateNotes" hidden></pre>
+          </div>
+          <div class="modal-actions-split">
+            <button class="btn btn-ghost" id="cancelUpdate">关闭</button>
+            <div style="display: flex; gap: 8px">
+              <button class="btn btn-ghost" id="checkUpdateBtn">检查更新</button>
+              <button class="btn btn-primary" id="installUpdateBtn" disabled>下载并安装</button>
+            </div>
           </div>
         </div>
       </div>

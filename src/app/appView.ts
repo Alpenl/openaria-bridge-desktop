@@ -13,6 +13,20 @@ import type { TraySelection } from "../ui/traySelector";
 import type { StorageConfig } from "../types";
 import type { MediaWorkspaceSnapshot } from "../ui/media/types";
 
+export interface AppUpdateViewModel {
+  readonly currentVersion: string | null;
+  readonly availableVersion: string | null;
+  readonly checked: boolean;
+  readonly checking: boolean;
+  readonly installing: boolean;
+  readonly progressLabel: string | null;
+  readonly message: string | null;
+  readonly error: string | null;
+  readonly notes: string | null;
+  readonly canCheck: boolean;
+  readonly canInstall: boolean;
+}
+
 export interface AppView {
   /** Device list and connected count in the left rail. */
   renderRail(state: AppState): void;
@@ -45,6 +59,9 @@ export interface AppView {
   openDownloadRootSettings(config: StorageConfig): void;
   closeDownloadRootSettings(): void;
   setDownloadRootField(value: string): void;
+  openUpdateSettings(model: AppUpdateViewModel): void;
+  closeUpdateSettings(): void;
+  renderUpdateSettings(model: AppUpdateViewModel): void;
 
   /** A blocking, user-facing confirmation for an irreversible remote deletion.
    * Returns whether the user agreed. */

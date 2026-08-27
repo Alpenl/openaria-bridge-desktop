@@ -2787,7 +2787,7 @@ mod tests {
         let request = one_file_request(&device_id, "sess-1", "job-succeed", &data);
         let job_id = coordinator.enqueue(request).expect("enqueue");
 
-        let ok = wait_until(Duration::from_secs(5), || {
+        let ok = wait_until(DEFAULT_TEST_TIMEOUT, || {
             matches!(
                 coordinator.job_state(&job_id),
                 Some(TransferJobState::Succeeded)

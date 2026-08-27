@@ -2,6 +2,7 @@
 // saved-location control, notifications and the theme switch.
 
 import type { Dispatch } from "../../app/actions";
+import type { AppUpdateViewModel } from "../../app/appView";
 import type { ThemePreference } from "../../store";
 import { storageOf, type AppState } from "../../runtime/reducer";
 import type { SaveStorageConfigInput, StorageConfig, StorageUrlStyle } from "../../types";
@@ -18,6 +19,9 @@ export interface SettingsScreen {
   openDownloadRootSettings(config: StorageConfig): void;
   closeDownloadRootSettings(): void;
   setDownloadRootField(value: string): void;
+  openUpdateSettings(model: AppUpdateViewModel): void;
+  closeUpdateSettings(): void;
+  renderUpdateSettings(model: AppUpdateViewModel): void;
   dispose(): void;
 }
 
@@ -37,6 +41,7 @@ export function createSettingsScreen(dispatch: Dispatch): SettingsScreen {
   const bound = bindings();
   const storageOverlay = el("storageOverlay");
   const downloadRootOverlay = el("downloadRootOverlay");
+  const updateOverlay = el("updateOverlay");
 
   /* ---- rail footer ---- */
 
@@ -50,6 +55,7 @@ export function createSettingsScreen(dispatch: Dispatch): SettingsScreen {
       dispatch({ kind: "settings/setNotifications", enabled: matched.dataset.on !== "true" }),
     ),
   );
+  bound.add(delegate(el("openUpdateBtn"), "click", "#openUpdateBtn", () => dispatch({ kind: "updates/open" })));
   bound.add(
     delegate(document.body, "click", "[data-theme-btn]", (matched) => {
       const theme = matched.dataset.themeBtn as ThemePreference | undefined;
@@ -97,6 +103,24 @@ export function createSettingsScreen(dispatch: Dispatch): SettingsScreen {
           return;
         case "saveDownloadRoot":
           dispatch({ kind: "settings/saveDownloadRoot", downloadRoot: inputEl("downloadRootInput").value.trim() });
+          return;
+      }
+    }),
+  );
+
+  /* ---- app update modal ---- */
+
+  bound.add(
+    delegate(updateOverlay, "click", "button", (matched) => {
+      switch (matched.id) {
+        case "cancelUpdate":
+          dispatch({ kind: "updates/close" });
+          return;
+        case "checkUpdateBtn":
+          dispatch({ kind: "updates/check" });
+          return;
+        case "installUpdateBtn":
+          dispatch({ kind: "updates/install" });
           return;
       }
     }),
@@ -165,6 +189,34 @@ export function createSettingsScreen(dispatch: Dispatch): SettingsScreen {
     setDownloadRootField(value: string): void {
       inputEl("downloadRootInput").value = value;
     },
+    openUpdateSettings(model: AppUpdateViewModel): void {
+      renderUpdate(model);
+      updateOverlay.dataset.open = "true";
+    },
+    closeUpdateSettings(): void {
+      updateOverlay.dataset.open = "false";
+    },
+    renderUpdateSettings(model: AppUpdateViewModel): void {
+      renderUpdate(model);
+    },
     dispose: bound.dispose,
   };
+}
+
+function renderUpdate(model: AppUpdateViewModel): void {
+  el("updateCurrentVersion").textContent = model.currentVersion ?? "未知";
+  el("updateAvailableVersion").textContent = model.availableVersion ?? "无";
+  el("updateStatusText").textContent = model.error ?? model.message ?? (model.checked ? "没有可用更新" : "尚未检查");
+  el("updateStatusText").dataset.tone = model.error === null ? "default" : "danger";
+  el("updateProgress").textContent = model.progressLabel ?? "";
+  el("updateProgress").toggleAttribute("hidden", model.progressLabel === null);
+  const notes = el("updateNotes");
+  notes.textContent = model.notes ?? "";
+  notes.toggleAttribute("hidden", model.notes === null || model.notes.trim() === "");
+  const checkButton = el("checkUpdateBtn") as HTMLButtonElement;
+  checkButton.disabled = !model.canCheck;
+  checkButton.textContent = model.checking ? "检查中…" : "检查更新";
+  const installButton = el("installUpdateBtn") as HTMLButtonElement;
+  installButton.disabled = !model.canInstall;
+  installButton.textContent = model.installing ? "更新中…" : "下载并安装";
 }

@@ -9,6 +9,7 @@
 import "./styles/app.css";
 
 import { createTransferApp } from "./app/transferApp";
+import { createTauriAppUpdater } from "./runtime/appUpdater";
 import { systemClock } from "./runtime/clock";
 import { createTauriBackend } from "./runtime/tauriBackend";
 import { createDomAppView } from "./ui/views/appDom";
@@ -18,6 +19,7 @@ const app = createTransferApp({
   backend: createTauriBackend(),
   clock: systemClock,
   toast,
+  updater: createTauriAppUpdater(),
   view: createDomAppView,
 });
 

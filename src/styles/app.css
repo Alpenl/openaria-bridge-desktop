@@ -383,6 +383,50 @@ button {
   box-shadow: var(--shadow-card);
 }
 
+.update-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 8px;
+}
+.update-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  color: var(--text-secondary);
+}
+.update-row .mono {
+  color: var(--text-primary);
+}
+.update-status {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-inset);
+  color: var(--text-secondary);
+  padding: 9px 10px;
+}
+.update-status[data-tone="danger"] {
+  border-color: var(--danger-500);
+  background: var(--danger-wash);
+  color: var(--text-primary);
+}
+.update-progress {
+  color: var(--accent-strong);
+}
+.update-notes {
+  max-height: 140px;
+  overflow: auto;
+  white-space: pre-wrap;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-inset);
+  color: var(--text-secondary);
+  padding: 10px;
+  margin: 0;
+  user-select: text;
+}
+
 /* ---------- nav (library) ---------- */
 .rail-group-title {
   padding: 8px 9px 6px;
