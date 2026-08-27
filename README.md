@@ -6,16 +6,17 @@ maintaining a local library, and publishing selected recordings to
 an S3-compatible object store.
 
 The application is built with Tauri 2, Rust, and TypeScript. Production builds
-use the real mDNS, HTTPS, filesystem, SQLite, OS keyring, and object-store
-adapters. Simulation code is available only through the explicit Rust `demo`
-feature.
+use the real mDNS, Device API HTTP, filesystem, SQLite, OS keyring, and
+object-store adapters. Simulation code is available only through the explicit
+Rust `demo` feature.
 
 ## Product boundary
 
 The desktop client owns the human-operated Bridge workflow:
 
-- discover or manually add a device and pin its TLS identity;
-- pair, list sessions, and download a full session or selected files;
+- discover or manually add a current RDK X5 device through Device API v4 over
+  trusted-LAN HTTP on port `8080`;
+- pair/connect, list sessions, and download a full session or selected files;
 - validate signed publication material, paths, sizes, and SHA-256 claims;
 - cancel or explicitly retry a transfer during normal operation;
 - publish verified local recordings with multipart upload; and
@@ -30,6 +31,13 @@ operation interruption are not current product promises or release gates.
 Device capture and Device API authority belong to
 [Open Aria Conductor](https://github.com/Alpenl/openaria-conductor). This
 repository contains only the desktop client and its local test fixtures.
+
+Current RDK X5 lab/internal devices advertise `_ylx-capture._tcp.local.` and
+serve `GET /api/v4/device` plus session/artifact endpoints at
+`http://<device-ip>:8080/api/v4`. The desktop app therefore probes manual IPs
+on `8080` and treats the `/api/v4/device` response as the current lab device
+descriptor. The old pinned HTTPS `:8443` Device API v1 path remains as retained
+adapter compatibility, but it is not the current Windows/manual-connect route.
 
 ## Compatibility
 
@@ -156,7 +164,9 @@ interruption. Credentials never enter its SQLite schema.
 
 ## Security notes
 
-- Device identities use full certificate fingerprints; short labels are for
+- Current lab/internal Device API v4 devices use a desktop-internal synthetic
+  identity derived from `/api/v4/device.device_id`; retained legacy Device API
+  v1 clients still use full certificate fingerprints. Short labels are for
   display and legacy lookup only.
 - Session and publication JSON is parsed strictly and fails closed on unknown
   or malformed contract input.

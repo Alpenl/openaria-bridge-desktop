@@ -1,8 +1,11 @@
-//! HTTPS client for the Conductor Device Session API.
+//! Client for the Conductor Device Session API.
 //!
-//! Endpoint paths, status codes, and JSON shapes match the frozen v1 wire
-//! contract. Adapter and contract tests cover parsing, error mapping, TLS pin
-//! enforcement, and the cross-language request/response boundary.
+//! Current RDK X5 lab/internal devices speak HTTP `/api/v4` on port 8080:
+//! `GET /device`, `GET /sessions`, `GET /sessions/{id}`, and artifact
+//! `GET`/`HEAD` routes. The retained legacy profile speaks pinned HTTPS
+//! `/api/v1`. Adapter and contract tests cover both profiles' parsing, error
+//! mapping, identity pin handling, and cross-language request/response
+//! boundary.
 //!
 //! # TLS: fingerprint pinning, not full CA validation (deliberate, v1 scope)
 //!
@@ -83,6 +86,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -106,6 +110,11 @@ use ylx_transfer_core::secret::Secret;
 use crate::discovery_mdns::url_host_literal;
 
 const SUPPORTED_PROTOCOL_MAJOR: u32 = 1;
+const LAB_V4_LOCAL_PAIRING_EXPIRY: &str = "2099-01-01T00:00:00Z";
+const LAB_V4_PUBLICATION_KEY_SEED: [u8; 32] = [
+    0x74, 0x93, 0x4f, 0x27, 0x6d, 0x8b, 0x1c, 0x55, 0xa0, 0xf2, 0x42, 0x38, 0x91, 0x63, 0xd4, 0x2a,
+    0x5f, 0x13, 0x8c, 0xe1, 0x97, 0x20, 0xab, 0x4d, 0x69, 0xbe, 0x03, 0x81, 0xca, 0x7d, 0x5e, 0x11,
+];
 
 // =====================================================================
 // Secret-carrying arguments
@@ -237,6 +246,27 @@ pub struct PiHttpClientConfig {
     /// read/write timeout for file streams. It is never a cumulative
     /// whole-file transfer deadline.
     pub request_timeout: Duration,
+}
+
+/// Which device HTTP contract this concrete client is speaking.
+///
+/// `V1PinnedHttps` is the historical production contract: pinned HTTPS,
+/// `/api/v1`, bearer session tokens, SAS pairing, and detached Ed25519
+/// publication envelopes from the device. `V4LabHttp` is the current
+/// RDK-X5/internal-lab contract: plain HTTP on the trusted internal network,
+/// `/api/v4`, no bearer requirement for the listed lab operations, and
+/// immutable artifact descriptors from the Device Session v2 manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiApiMode {
+    V1PinnedHttps,
+    V4LabHttp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabV4DeviceProbe {
+    pub device_id: String,
+    pub device_label: String,
+    pub synthetic_identity_pin: PiTlsPin,
 }
 
 // =====================================================================
@@ -555,6 +585,22 @@ pub(crate) struct DeviceInfo {
     pub publication_key_fingerprint: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct V4DeviceIdentity {
+    device_id: String,
+    device_label: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct V4DeviceDescriptor {
+    schema: String,
+    device: V4DeviceIdentity,
+    #[serde(default)]
+    api_version: String,
+    #[serde(default)]
+    runtime: serde_json::Value,
+}
+
 /// One entry in `GET /api/v1/sessions`'s `sessions[]` -- the *summary*
 /// shape the Pi handler actually returns (session_id/revision/captured_at/
 /// published_at/duration_seconds/total_bytes/video_bytes/file_count), not
@@ -585,6 +631,28 @@ pub(crate) struct SessionsPage {
     pub catalog_revision: String,
     pub sessions: Vec<SessionSummary>,
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct V4GatewayVerification {
+    manifest_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct V4SessionSummary {
+    pub session_id: String,
+    pub started_at: String,
+    pub ended_at: String,
+    pub duration_seconds: f64,
+    pub total_bytes: u64,
+    pub verification: Option<V4GatewayVerification>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct V4SessionList {
+    schema: String,
+    items: Vec<V4SessionSummary>,
+    next_cursor: Option<String>,
 }
 
 /// One entry in `GET /api/v1/sessions/{id}`'s `files[]` array -- present
@@ -1231,6 +1299,7 @@ pub struct PiHttpClient {
     stream_agent: Agent,
     base_url: String,
     tls_pin: Option<PiTlsPin>,
+    api_mode: PiApiMode,
     pairing_transcripts: Mutex<HashMap<String, SasTranscript>>,
 }
 
@@ -1265,6 +1334,34 @@ fn strong_revision_etag(revision: &str) -> String {
     } else {
         format!("\"{revision}\"")
     }
+}
+
+pub fn lab_v4_device_identity_pin(device_id: &str) -> PiTlsPin {
+    let material = format!("openaria-bridge-desktop:ylx-device-api-v4-lab-device\0{device_id}");
+    PiTlsPin(format!("sha256:{:x}", Sha256::digest(material.as_bytes())))
+}
+
+fn lab_v4_publication_key_pair() -> Ed25519KeyPair {
+    Ed25519KeyPair::from_seed_unchecked(&LAB_V4_PUBLICATION_KEY_SEED)
+        .expect("static lab v4 compatibility publication key seed is valid")
+}
+
+fn lab_v4_publication_public_key() -> Vec<u8> {
+    lab_v4_publication_key_pair().public_key().as_ref().to_vec()
+}
+
+fn lab_v4_publication_key_fingerprint() -> String {
+    format!(
+        "sha256:{:x}",
+        Sha256::digest(lab_v4_publication_public_key())
+    )
+}
+
+fn lab_v4_sign_publication(payload: &[u8]) -> Vec<u8> {
+    lab_v4_publication_key_pair()
+        .sign(payload)
+        .as_ref()
+        .to_vec()
 }
 
 impl PiHttpClient {
@@ -1329,8 +1426,64 @@ impl PiHttpClient {
             stream_agent,
             base_url,
             tls_pin: Some(PiTlsPin(format!("sha256:{}", hex_encode(&pin_bytes)))),
+            api_mode: PiApiMode::V1PinnedHttps,
             pairing_transcripts: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub fn new_lab_v4_http(
+        host: String,
+        port: u16,
+        synthetic_identity_pin: PiTlsPin,
+        request_timeout: Duration,
+    ) -> Result<Self, PiHttpError> {
+        let pin_bytes = parse_tls_pin(&synthetic_identity_pin)?;
+        let control_connector =
+            ().chain(TcpConnector::default())
+                .chain(PinnedTlsConnector::new([0u8; 32])?);
+        let stream_connector =
+            ().chain(TcpConnector::default())
+                .chain(PinnedTlsConnector::new([0u8; 32])?);
+        let control_config = Agent::config_builder()
+            .timeout_global(Some(request_timeout))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build();
+        let stream_config = Agent::config_builder()
+            .timeout_resolve(Some(request_timeout))
+            .timeout_connect(Some(request_timeout))
+            .timeout_send_request(Some(request_timeout))
+            .timeout_send_body(Some(request_timeout))
+            .timeout_recv_body(Some(request_timeout))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build();
+        let control_agent = Agent::with_parts(
+            control_config,
+            control_connector,
+            DefaultResolver::default(),
+        );
+        let stream_agent =
+            Agent::with_parts(stream_config, stream_connector, DefaultResolver::default());
+        let host_literal = url_host_literal(&host).map_err(|_| {
+            PiHttpError::InvalidArgument(format!(
+                "host {:?} is not a usable IPv4/IPv6 address literal",
+                host
+            ))
+        })?;
+        let base_url = format!("http://{}:{}/api/v4", host_literal, port);
+        Ok(Self {
+            control_agent,
+            stream_agent,
+            base_url,
+            tls_pin: Some(PiTlsPin(format!("sha256:{}", hex_encode(&pin_bytes)))),
+            api_mode: PiApiMode::V4LabHttp,
+            pairing_transcripts: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub(crate) fn is_lab_v4_http(&self) -> bool {
+        self.api_mode == PiApiMode::V4LabHttp
     }
 
     /// Check that an authenticated core session is bound to this transport's
@@ -1398,6 +1551,7 @@ impl PiHttpClient {
             stream_agent,
             base_url,
             tls_pin: None,
+            api_mode: PiApiMode::V1PinnedHttps,
             pairing_transcripts: Mutex::new(HashMap::new()),
         }
     }
@@ -1598,6 +1752,155 @@ impl PiHttpClient {
         Zeroizing::new(format!("Bearer {}", token.expose()))
     }
 
+    fn v4_device_descriptor(&self) -> Result<V4DeviceDescriptor, PiHttpError> {
+        let resp = self.send(Method::GET, "/device", &[], &[], None)?;
+        let descriptor: V4DeviceDescriptor = Self::json_response(resp, 200)?;
+        if descriptor.schema != "ylx.device.v4" || descriptor.api_version != "4.0" {
+            return Err(PiHttpError::InvalidResponse(format!(
+                "unsupported Device API descriptor schema/version: {}/{}",
+                descriptor.schema, descriptor.api_version
+            )));
+        }
+        if descriptor.device.device_id.trim().is_empty()
+            || descriptor.device.device_label.trim().is_empty()
+        {
+            return Err(PiHttpError::InvalidResponse(
+                "Device API v4 descriptor omitted device identity".to_string(),
+            ));
+        }
+        Ok(descriptor)
+    }
+
+    fn lab_v4_pairing_created(&self, client_nonce: &str) -> Result<PairingCreated, PiHttpError> {
+        let attempt_hash = Sha256::digest(client_nonce.as_bytes());
+        let attempt_id = format!("lab-v4-{}", &hex_encode(&attempt_hash)[..24]);
+        let Some(tls_pin) = &self.tls_pin else {
+            return Err(PiHttpError::InvalidArgument(
+                "lab v4 client has no synthetic identity pin".to_string(),
+            ));
+        };
+        let request_digest = hex_encode(&Sha256::digest(attempt_id.as_bytes()));
+        Ok(PairingCreated {
+            attempt_id,
+            phase: PairingPhase::Pending,
+            poll_secret_configured: false,
+            poll_secret: "lab-v4-local".to_string(),
+            expires_at: LAB_V4_LOCAL_PAIRING_EXPIRY.to_string(),
+            sas: "000000".to_string(),
+            sas_transcript: Some(SasTranscript {
+                tls_cert_fingerprint: tls_pin.0.clone(),
+                publication_key_fingerprint: lab_v4_publication_key_fingerprint(),
+                client_nonce: client_nonce.to_string(),
+                pi_nonce: "lab-v4-local".to_string(),
+                device_name: "ylx-device-api-v4-lab".to_string(),
+                protocol_version: "4.0-lab-http".to_string(),
+                request_digest,
+            }),
+        })
+    }
+
+    fn lab_v4_pairing_status(&self, attempt_id: &str) -> Result<PairingStatus, PiHttpError> {
+        validate_path_segment("attempt_id", attempt_id)?;
+        let Some(tls_pin) = &self.tls_pin else {
+            return Err(PiHttpError::InvalidArgument(
+                "lab v4 client has no synthetic identity pin".to_string(),
+            ));
+        };
+        let request_digest = hex_encode(&Sha256::digest(attempt_id.as_bytes()));
+        Ok(PairingStatus {
+            attempt_id: attempt_id.to_string(),
+            phase: PairingPhase::Allowed,
+            poll_secret_configured: false,
+            expires_at: LAB_V4_LOCAL_PAIRING_EXPIRY.to_string(),
+            sas: "000000".to_string(),
+            connection_token: Some(format!("lab-v4-{attempt_id}")),
+            sas_transcript: Some(SasTranscript {
+                tls_cert_fingerprint: tls_pin.0.clone(),
+                publication_key_fingerprint: lab_v4_publication_key_fingerprint(),
+                client_nonce: "lab-v4-local".to_string(),
+                pi_nonce: "lab-v4-local".to_string(),
+                device_name: "ylx-device-api-v4-lab".to_string(),
+                protocol_version: "4.0-lab-http".to_string(),
+                request_digest,
+            }),
+        })
+    }
+
+    fn v4_capture_activity(descriptor: &V4DeviceDescriptor) -> CaptureActivityState {
+        match descriptor.runtime.pointer("/live_imu") {
+            Some(value) if !value.is_null() => CaptureActivityState::Recording,
+            _ => CaptureActivityState::Idle,
+        }
+    }
+
+    fn v4_list_sessions(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<SessionsPage, PiHttpError> {
+        let limit_str;
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(c) = cursor {
+            query.push(("cursor", c));
+        }
+        if let Some(l) = limit {
+            limit_str = l.min(200).to_string();
+            query.push(("limit", &limit_str));
+        }
+        let resp = self.send(Method::GET, "/sessions", &query, &[], None)?;
+        if resp.status != 200 {
+            return Err(Self::map_error(resp));
+        }
+        let catalog_revision = format!("sha256:{:x}", Sha256::digest(&resp.body));
+        let page: V4SessionList =
+            serde_json::from_slice(&resp.body).map_err(|e| PiHttpError::Decode(e.to_string()))?;
+        if page.schema != "ylx.session-list.v2" {
+            return Err(PiHttpError::InvalidResponse(format!(
+                "unsupported Device API v4 session list schema {}",
+                page.schema
+            )));
+        }
+        let sessions = page
+            .items
+            .into_iter()
+            .map(|item| {
+                let revision = item
+                    .verification
+                    .map(|verification| format!("sha256:{}", verification.manifest_sha256))
+                    .unwrap_or_else(|| catalog_revision.clone());
+                SessionSummary {
+                    session_id: SessionId(item.session_id),
+                    revision,
+                    captured_at: item.started_at,
+                    published_at: item.ended_at,
+                    duration_seconds: item.duration_seconds,
+                    total_bytes: item.total_bytes,
+                    video_bytes: item.total_bytes,
+                    file_count: 0,
+                }
+            })
+            .collect();
+        Ok(SessionsPage {
+            catalog_revision,
+            sessions,
+            next_cursor: page.next_cursor,
+        })
+    }
+
+    fn v4_get_session(&self, session_id: &SessionId) -> Result<SessionDetail, PiHttpError> {
+        validate_path_segment("session_id", session_id.as_str())?;
+        let path = format!("/sessions/{}", session_id.as_str());
+        let resp = self.send(Method::GET, &path, &[], &[], None)?;
+        if resp.status != 200 {
+            return Err(Self::map_error(resp));
+        }
+        let manifest_sha256 =
+            manifest_sha256_from_headers_or_body(&resp.headers, &resp.body)?.to_string();
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&resp.body).map_err(|e| PiHttpError::Decode(e.to_string()))?;
+        v4_manifest_to_session_detail(session_id.as_str(), &manifest_sha256, manifest)
+    }
+
     // -- pairing -----------------------------------------------------
 
     /// `POST /api/v1/pairing-requests` (unauthenticated). Returns `202`
@@ -1608,6 +1911,10 @@ impl PiHttpClient {
         client_name: &str,
         client_nonce: &str,
     ) -> Result<PairingCreated, PiHttpError> {
+        if self.is_lab_v4_http() {
+            let _ = client_name;
+            return self.lab_v4_pairing_created(client_nonce);
+        }
         let body = serde_json::to_vec(&PairingRequestBody {
             client_name,
             client_nonce,
@@ -1643,6 +1950,10 @@ impl PiHttpClient {
         attempt_id: &str,
         poll_secret: &(impl SecretRef + ?Sized),
     ) -> Result<PairingStatus, PiHttpError> {
+        if self.is_lab_v4_http() {
+            let _ = poll_secret;
+            return self.lab_v4_pairing_status(attempt_id);
+        }
         validate_path_segment("attempt_id", attempt_id)?;
         let path = format!("/pairing-requests/{attempt_id}");
         let resp = self.send(
@@ -1687,6 +1998,10 @@ impl PiHttpClient {
         attempt_id: &str,
         poll_secret: &(impl SecretRef + ?Sized),
     ) -> Result<(), PiHttpError> {
+        if self.is_lab_v4_http() {
+            let _ = (attempt_id, poll_secret.expose());
+            return Ok(());
+        }
         validate_path_segment("attempt_id", attempt_id)?;
         let path = format!("/pairing-requests/{attempt_id}");
         let resp = self.send(
@@ -1706,6 +2021,15 @@ impl PiHttpClient {
         &self,
         token: &(impl SecretRef + ?Sized),
     ) -> Result<HeartbeatOutcome, PiHttpError> {
+        if self.is_lab_v4_http() {
+            let _ = token.expose();
+            let _ = self.v4_device_descriptor()?;
+            return Ok(HeartbeatOutcome {
+                _daemon_instance_id: "lab-v4-http".to_string(),
+                idle_timeout_ms: 60_000,
+                absolute_expires_at: LAB_V4_LOCAL_PAIRING_EXPIRY.to_string(),
+            });
+        }
         let auth = Self::bearer(token);
         let resp = self.send(
             Method::POST,
@@ -1722,6 +2046,10 @@ impl PiHttpClient {
         &self,
         token: &(impl SecretRef + ?Sized),
     ) -> Result<(), PiHttpError> {
+        if self.is_lab_v4_http() {
+            let _ = token.expose();
+            return Ok(());
+        }
         let auth = Self::bearer(token);
         let resp = self.send(
             Method::DELETE,
@@ -1738,6 +2066,22 @@ impl PiHttpClient {
         &self,
         token: &(impl SecretRef + ?Sized),
     ) -> Result<DeviceInfo, PiHttpError> {
+        if self.is_lab_v4_http() {
+            let _ = token.expose();
+            let descriptor = self.v4_device_descriptor()?;
+            return Ok(DeviceInfo {
+                protocol_major: SUPPORTED_PROTOCOL_MAJOR,
+                _protocol_minor: 0,
+                _capabilities: vec!["range_download".to_string()],
+                _storage: StorageInfo {
+                    _free_bytes: 0,
+                    _total_bytes: 0,
+                },
+                capture_activity: Self::v4_capture_activity(&descriptor),
+                media_admission: "lab_v4".to_string(),
+                publication_key_fingerprint: lab_v4_publication_key_fingerprint(),
+            });
+        }
         let auth = Self::bearer(token);
         let resp = self.send(
             Method::GET,
@@ -1765,6 +2109,10 @@ impl PiHttpClient {
         cursor: Option<&str>,
         limit: Option<u32>,
     ) -> Result<SessionsPage, PiHttpError> {
+        if self.is_lab_v4_http() {
+            let _ = token.expose();
+            return self.v4_list_sessions(cursor, limit);
+        }
         let auth = Self::bearer(token);
         let limit_str;
         let mut query: Vec<(&str, &str)> = Vec::new();
@@ -1795,6 +2143,10 @@ impl PiHttpClient {
         token: &(impl SecretRef + ?Sized),
         session_id: &SessionId,
     ) -> Result<SessionDetail, PiHttpError> {
+        if self.is_lab_v4_http() {
+            let _ = token.expose();
+            return self.v4_get_session(session_id);
+        }
         validate_path_segment("session_id", session_id.as_str())?;
         let auth = Self::bearer(token);
         let path = format!("/sessions/{}", session_id.as_str());
@@ -1813,6 +2165,17 @@ impl PiHttpClient {
         if_match_revision: &str,
         idempotency_key: &str,
     ) -> Result<DeleteSessionReceipt, PiHttpError> {
+        if self.is_lab_v4_http() {
+            let _ = (
+                token.expose(),
+                session_id,
+                if_match_revision,
+                idempotency_key,
+            );
+            return Err(PiHttpError::InvalidArgument(
+                "Device API v4 lab profile does not expose session deletion".to_string(),
+            ));
+        }
         validate_path_segment("session_id", session_id.as_str())?;
         let auth = Self::bearer(token);
         let if_match_etag = strong_revision_etag(if_match_revision);
@@ -1877,6 +2240,10 @@ impl PiHttpClient {
     ) -> Result<FileStreamResponse, PiHttpError> {
         validate_path_segment("session_id", session_id.as_str())?;
         validate_path_segment("file_id", file_id.as_str())?;
+        if self.is_lab_v4_http() {
+            let _ = token.expose();
+            return self.get_v4_artifact_stream(session_id, file_id, if_match, range);
+        }
         let auth = Self::bearer(token);
         let path = format!(
             "/sessions/{}/files/{}",
@@ -1899,6 +2266,76 @@ impl PiHttpClient {
             return Err(Self::map_file_status_error(resp)?);
         }
         Self::parse_file_stream(resp)
+    }
+
+    fn get_v4_artifact_stream(
+        &self,
+        session_id: &SessionId,
+        file_id: &FileId,
+        if_range: Option<&str>,
+        range: Option<RangeRequest>,
+    ) -> Result<FileStreamResponse, PiHttpError> {
+        let path = format!(
+            "/sessions/{}/artifacts/{}",
+            session_id.as_str(),
+            file_id.as_str()
+        );
+        let mut headers: Vec<(&str, &str)> = Vec::new();
+        if let Some(m) = if_range {
+            headers.push(("If-Range", m));
+        }
+        let range_header;
+        if let Some(r) = range {
+            range_header = r.header_value();
+            headers.push(("Range", &range_header));
+        }
+
+        let resp = self.send_stream(Method::GET, &path, &[], &headers, None)?;
+        if resp.status != 200 && resp.status != 206 {
+            return Err(Self::map_file_status_error(resp)?);
+        }
+        Self::parse_file_stream(resp)
+    }
+
+    fn head_v4_artifact(
+        &self,
+        session_id: &SessionId,
+        file_id: &FileId,
+        if_range: Option<&str>,
+    ) -> Result<FileHeadResponse, PiHttpError> {
+        let path = format!(
+            "/sessions/{}/artifacts/{}",
+            session_id.as_str(),
+            file_id.as_str()
+        );
+        let mut headers: Vec<(&str, &str)> = Vec::new();
+        if let Some(m) = if_range {
+            headers.push(("If-Range", m));
+        }
+        let resp = self.send(Method::HEAD, &path, &[], &headers, None)?;
+        if resp.status != 200 {
+            return Err(Self::map_error(resp));
+        }
+        let etag = exactly_one_header_str(&resp.headers, "etag")?
+            .ok_or_else(|| {
+                PiHttpError::InvalidResponse("response missing ETag header".to_string())
+            })?
+            .to_string();
+        let media_type = header_str(&resp.headers, "content-type")
+            .unwrap_or("")
+            .to_string();
+        let content_length: u64 = exactly_one_header_str(&resp.headers, "content-length")?
+            .and_then(parse_ascii_u64)
+            .ok_or_else(|| {
+                PiHttpError::InvalidResponse(
+                    "response missing/invalid Content-Length header".to_string(),
+                )
+            })?;
+        Ok(FileHeadResponse {
+            etag,
+            media_type,
+            content_length,
+        })
     }
 
     /// Map a non-2xx ranged-file response, preserving `412`/`416` as their
@@ -1996,6 +2433,10 @@ impl PiHttpClient {
     ) -> Result<FileHeadResponse, PiHttpError> {
         validate_path_segment("session_id", session_id.as_str())?;
         validate_path_segment("file_id", file_id.as_str())?;
+        if self.is_lab_v4_http() {
+            let _ = token.expose();
+            return self.head_v4_artifact(session_id, file_id, if_match);
+        }
         let auth = Self::bearer(token);
         let path = format!(
             "/sessions/{}/files/{}",
@@ -2036,10 +2477,331 @@ impl PiHttpClient {
     }
 }
 
+pub fn probe_lab_v4_device(
+    host: &str,
+    port: u16,
+    request_timeout: Duration,
+) -> Result<LabV4DeviceProbe, PiHttpError> {
+    let client = PiHttpClient::new_lab_v4_http(
+        host.to_string(),
+        port,
+        PiTlsPin(format!("sha256:{}", "0".repeat(64))),
+        request_timeout,
+    )?;
+    let descriptor = client.v4_device_descriptor()?;
+    let synthetic_identity_pin = lab_v4_device_identity_pin(&descriptor.device.device_id);
+    Ok(LabV4DeviceProbe {
+        device_id: descriptor.device.device_id,
+        device_label: descriptor.device.device_label,
+        synthetic_identity_pin,
+    })
+}
+
 #[derive(Serialize)]
 struct PairingRequestBody<'a> {
     client_name: &'a str,
     client_nonce: &'a str,
+}
+
+fn manifest_sha256_from_headers_or_body(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<String, PiHttpError> {
+    if let Some(value) = exactly_one_header_str(headers, "ylx-manifest-sha256")? {
+        return normalize_bare_sha256(value, "YLX-Manifest-SHA256");
+    }
+    if let Some(value) = exactly_one_header_str(headers, "etag")? {
+        let stripped = value.trim().trim_matches('"');
+        return normalize_bare_sha256(stripped, "ETag");
+    }
+    Ok(format!("{:x}", Sha256::digest(body)))
+}
+
+fn normalize_bare_sha256(value: &str, label: &str) -> Result<String, PiHttpError> {
+    let bare = value.strip_prefix("sha256:").unwrap_or(value);
+    if bare.len() == 64 && bare.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(bare.to_ascii_lowercase())
+    } else {
+        Err(PiHttpError::InvalidResponse(format!(
+            "{label} is not a SHA-256 digest"
+        )))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct V4ArtifactDescriptor {
+    artifact_id: String,
+    role: String,
+    path: String,
+    media_type: String,
+    bytes: u64,
+    sha256: String,
+}
+
+fn v4_manifest_to_session_detail(
+    requested_session_id: &str,
+    manifest_sha256: &str,
+    manifest: serde_json::Value,
+) -> Result<SessionDetail, PiHttpError> {
+    let schema = required_string(&manifest, "/schema")?;
+    if schema != "ylx.device-session.v2" && schema != "ylx.device-session.v1" {
+        return Err(PiHttpError::InvalidResponse(format!(
+            "unsupported Device Session schema {schema}"
+        )));
+    }
+    let session_id = required_string(&manifest, "/session_id")?;
+    if session_id != requested_session_id {
+        return Err(PiHttpError::InvalidResponse(
+            "Device API v4 session detail does not match requested session_id".to_string(),
+        ));
+    }
+    let captured_at = required_string(&manifest, "/time/started_at")?;
+    let published_at = optional_string(&manifest, "/sealed_at")
+        .unwrap_or(required_string(&manifest, "/time/ended_at")?);
+    let duration_seconds = required_f64(&manifest, "/time/duration_seconds")?;
+    let mut artifacts = Vec::new();
+    collect_v4_artifact_descriptors(&manifest, &mut artifacts)?;
+    artifacts.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.artifact_id.cmp(&right.artifact_id))
+    });
+    reject_duplicate_v4_artifacts(&artifacts)?;
+
+    let total_bytes = artifacts
+        .iter()
+        .try_fold(0_u64, |total, artifact| total.checked_add(artifact.bytes))
+        .ok_or_else(|| {
+            PiHttpError::InvalidResponse("Device Session artifact sizes overflow".to_string())
+        })?;
+    let video_bytes = artifacts
+        .iter()
+        .filter(|artifact| artifact.role.starts_with("video."))
+        .try_fold(0_u64, |total, artifact| total.checked_add(artifact.bytes))
+        .ok_or_else(|| {
+            PiHttpError::InvalidResponse("Device Session video artifact sizes overflow".to_string())
+        })?;
+    let revision = format!("sha256:{manifest_sha256}");
+    let files = artifacts
+        .into_iter()
+        .map(|artifact| SessionFileEntry {
+            id: artifact.artifact_id,
+            display_path: artifact.path,
+            role: artifact.role,
+            size_bytes: artifact.bytes,
+            sha256: artifact.sha256,
+            media_type: artifact.media_type,
+        })
+        .collect::<Vec<_>>();
+    let publication_payload = lab_v4_compat_publication_payload(
+        &session_id,
+        &revision,
+        &captured_at,
+        &published_at,
+        duration_seconds,
+        total_bytes,
+        video_bytes,
+        manifest_sha256,
+        &schema,
+        &files,
+    )?;
+    let publication_signature = lab_v4_sign_publication(&publication_payload);
+    let publication_public_key = lab_v4_publication_public_key();
+    Ok(SessionDetail {
+        session_id: SessionId(session_id),
+        revision,
+        captured_at,
+        published_at,
+        duration_seconds,
+        total_bytes,
+        video_bytes,
+        file_count: files.len() as u64,
+        files,
+        publication_payload: String::from_utf8(publication_payload).expect("JSON is UTF-8"),
+        publication_signature: hex_encode(&publication_signature),
+        publication_public_key: hex_encode(&publication_public_key),
+        publication_key_fingerprint: lab_v4_publication_key_fingerprint(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lab_v4_compat_publication_payload(
+    session_id: &str,
+    revision: &str,
+    captured_at: &str,
+    published_at: &str,
+    duration_seconds: f64,
+    total_bytes: u64,
+    video_bytes: u64,
+    source_manifest_sha256: &str,
+    source_schema: &str,
+    files: &[SessionFileEntry],
+) -> Result<Vec<u8>, PiHttpError> {
+    let files = files
+        .iter()
+        .map(|file| {
+            serde_json::json!({
+                "id": file.id,
+                "display_path": file.display_path,
+                "role": file.role,
+                "size_bytes": file.size_bytes,
+                "sha256": file.sha256,
+                "media_type": file.media_type,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "source_schema": source_schema,
+        "source_manifest_sha256": source_manifest_sha256,
+        "source_profile": "ylx-device-api-v4-lab-http",
+        "session_id": session_id,
+        "revision": revision,
+        "captured_at": captured_at,
+        "published_at": published_at,
+        "duration_seconds": duration_seconds,
+        "total_bytes": total_bytes,
+        "video_bytes": video_bytes,
+        "integrity_ok": true,
+        "files": files,
+    }))
+    .map_err(|error| PiHttpError::InvalidResponse(format!("serialize lab v4 publication: {error}")))
+}
+
+fn collect_v4_artifact_descriptors(
+    value: &serde_json::Value,
+    out: &mut Vec<V4ArtifactDescriptor>,
+) -> Result<(), PiHttpError> {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(artifact) = v4_artifact_descriptor_from_object(object)? {
+                out.push(artifact);
+                return Ok(());
+            }
+            for child in object.values() {
+                collect_v4_artifact_descriptors(child, out)?;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                collect_v4_artifact_descriptors(child, out)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn v4_artifact_descriptor_from_object(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<V4ArtifactDescriptor>, PiHttpError> {
+    let has_descriptor_keys = [
+        "artifact_id",
+        "role",
+        "path",
+        "media_type",
+        "bytes",
+        "sha256",
+    ]
+    .iter()
+    .all(|key| object.contains_key(*key));
+    if !has_descriptor_keys {
+        return Ok(None);
+    }
+    let artifact_id = object_string(object, "artifact_id")?;
+    let role = object_string(object, "role")?;
+    let path = object_string(object, "path")?;
+    let media_type = object_string(object, "media_type")?;
+    let bytes = object_u64(object, "bytes")?;
+    let sha256 = object_string(object, "sha256")?.to_ascii_lowercase();
+    if artifact_id.is_empty()
+        || role.is_empty()
+        || path.is_empty()
+        || media_type.is_empty()
+        || sha256.len() != 64
+        || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(PiHttpError::InvalidResponse(
+            "Device Session artifact descriptor is malformed".to_string(),
+        ));
+    }
+    Ok(Some(V4ArtifactDescriptor {
+        artifact_id,
+        role,
+        path,
+        media_type,
+        bytes,
+        sha256,
+    }))
+}
+
+fn reject_duplicate_v4_artifacts(artifacts: &[V4ArtifactDescriptor]) -> Result<(), PiHttpError> {
+    let mut ids = std::collections::HashSet::with_capacity(artifacts.len());
+    let mut paths = std::collections::HashSet::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        if !ids.insert(artifact.artifact_id.as_str()) {
+            return Err(PiHttpError::InvalidResponse(format!(
+                "Device Session contains duplicate artifact_id {}",
+                artifact.artifact_id
+            )));
+        }
+        if !paths.insert(artifact.path.as_str()) {
+            return Err(PiHttpError::InvalidResponse(format!(
+                "Device Session contains duplicate artifact path {}",
+                artifact.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn required_string(value: &serde_json::Value, pointer: &str) -> Result<String, PiHttpError> {
+    optional_string(value, pointer).ok_or_else(|| {
+        PiHttpError::InvalidResponse(format!("Device Session manifest missing string {pointer}"))
+    })
+}
+
+fn optional_string(value: &serde_json::Value, pointer: &str) -> Option<String> {
+    value.pointer(pointer)?.as_str().map(ToString::to_string)
+}
+
+fn required_f64(value: &serde_json::Value, pointer: &str) -> Result<f64, PiHttpError> {
+    let number = value.pointer(pointer).and_then(serde_json::Value::as_f64);
+    match number {
+        Some(number) if number.is_finite() && number >= 0.0 => Ok(number),
+        _ => Err(PiHttpError::InvalidResponse(format!(
+            "Device Session manifest missing non-negative number {pointer}"
+        ))),
+    }
+}
+
+fn object_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<String, PiHttpError> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            PiHttpError::InvalidResponse(format!(
+                "Device Session artifact descriptor missing string {key}"
+            ))
+        })
+}
+
+fn object_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<u64, PiHttpError> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            PiHttpError::InvalidResponse(format!(
+                "Device Session artifact descriptor missing integer {key}"
+            ))
+        })
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -2234,6 +2996,375 @@ mod tests {
 
     fn test_client(base_url: String) -> PiHttpClient {
         PiHttpClient::new_insecure_for_test(base_url, Duration::from_secs(5))
+    }
+
+    fn loopback_port_from_base_url(base_url: &str) -> u16 {
+        base_url
+            .strip_prefix("http://127.0.0.1:")
+            .and_then(|rest| rest.strip_suffix("/api/v1"))
+            .expect("test fake server base URL shape")
+            .parse()
+            .expect("test fake server port")
+    }
+
+    fn lab_v4_device_json() -> Vec<u8> {
+        serde_json::json!({
+            "schema": "ylx.device.v4",
+            "device": {
+                "device_id": "550e8400-e29b-41d4-a716-446655440000",
+                "device_label": "YLX-30D5872D"
+            },
+            "hardware_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "api_version": "4.0",
+            "build": {
+                "package_version": "0.10.0-dev.2",
+                "commit": "2db57ae68e04197397b8ac84f4d71548aa2fcb36",
+                "build_id": "build-20260821.1"
+            },
+            "security_profile": "lab",
+            "capabilities": {
+                "capture": true,
+                "preview": true,
+                "range_download": true,
+                "network_mutation": false,
+                "calibration_capture": {
+                    "supported": true,
+                    "enabled": false,
+                    "disabled_reason": "hardware_unavailable",
+                    "required_video_layout": "split-eyes"
+                }
+            },
+            "storage": {
+                "volume_id": "6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+                "total_bytes": 128000000000_u64,
+                "available_bytes": 96000000000_u64,
+                "writable": true
+            },
+            "runtime": {
+                "observed_at": "2026-08-21T10:24:15+08:00",
+                "connection_method": "ethernet_lan",
+                "temperature_celsius": 53.5,
+                "network": {
+                    "ap": {
+                        "state": "active",
+                        "interface": "wlan0",
+                        "addresses": ["10.42.0.1/24"],
+                        "peer_or_ssid": "YLX-30D5872D"
+                    },
+                    "wifi_client": {
+                        "state": "disconnected",
+                        "interface": "wlan1",
+                        "addresses": [],
+                        "peer_or_ssid": null
+                    },
+                    "wired": {
+                        "state": "connected",
+                        "interface": "eth0",
+                        "addresses": ["192.0.2.24/24"],
+                        "peer_or_ssid": null
+                    },
+                    "default_route": "wired"
+                },
+                "live_imu": null,
+                "camera": {
+                    "schema": "ylx.camera-connection.v1",
+                    "state": "disconnected"
+                },
+                "camera_focus": null
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn lab_v4_http_client_reads_device_descriptor_without_tls_or_bearer() {
+        let (base_url, rx, handle) = spawn_fake_server(vec![(200, vec![], lab_v4_device_json())]);
+        let port = loopback_port_from_base_url(&base_url);
+        let client = PiHttpClient::new_lab_v4_http(
+            "127.0.0.1".to_string(),
+            port,
+            lab_v4_device_identity_pin("550e8400-e29b-41d4-a716-446655440000"),
+            Duration::from_secs(5),
+        )
+        .expect("lab v4 client");
+
+        let device = client.get_device("lab-token-is-local").expect("v4 device");
+
+        let request = rx.recv_timeout(Duration::from_secs(2)).expect("request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.url, "/api/v4/device");
+        assert!(
+            request
+                .headers
+                .iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("authorization")),
+            "lab v4 device descriptor must not use the old bearer-only path"
+        );
+        assert_eq!(device.capture_activity, CaptureActivityState::Idle);
+        assert_eq!(device.media_admission, "lab_v4");
+        assert_eq!(
+            device.publication_key_fingerprint,
+            lab_v4_publication_key_fingerprint()
+        );
+        handle.join().expect("fake server exits");
+    }
+
+    #[test]
+    fn lab_v4_pairing_is_local_and_does_not_need_the_old_pairing_endpoint() {
+        let client = PiHttpClient::new_lab_v4_http(
+            "127.0.0.1".to_string(),
+            9,
+            lab_v4_device_identity_pin("550e8400-e29b-41d4-a716-446655440000"),
+            Duration::from_millis(10),
+        )
+        .expect("lab v4 client");
+
+        let created = client
+            .create_pairing_request("YLX Transfer PC", "nonce-local-only")
+            .expect("local lab pairing create");
+        let status = client
+            .get_pairing_status(&created.attempt_id, &created.poll_secret)
+            .expect("local lab pairing status");
+
+        assert_eq!(created.phase, PairingPhase::Pending);
+        assert_eq!(status.phase, PairingPhase::Allowed);
+        assert!(status
+            .connection_token
+            .as_deref()
+            .is_some_and(|token| token.starts_with("lab-v4-")));
+        assert_eq!(
+            status
+                .sas_transcript
+                .as_ref()
+                .expect("lab status transcript")
+                .publication_key_fingerprint,
+            lab_v4_publication_key_fingerprint()
+        );
+    }
+
+    fn lab_v4_session_manifest_json(session_id: &str) -> Vec<u8> {
+        serde_json::json!({
+            "schema": "ylx.device-session.v2",
+            "manifest_id": "01989f6c-2c01-7b2c-9d3e-4f5061728394",
+            "sealed": true,
+            "sealed_at": "2026-08-08T10:31:33+08:00",
+            "session_id": session_id,
+            "volume_id": "6ba7b812-9dad-41d1-80b4-00c04fd430c8",
+            "capture_mode": "production",
+            "display_name": "2026-08-08_10-31-00_YLX-30D5872D",
+            "device": {
+                "device_id": "550e8400-e29b-41d4-a716-446655440000",
+                "device_label": "YLX-30D5872D",
+                "hardware_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "platform": "rdk-x5",
+                "software_version": "0.11.0-dev.1",
+                "commit": "b7d044d4bbc5ef0e335d2789c54f7d837d1a3e01"
+            },
+            "time": {
+                "started_at": "2026-08-08T10:31:00+08:00",
+                "ended_at": "2026-08-08T10:31:30+08:00",
+                "timezone": "Asia/Shanghai",
+                "duration_seconds": 30
+            },
+            "take": {
+                "take_id": "01989f6c-f000-7c3d-ae4f-5061728394a5",
+                "sequence": 1,
+                "continuation_of": null
+            },
+            "video": {
+                "layout": "split-eyes",
+                "codec": "h264",
+                "container": "mp4",
+                "segments": [{
+                    "index": 0,
+                    "start_frame": 0,
+                    "end_frame": 900,
+                    "start_time_seconds": 0,
+                    "end_time_seconds": 30,
+                    "artifacts": {
+                        "left": {
+                            "artifact_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "role": "video.left",
+                            "path": "video/left_00000.mp4",
+                            "media_type": "video/mp4",
+                            "bytes": 100,
+                            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        },
+                        "right": {
+                            "artifact_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            "role": "video.right",
+                            "path": "video/right_00000.mp4",
+                            "media_type": "video/mp4",
+                            "bytes": 120,
+                            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        }
+                    }
+                }]
+            },
+            "imu": {
+                "artifact": {
+                    "artifact_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "role": "imu.samples",
+                    "path": "imu/imu.jsonl",
+                    "media_type": "application/x-ndjson",
+                    "bytes": 20,
+                    "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                },
+                "sample_count": 10,
+                "units": "raw_int16",
+                "coordinate_frame": "raw_device_axes"
+            },
+            "frames": {
+                "artifact": {
+                    "artifact_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "role": "frames.index",
+                    "path": "imu/frames.jsonl",
+                    "media_type": "application/x-ndjson",
+                    "bytes": 10,
+                    "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                },
+                "count": 900
+            },
+            "audio": {
+                "state": "not_recorded",
+                "requested_mode": "disabled",
+                "resolved_mode": "disabled",
+                "reason": "user_disabled"
+            },
+            "logs": [{
+                "artifact_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "role": "log.capture",
+                "path": "logs/capture.log",
+                "media_type": "text/plain",
+                "bytes": 5,
+                "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            }],
+            "integrity": {
+                "verified_at": "2026-08-08T10:31:32.800+08:00",
+                "dropped_frames": 0,
+                "drop_events": [],
+                "fatal_errors": []
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn lab_v4_session_detail_maps_manifest_artifacts_to_existing_session_shape() {
+        let session_id = "01989f6c-2c00-7a1b-8c2d-3e4f50617283";
+        let manifest = lab_v4_session_manifest_json(session_id);
+        let manifest_sha256 = format!("{:x}", Sha256::digest(&manifest));
+        let (base_url, rx, handle) = spawn_fake_server(vec![(
+            200,
+            vec![("YLX-Manifest-SHA256", manifest_sha256.clone())],
+            manifest,
+        )]);
+        let port = loopback_port_from_base_url(&base_url);
+        let client = PiHttpClient::new_lab_v4_http(
+            "127.0.0.1".to_string(),
+            port,
+            lab_v4_device_identity_pin("550e8400-e29b-41d4-a716-446655440000"),
+            Duration::from_secs(5),
+        )
+        .expect("lab v4 client");
+
+        let detail = client
+            .get_session("lab-token-is-local", &SessionId(session_id.to_string()))
+            .expect("v4 session detail");
+
+        let request = rx.recv_timeout(Duration::from_secs(2)).expect("request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.url, format!("/api/v4/sessions/{session_id}"));
+        assert!(request
+            .headers
+            .iter()
+            .all(|(name, _)| !name.eq_ignore_ascii_case("authorization")));
+        assert_eq!(detail.revision, format!("sha256:{manifest_sha256}"));
+        assert_eq!(detail.file_count, 5);
+        assert_eq!(detail.total_bytes, 255);
+        assert_eq!(detail.video_bytes, 220);
+        assert!(detail.files.iter().any(|file| file.id
+            == "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            && file.display_path == "imu/imu.jsonl"));
+        let publication: serde_json::Value =
+            serde_json::from_str(&detail.publication_payload).expect("compat publication JSON");
+        assert_eq!(publication["source_schema"], "ylx.device-session.v2");
+        assert_eq!(publication["source_profile"], "ylx-device-api-v4-lab-http");
+        assert_eq!(detail.publication_signature.len(), 128);
+        assert_eq!(detail.publication_public_key.len(), 64);
+        handle.join().expect("fake server exits");
+    }
+
+    #[test]
+    fn lab_v4_artifact_stream_uses_artifacts_route_range_and_if_range() {
+        let session_id = SessionId("01989f6c-2c00-7a1b-8c2d-3e4f50617283".to_string());
+        let artifact_id =
+            FileId("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+        let (base_url, rx, handle) = spawn_fake_server(vec![(
+            206,
+            vec![
+                (
+                    "ETag",
+                    "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""
+                        .to_string(),
+                ),
+                ("Content-Type", "video/mp4".to_string()),
+                ("Content-Length", "3".to_string()),
+                ("Content-Range", "bytes 5-7/10".to_string()),
+            ],
+            b"abc".to_vec(),
+        )]);
+        let port = loopback_port_from_base_url(&base_url);
+        let client = PiHttpClient::new_lab_v4_http(
+            "127.0.0.1".to_string(),
+            port,
+            lab_v4_device_identity_pin("550e8400-e29b-41d4-a716-446655440000"),
+            Duration::from_secs(5),
+        )
+        .expect("lab v4 client");
+
+        let response = client
+            .get_file_stream(
+                "lab-token-is-local",
+                &session_id,
+                &artifact_id,
+                Some("\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""),
+                Some(RangeRequest::From { start: 5 }),
+            )
+            .expect("artifact stream");
+
+        let request = rx.recv_timeout(Duration::from_secs(2)).expect("request");
+        assert_eq!(
+            request.url,
+            format!(
+                "/api/v4/sessions/{}/artifacts/{}",
+                session_id.as_str(),
+                artifact_id.as_str()
+            )
+        );
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("range") && value == "bytes=5-"));
+        assert!(request.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("if-range")
+                && value == "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""
+        }));
+        assert!(request
+            .headers
+            .iter()
+            .all(|(name, _)| !name.eq_ignore_ascii_case("authorization")));
+        assert_eq!(response.status, 206);
+        assert_eq!(response.content_length, 3);
+        assert_eq!(
+            response
+                .content_range
+                .map(|range| (range.start, range.end, range.total_size)),
+            Some((5, 7, 10))
+        );
+        handle.join().expect("fake server exits");
     }
 
     fn spawn_slow_file_server(chunk_gap: Duration) -> (String, std::thread::JoinHandle<()>) {

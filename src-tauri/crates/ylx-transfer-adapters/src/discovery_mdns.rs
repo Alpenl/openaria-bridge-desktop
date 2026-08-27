@@ -17,12 +17,12 @@
 //! on the same LAN segment can spoof. Nothing in this module (or anywhere
 //! else in this crate) may treat a candidate as a paired/trusted device on
 //! the strength of this data alone -- the only thing that establishes
-//! trust is the SAS-verified pairing flow (`pi_http.rs`'s
-//! `create_pairing_request`/TLS fingerprint pin), which a caller drives
-//! separately using the `host`/`port` this module surfaces as *inputs* to
-//! attempt, never as an identity to accept outright. This module's own
-//! type names deliberately say "candidate", not "device", to keep that
-//! distinction visible at every call site.
+//! trust is established outside mDNS: current lab/internal Device API v4
+//! callers probe `GET /api/v4/device` over the candidate's advertised
+//! host/port and derive the desktop identity from that descriptor, while
+//! retained legacy v1 callers use the SAS/TLS-pin path. This module's own type
+//! names deliberately say "candidate", not "device", to keep that distinction
+//! visible at every call site.
 //!
 //! # Lifecycle: tagged poll outcomes + RAII shutdown
 //!
@@ -202,8 +202,8 @@ pub fn url_host_literal(host: &str) -> Result<String, MdnsDiscoveryError> {
 
 /// Composes `{scheme}://{host}:{port}{path}` with `host` formatted by
 /// [`url_host_literal`], so IPv6 candidates produce a valid URL
-/// (`http://[fe80::1%25eth0]:8080/api/v1`) instead of the malformed
-/// `http://fe80::1%eth0:8080/api/v1` that naive `format!` interpolation
+/// (`http://[fe80::1%25eth0]:8080/api/v4`) instead of the malformed
+/// `http://fe80::1%eth0:8080/api/v4` that naive `format!` interpolation
 /// yields. `path` is normalised to have exactly one leading `/`.
 pub fn candidate_url(
     scheme: &str,
@@ -518,7 +518,7 @@ mod tests {
             "ylx-pi-01",
             "ylx-pi-01.local.",
             "192.168.1.42",
-            8443,
+            8080,
             &[("device_id", "DEV00001"), ("display_name", "YLX Capture")][..],
         )
         .expect("valid ServiceInfo constructs")
@@ -530,7 +530,7 @@ mod tests {
             "ylx-pi-01",
             "ylx-pi-01.local.",
             addrs,
-            8443,
+            8080,
             &[("device_id", "DEV00001")][..],
         )
         .expect("valid ServiceInfo constructs")
@@ -611,7 +611,7 @@ mod tests {
         let candidate = candidate_from_service_info(&info);
 
         assert!(candidate.fullname.starts_with("ylx-pi-01."));
-        assert_eq!(candidate.port, 8443);
+        assert_eq!(candidate.port, 8080);
         assert!(
             candidate
                 .addresses
@@ -703,8 +703,8 @@ mod tests {
     #[test]
     fn candidate_url_composes_each_address_family() {
         assert_eq!(
-            candidate_url("http", "192.168.1.42", 8080, "/api/v1").unwrap(),
-            "http://192.168.1.42:8080/api/v1"
+            candidate_url("http", "192.168.1.42", 8080, "/api/v4").unwrap(),
+            "http://192.168.1.42:8080/api/v4"
         );
         assert_eq!(
             candidate_url("https", "2001:db8::42", 8443, "api/v1").unwrap(),
@@ -721,8 +721,8 @@ mod tests {
     fn candidate_url_helper_uses_first_address() {
         let candidate = candidate_from_service_info(&service_info_with_addresses("2001:db8::42"));
         assert_eq!(
-            candidate.url("https", "/api/v1").unwrap().unwrap(),
-            "https://[2001:db8::42]:8443/api/v1"
+            candidate.url("http", "/api/v4").unwrap().unwrap(),
+            "http://[2001:db8::42]:8080/api/v4"
         );
 
         let empty = MdnsCandidate {

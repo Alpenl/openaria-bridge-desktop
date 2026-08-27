@@ -1,19 +1,25 @@
 //! Production composition root for the PC client.
 //!
-//! The default build uses real mDNS discovery (or manual IP plus an
-//! out-of-band TLS fingerprint), pinned HTTPS, physical-confirmation
-//! pairing, authenticated session catalogs, opaque file identifiers, Range
-//! downloads, persistent transfer jobs, local-library files, and S3 uploads.
-//! Session detail is accepted only when its Ed25519 publication signature,
-//! public-key fingerprint, authenticated `/device` identity, schema version,
-//! scalar projection, and file inventory all agree.
+//! The default build uses real mDNS discovery (or manual IP), Device API v4
+//! lab/internal HTTP on port 8080 for current RDK X5 devices, opaque artifact
+//! identifiers, Range downloads, persistent transfer jobs, local-library files,
+//! and S3 uploads. Retained legacy Device API v1 adapters still support pinned
+//! HTTPS and physical-confirmation pairing, but that is not the current
+//! Windows/manual-connect path.
+//!
+//! Current Device API v4 session detail is accepted from the exact manifest
+//! returned by `/api/v4/sessions/{session_id}` and mapped into the desktop's
+//! existing local-library/download shape. Legacy v1 detail is accepted only
+//! when its Ed25519 publication signature, public-key fingerprint,
+//! authenticated `/device` identity, schema version, scalar projection, and
+//! file inventory all agree.
 //!
 //! Download context is persisted in the shared transfer store so a terminal
 //! job can be reconciled after restart. A successful job is not
 //! exposed as a library entry until every requested file is present at its
 //! validated target path and the application store is durably committed.
-//! Single-file downloads remain partial entries; only a complete immutable
-//! inventory may be uploaded as an entire-session backup.
+//! Selected-artifact downloads remain partial entries; only a complete
+//! immutable inventory may be uploaded as an entire-session backup.
 //!
 //! Synthetic devices and timer-driven transfers live in `demo.rs`/`sim.rs`
 //! and compile only with the explicit `demo` feature. No production command
@@ -42,7 +48,7 @@ use ylx_transfer_adapters::object_store_s3::{S3ObjectStore, S3ObjectStoreConfig,
 use ylx_transfer_adapters::pi_client_port::{AuthenticatedPiClient, PiPairingClient};
 use ylx_transfer_adapters::pi_download_source::PiDownloadSource;
 use ylx_transfer_adapters::pi_http::{
-    probe_tls_identity, PiHttpClient, PiHttpClientConfig, PiHttpError, PiTlsPin,
+    probe_lab_v4_device, PiHttpClient, PiHttpClientConfig, PiHttpError, PiTlsPin,
 };
 use ylx_transfer_adapters::publication_verifier::Ed25519PublicationVerifier;
 
@@ -114,23 +120,33 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How many devices one heartbeat sweep may talk to at once
 /// (`DeviceFleet::for_each_device`'s bound). Bounded rather than unbounded
-/// because each slot is a real blocking thread doing a real HTTPS request:
-/// a home LAN with a handful of Pis wants them all in flight together, but
-/// the sweep must not spawn one thread per device without limit. A device
-/// that hangs for its whole request timeout occupies exactly one slot; the
-/// others keep flowing.
+/// because each slot is a real blocking thread doing a real device request: a
+/// home LAN with a handful of devices wants them all in flight together, but the
+/// sweep must not spawn one thread per device without limit. A device that hangs
+/// for its whole request timeout occupies exactly one slot; the others keep
+/// flowing.
 const HEARTBEAT_CONCURRENCY: usize = 4;
 
-/// What we learned about one device's network address. Discovery and manual
-/// registration both obtain `tls_fingerprint` from a TLS-only identity probe;
-/// it becomes trusted only after the same fingerprint is bound into the SAS
-/// transcript and the operator confirms it on the Pi.
+/// Which Device API transport contract one endpoint speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceApiProfile {
+    LegacyPinnedTlsV1,
+    LabHttpV4,
+}
+
+/// What we learned about one device's network address. Legacy endpoints use
+/// `tls_fingerprint` as the pinned TLS certificate identity. Current
+/// lab/internal Device API v4 endpoints use HTTP on port 8080, so the same
+/// field stores the desktop-internal synthetic identity derived from
+/// `/api/v4/device.device.device_id`.
 #[derive(Debug, Clone)]
 pub struct DeviceEndpoint {
     pub host: String,
     pub port: u16,
     pub tls_fingerprint: String,
     pub name: String,
+    pub display_label: Option<String>,
+    pub api_profile: DeviceApiProfile,
 }
 
 /// One live Pi session that may be removed by the conservative
@@ -178,12 +194,20 @@ fn fallback_device(id: &str) -> CoreDevice {
 }
 
 fn build_client(endpoint: &DeviceEndpoint) -> Result<PiHttpClient, PiHttpError> {
-    PiHttpClient::new(PiHttpClientConfig {
-        host: endpoint.host.clone(),
-        port: endpoint.port,
-        tls_pin: PiTlsPin(endpoint.tls_fingerprint.clone()),
-        request_timeout: Duration::from_secs(6),
-    })
+    match endpoint.api_profile {
+        DeviceApiProfile::LegacyPinnedTlsV1 => PiHttpClient::new(PiHttpClientConfig {
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+            tls_pin: PiTlsPin(endpoint.tls_fingerprint.clone()),
+            request_timeout: Duration::from_secs(6),
+        }),
+        DeviceApiProfile::LabHttpV4 => PiHttpClient::new_lab_v4_http(
+            endpoint.host.clone(),
+            endpoint.port,
+            PiTlsPin(endpoint.tls_fingerprint.clone()),
+            Duration::from_secs(6),
+        ),
+    }
 }
 
 /// Binds the current actor session to its already-pinned transport. The
@@ -566,6 +590,11 @@ struct ActivePairing {
     /// It is never persisted; it only contributes to the pairing-evidence
     /// digest recorded when this attempt is confirmed.
     sas: String,
+    /// Legacy v1 pairings use the SAS transcript to trust a producer key for
+    /// removable-media/offline verification. Current Device API v4 lab HTTP
+    /// auto-connects do not participate in that workflow and must not write
+    /// producer trust rows.
+    record_trusted_producer_key: bool,
 }
 
 /// The file name of the deleted pending-download sidecar. Kept only so the
@@ -2200,6 +2229,8 @@ impl Composition {
             port: 9,
             tls_fingerprint,
             name: "session gate fixture".to_string(),
+            display_label: None,
+            api_profile: DeviceApiProfile::LegacyPinnedTlsV1,
         })?;
         Ok((
             registration.identity.device_id().as_str().to_string(),
@@ -2237,18 +2268,18 @@ impl Composition {
     }
 
     /// Registers (or refreshes) a known network endpoint from its complete
-    /// TLS fingerprint, creating its `DeviceActor` on first sight. Identity
-    /// parsing and TLS-pin normalization happen before any visible state is
+    /// device identity pin, creating its `DeviceActor` on first sight. Identity
+    /// parsing and pin normalization happen before any visible state is
     /// registered.
     fn register_endpoint(
         &self,
         mut endpoint: DeviceEndpoint,
     ) -> Result<EndpointRegistration, String> {
         let identity = DeviceIdentity::parse(&endpoint.tls_fingerprint)
-            .map_err(|error| format!("设备 TLS 指纹无效：{error}"))?;
+            .map_err(|error| format!("设备身份指纹无效：{error}"))?;
         endpoint.tls_fingerprint = identity.tls_pin();
-        let client = build_client(&endpoint)
-            .map_err(|error| format!("无法创建固定 TLS 指纹的设备连接：{error}"))?;
+        let client =
+            build_client(&endpoint).map_err(|error| format!("无法创建设备连接：{error}"))?;
         let fingerprint = identity.fingerprint().clone();
         let handle = self.fleet.get_or_create(fingerprint, || CoreDevice {
             device_id: identity.device_id().clone(),
@@ -2268,23 +2299,24 @@ impl Composition {
         Ok(EndpointRegistration { identity, is_new })
     }
 
-    /// Registers a manual candidate by address. The initial TLS handshake
-    /// observes the presented SPKI without sending HTTP credentials; the
-    /// operator subsequently authenticates that observation through SAS,
-    /// exactly like an mDNS-discovered candidate.
+    /// Registers a manual current-contract candidate by address. The current
+    /// RDK-X5 lab/internal deployment exposes Device API v4 over HTTP on
+    /// port 8080; device identity comes from `/api/v4/device.device_id`,
+    /// not from a TLS certificate on 8443.
     pub fn add_manual_device(&self, ip: String) -> Result<FrontendDevice, String> {
         let address: IpAddr = ip
             .trim()
             .parse()
             .map_err(|_| "请输入有效的 IPv4 或 IPv6 地址".to_string())?;
-        let fingerprint = probe_tls_identity(&address.to_string(), 8443, Duration::from_secs(6))
-            .map_err(|error| format!("无法探测设备 TLS 身份：{error}"))?
-            .0;
+        let probe = probe_lab_v4_device(&address.to_string(), 8080, Duration::from_secs(6))
+            .map_err(|error| format!("无法探测设备 Device API v4 身份（HTTP 8080）：{error}"))?;
         let endpoint = DeviceEndpoint {
             host: address.to_string(),
-            port: 8443,
-            tls_fingerprint: fingerprint,
-            name: format!("YLX @ {address}"),
+            port: 8080,
+            tls_fingerprint: probe.synthetic_identity_pin.0,
+            name: probe.device_label.clone(),
+            display_label: Some(probe.device_label),
+            api_profile: DeviceApiProfile::LabHttpV4,
         };
         let registration = self.register_endpoint(endpoint)?;
         let id = registration.identity.device_id().as_str();
@@ -2394,6 +2426,7 @@ impl Composition {
     /// returning a deceptively partial inventory.
     fn try_list_sessions(&self, device_id: &str) -> Result<Vec<SessionView>, String> {
         let binding = self.resolve_binding(device_id)?;
+        let api_profile = binding.endpoint.api_profile;
         let client = binding.client;
         let handle = binding.handle;
         let mut authenticated = authenticated_client_for(&handle, client.clone())?;
@@ -2425,12 +2458,14 @@ impl Composition {
             let page = handle
                 .list_sessions_with(&authenticated, cursor.as_deref(), Some(500))
                 .map_err(|error| authenticated_request_error("读取设备会话目录失败", error))?;
-            match &catalog_revision {
-                Some(expected) if expected != &page.catalog_revision => {
-                    return Err("读取期间设备会话目录发生变化，请重试".to_string());
+            if api_profile != DeviceApiProfile::LabHttpV4 {
+                match &catalog_revision {
+                    Some(expected) if expected != &page.catalog_revision => {
+                        return Err("读取期间设备会话目录发生变化，请重试".to_string());
+                    }
+                    None => catalog_revision = Some(page.catalog_revision.clone()),
+                    _ => {}
                 }
-                None => catalog_revision = Some(page.catalog_revision.clone()),
-                _ => {}
             }
             summaries.extend(page.sessions);
             let Some(next) = page.next_cursor else {
@@ -2459,7 +2494,9 @@ impl Composition {
                     ))
                 }
             };
-            ensure_summary_matches_detail(&summary, &detail)?;
+            if api_profile != DeviceApiProfile::LabHttpV4 {
+                ensure_summary_matches_detail(&summary, &detail)?;
+            }
             sessions.push(session_detail_to_view(detail));
         }
         Ok(sessions)
@@ -3113,7 +3150,9 @@ fn to_frontend_device(
     };
     FrontendDevice {
         id: identity.device_id().as_str().to_string(),
-        display_id: identity.display_id().to_string(),
+        display_id: endpoint
+            .and_then(|e| e.display_label.clone())
+            .unwrap_or_else(|| identity.display_id().to_string()),
         ip: endpoint.map(|e| e.host.clone()),
         state,
         last_seen: None,
@@ -3130,22 +3169,23 @@ fn apply_mdns_candidates(comp: &Composition, app: &AppHandle, candidates: Vec<Md
         let Some(addr) = c.addresses.first() else {
             continue;
         };
-        let fingerprint =
-            match probe_tls_identity(&addr.to_string(), c.port, Duration::from_secs(3)) {
-                Ok(pin) => pin.0,
-                Err(error) => {
-                    eprintln!(
-                        "[composition] TLS identity probe failed for mDNS candidate {}:{}: {error}",
-                        addr, c.port
-                    );
-                    continue;
-                }
-            };
+        let probe = match probe_lab_v4_device(&addr.to_string(), c.port, Duration::from_secs(3)) {
+            Ok(probe) => probe,
+            Err(error) => {
+                eprintln!(
+                    "[composition] Device API v4 probe failed for mDNS candidate {}:{}: {error}",
+                    addr, c.port
+                );
+                continue;
+            }
+        };
         let endpoint = DeviceEndpoint {
             host: addr.to_string(),
             port: c.port,
-            tls_fingerprint: fingerprint,
-            name: c.hostname.trim_end_matches('.').to_string(),
+            tls_fingerprint: probe.synthetic_identity_pin.0,
+            name: probe.device_label.clone(),
+            display_label: Some(probe.device_label),
+            api_profile: DeviceApiProfile::LabHttpV4,
         };
         match comp.register_endpoint(endpoint) {
             Ok(EndpointRegistration { is_new: true, .. }) => changed = true,
@@ -4354,6 +4394,8 @@ pub async fn connect_device(
 ) -> Result<String, String> {
     let binding = comp.resolve_binding(&device_id)?;
     let device_id = binding.identity.device_id().as_str().to_string();
+    let record_trusted_producer_key =
+        binding.endpoint.api_profile == DeviceApiProfile::LegacyPinnedTlsV1;
     let client = binding.client;
     let handle = binding.handle;
     if let ConnectionState::Connected { connection_id, .. } = handle.connection_state() {
@@ -4384,6 +4426,7 @@ pub async fn connect_device(
                 poll_secret: created.poll_secret,
                 client,
                 sas: created.sas,
+                record_trusted_producer_key,
             };
             Ok::<_, PiClientError>((info, active))
         })
@@ -4543,11 +4586,11 @@ async fn run_pairing(
                 continue;
             }
             Ok(PollPairingOutcome::Connected { .. }) => {
-                // The SAS the operator just confirmed is the only thing that
-                // can make this producer's publication key trusted for
-                // offline TF-card verification. Record it before the attempt
-                // is cleared; a failure here leaves the LAN session intact and
-                // simply leaves signed cards waiting for a pairing key.
+                // Retained legacy v1 endpoints may still use a SAS-confirmed
+                // publication key for frozen offline compatibility paths. The
+                // current Device API v4 lab profile disables this write because
+                // removable-media/TF-card workflows are no longer part of the
+                // current product route.
                 record_trusted_producer_key(&comp, &device_id, &attempt_id);
                 clear_active_pairing(&comp, &device_id, &attempt_id);
                 emit_devices(&comp, &app);
@@ -4663,7 +4706,8 @@ fn record_trusted_producer_key(comp: &Composition, device_id: &str, attempt_id: 
             return;
         }
         match active.get(device_id) {
-            Some(active) => active.sas.clone(),
+            Some(active) if active.record_trusted_producer_key => active.sas.clone(),
+            Some(_) => return,
             None => return,
         }
     };
@@ -8334,6 +8378,7 @@ mod tests {
             poll_secret: "poll-secret".to_string(),
             client: test_client(),
             sas: "123456".to_string(),
+            record_trusted_producer_key: true,
         }
     }
 
@@ -8462,6 +8507,8 @@ mod tests {
                 port: 9,
                 tls_fingerprint: identity.tls_pin(),
                 name: "Pi B".to_string(),
+                display_label: None,
+                api_profile: DeviceApiProfile::LegacyPinnedTlsV1,
             },
             client,
             handle,
@@ -8483,9 +8530,9 @@ mod tests {
     // point, and results that arrive after the world moved on are dropped.
     // -----------------------------------------------------------------
 
-    /// Registers a device through the real production path
-    /// ([`Composition::register_endpoint`], which builds a real pinned
-    /// HTTPS client but performs no I/O) and returns its canonical id.
+    /// Registers a retained legacy v1 endpoint through the real registry path
+    /// ([`Composition::register_endpoint`], which builds a real pinned HTTPS
+    /// client but performs no I/O) and returns its canonical id.
     fn register_test_device(comp: &Composition, seed: &str) -> String {
         let fingerprint = test_fingerprint(seed);
         comp.register_endpoint(DeviceEndpoint {
@@ -8493,6 +8540,8 @@ mod tests {
             port: 9,
             tls_fingerprint: fingerprint,
             name: format!("Pi {seed}"),
+            display_label: None,
+            api_profile: DeviceApiProfile::LegacyPinnedTlsV1,
         })
         .expect("registering an endpoint does no I/O")
         .identity
@@ -8514,6 +8563,8 @@ mod tests {
                 port: 8443,
                 tls_fingerprint: fingerprint_a,
                 name: "Pi A".to_string(),
+                display_label: None,
+                api_profile: DeviceApiProfile::LegacyPinnedTlsV1,
             })
             .unwrap();
         let registration_b = comp
@@ -8522,6 +8573,8 @@ mod tests {
                 port: 9443,
                 tls_fingerprint: fingerprint_b,
                 name: "Pi B".to_string(),
+                display_label: None,
+                api_profile: DeviceApiProfile::LegacyPinnedTlsV1,
             })
             .unwrap();
 
@@ -8884,6 +8937,8 @@ mod tests {
                 port: 9,
                 tls_fingerprint: identity.tls_pin(),
                 name: "Pi C".to_string(),
+                display_label: None,
+                api_profile: DeviceApiProfile::LegacyPinnedTlsV1,
             },
             test_client(),
             handle,

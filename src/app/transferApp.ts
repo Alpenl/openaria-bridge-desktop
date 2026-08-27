@@ -1672,7 +1672,7 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
           toast("请输入 IP 地址", "danger");
           return;
         }
-        toast(`正在探测 ${ip} 的 TLS 身份`, "success");
+        toast(`正在探测 ${ip} 的 Device API v4（HTTP 8080）`, "success");
         void runner.run({
           key: `device:add:${ip}`,
           run: () => backend.addManualDevice(ip),

@@ -92,10 +92,9 @@ impl<'de> Deserialize<'de> for SessionFile {
     }
 }
 
-/// A completed recording session, as returned by `GET /api/v1/sessions`.
-/// Only `state == "complete" && integrity_ok`
-/// sessions are ever surfaced here — the Pi-side filtering is assumed to have
-/// already happened before this struct is constructed.
+/// A completed recording session in the desktop/frontend view contract.
+/// Current Device API v4 and retained legacy v1 wire shapes are normalized
+/// before this struct is constructed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {

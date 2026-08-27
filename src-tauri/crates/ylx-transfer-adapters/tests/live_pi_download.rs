@@ -1,4 +1,4 @@
-//! Explicit live-Pi diagnostic for the production download path.
+//! Explicit live-Pi diagnostic for the current Device API v4 download path.
 //!
 //! This test is ignored by default because it requires a trusted-LAN Pi.
 
@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ylx_transfer_adapters::pi_client_port::session::{AuthenticatedPiClient, PiPairingClient};
 use ylx_transfer_adapters::pi_download_source::PiDownloadSource;
-use ylx_transfer_adapters::pi_http::{probe_tls_identity, PiHttpClient, PiHttpClientConfig};
+use ylx_transfer_adapters::pi_http::{probe_lab_v4_device, PiHttpClient};
 use ylx_transfer_core::device::actor::{AuthenticatedPiSession, PairingPort};
 use ylx_transfer_core::device::SessionFileEntryView;
 use ylx_transfer_core::domain::{FileId, SessionId};
@@ -25,20 +25,15 @@ fn production_download_path_fetches_a_real_pi_file() {
                 .parse::<u16>()
                 .expect("YLX_LIVE_PI_PORT must be a u16")
         })
-        .unwrap_or(8443);
+        .unwrap_or(8080);
     let device_id =
         std::env::var("YLX_LIVE_PI_DEVICE_ID").unwrap_or_else(|_| "30D5872D".to_string());
     let timeout = Duration::from_secs(10);
-    let pin = probe_tls_identity(&host, port, timeout).expect("probe live Pi TLS identity");
-    let session_pin = pin.0.clone();
+    let probe = probe_lab_v4_device(&host, port, timeout).expect("probe live Pi Device API v4");
+    let session_pin = probe.synthetic_identity_pin.0.clone();
     let client = Arc::new(
-        PiHttpClient::new(PiHttpClientConfig {
-            host,
-            port,
-            tls_pin: pin,
-            request_timeout: timeout,
-        })
-        .expect("construct production PiHttpClient"),
+        PiHttpClient::new_lab_v4_http(host, port, probe.synthetic_identity_pin, timeout)
+            .expect("construct Device API v4 PiHttpClient"),
     );
 
     let nonce = SystemTime::now()
@@ -49,18 +44,18 @@ fn production_download_path_fetches_a_real_pi_file() {
     let pairing = PiPairingClient::new(client.clone());
     let created =
         PairingPort::create_pairing_request(&pairing, "ylx-live-download-diagnostic", &nonce)
-            .expect("create trusted-LAN pairing request");
+            .expect("create local Device API v4 compatibility pairing request");
     let deadline = Instant::now() + Duration::from_secs(5);
     let (token, sas_publication_key_fingerprint) = loop {
         let status =
             PairingPort::get_pairing_status(&pairing, &created.attempt_id, &created.poll_secret)
-                .expect("poll trusted-LAN pairing request");
+                .expect("poll local Device API v4 compatibility pairing request");
         if let Some(token) = status.connection_token {
             break (token, status.sas_publication_key_fingerprint);
         }
         assert!(
             Instant::now() < deadline,
-            "trusted-LAN pairing did not return a connection token"
+            "Device API v4 compatibility pairing did not return a connection token"
         );
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -70,9 +65,9 @@ fn production_download_path_fetches_a_real_pi_file() {
     let authenticated = AuthenticatedPiClient::new(client.clone(), session)
         .expect("live Pi transport pin matches session");
 
-    // Cross the old 20-second failure boundary while matching the PC's
-    // production five-second heartbeat cadence. The Pi initially grants a
-    // 15-second idle window, so every renewal must succeed before downloading.
+    // Cover the desktop's five-second heartbeat cadence before downloading.
+    // In the current lab v4 profile this is a compatibility liveness check
+    // against `/api/v4/device`, not an authenticated token renewal.
     for renewal in 1..=4 {
         std::thread::sleep(Duration::from_secs(5));
         let heartbeat = authenticated

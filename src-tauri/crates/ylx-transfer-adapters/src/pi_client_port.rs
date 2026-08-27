@@ -1,10 +1,12 @@
 //! Core capability-port implementations for the real [`PiHttpClient`].
 //!
-//! Pairing is deliberately unauthenticated. Every other capability accepts
-//! an `AuthenticatedPiSession`, verifies that its TLS pin belongs to this
-//! transport, and borrows its bearer token for exactly one wire call. The
-//! catalog mapping also verifies signed publication data against the
-//! session-bound publication identity.
+//! Retained legacy v1 pairing is deliberately unauthenticated. Every other
+//! capability accepts an `AuthenticatedPiSession`, verifies that its identity
+//! pin belongs to this transport, and borrows its bearer token for exactly one
+//! wire call. Current lab/internal Device API v4 uses a local compatibility
+//! session and no bearer authentication; catalog mapping accepts the v4 manifest
+//! bytes as the source of authority and emits a local compatibility publication
+//! envelope for the existing download/library pipeline.
 
 /// Session-bound convenience façades live next to the direct capability
 /// implementations so existing callers retain one adapter entry point.
@@ -146,6 +148,67 @@ fn to_session_detail_view(
     })
 }
 
+fn to_lab_v4_session_detail_view(
+    d: SessionDetail,
+    requested_session_id: &str,
+) -> Result<SessionDetailView, PiClientError> {
+    if d.session_id.as_str() != requested_session_id {
+        return Err(PiClientError {
+            kind: PiClientErrorKind::Other,
+            message: "Device API v4 session detail response does not match the requested session"
+                .to_string(),
+        });
+    }
+    Ok(SessionDetailView {
+        session_id: d.session_id.as_str().to_string(),
+        revision: d.revision,
+        captured_at: d.captured_at,
+        published_at: d.published_at,
+        duration_seconds: d.duration_seconds,
+        total_bytes: d.total_bytes,
+        video_bytes: d.video_bytes,
+        file_count: d.file_count,
+        files: d
+            .files
+            .into_iter()
+            .map(to_session_file_entry_view)
+            .collect(),
+        publication_payload: d.publication_payload.into_bytes(),
+        publication_signature: decode_lower_hex_for_lab_v4(
+            "publication_signature",
+            &d.publication_signature,
+        )?,
+        publication_public_key: decode_lower_hex_for_lab_v4(
+            "publication_public_key",
+            &d.publication_public_key,
+        )?,
+        publication_key_fingerprint: d.publication_key_fingerprint,
+    })
+}
+
+fn decode_lower_hex_for_lab_v4(field: &str, value: &str) -> Result<Vec<u8>, PiClientError> {
+    if value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(PiClientError {
+            kind: PiClientErrorKind::Other,
+            message: format!("Device API v4 compatibility {field} is not hex"),
+        });
+    }
+    let mut out = Vec::with_capacity(value.len() / 2);
+    let bytes = value.as_bytes();
+    for chunk in bytes.chunks_exact(2) {
+        let text = std::str::from_utf8(chunk).map_err(|_| PiClientError {
+            kind: PiClientErrorKind::Other,
+            message: format!("Device API v4 compatibility {field} is not UTF-8 hex"),
+        })?;
+        let byte = u8::from_str_radix(text, 16).map_err(|_| PiClientError {
+            kind: PiClientErrorKind::Other,
+            message: format!("Device API v4 compatibility {field} is not hex"),
+        })?;
+        out.push(byte);
+    }
+    Ok(out)
+}
+
 impl PairingPort for PiHttpClient {
     fn create_pairing_request(
         &self,
@@ -263,6 +326,14 @@ impl SessionCatalogPort for PiHttpClient {
         session_id: &str,
     ) -> Result<SessionDetailView, PiClientError> {
         validate_session_transport(self, session)?;
+        if self.is_lab_v4_http() {
+            return session
+                .with_authenticated_token(|token| {
+                    PiHttpClient::get_session(self, token, &SessionId(session_id.to_string()))
+                })
+                .map_err(map_error)
+                .and_then(|detail| to_lab_v4_session_detail_view(detail, session_id));
+        }
         let expected_publication_key_fingerprint = required_publication_key(session)?;
         session
             .with_authenticated_token(|token| {
