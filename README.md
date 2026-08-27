@@ -107,12 +107,14 @@ Open Aria Bridge checks the public GitHub Release update manifest from inside
 the app and downloads updater packages through Tauri's signed updater. Users do
 not need to open GitHub or choose an installer manually.
 
-The release workflow enables Tauri updater artifacts only for release builds,
-signs them with the repository `TAURI_SIGNING_PRIVATE_KEY` secret, publishes the
-signed updater archives and `.sig` files, and writes `latest.json` to the
-GitHub Release. The updater public key is compiled into
-`src-tauri/tauri.conf.json`; losing the matching private key breaks future
-in-app updates for already shipped builds.
+The release workflow enables Tauri updater artifacts only for release builds.
+Run it from GitHub Actions with a numeric semantic version `release_tag`
+(`0.1.0`, for example), or push that tag. After the cross-platform build passes,
+the workflow creates the tag when needed, creates or updates the GitHub Release,
+uploads the signed updater archives and `.sig` files, and writes `latest.json`
+to the Release. The updater public key is compiled into
+`src-tauri/tauri.conf.json`; losing the matching `TAURI_SIGNING_PRIVATE_KEY`
+breaks future in-app updates for already shipped builds.
 
 CI may continue to run pinned MinIO and legacy filesystem/recovery regressions
 on Ubuntu, macOS, and Windows to keep retained readers from corrupting old

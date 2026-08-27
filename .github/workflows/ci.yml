@@ -10,8 +10,9 @@ on:
     inputs:
       release_tag:
         description: >-
-          Existing semantic-version tag to build and publish. Leave empty to
-          run CI against the selected branch without publishing a release.
+          Semantic-version tag to create/update after a successful release
+          build. Leave empty to run CI against the selected branch without
+          publishing a release.
         required: false
         default: ""
         type: string
@@ -61,10 +62,9 @@ jobs:
           release_tag=""
 
           # A dispatch without a tag is a plain manual CI run against the
-          # selected ref, so only an explicitly requested tag redirects the
-          # checkout.
+          # selected ref. A dispatch with a tag publishes the selected ref and
+          # creates the tag later if it does not already exist.
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${REQUESTED_TAG}" ]]; then
-            checkout_ref="${REQUESTED_TAG}"
             release_tag="${REQUESTED_TAG}"
           elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             release_tag="${GITHUB_REF_NAME}"
@@ -300,6 +300,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+          fetch-depth: 0
+
       - name: Download platform artifacts
         uses: actions/download-artifact@v7
         with:
@@ -314,6 +319,19 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
           set -euo pipefail
+
+          git fetch --tags --force
+          head_commit="$(git rev-parse HEAD)"
+          if git rev-parse -q --verify "refs/tags/${RELEASE_TAG}" >/dev/null; then
+            tag_commit="$(git rev-list -n 1 "${RELEASE_TAG}")"
+            if [[ "${tag_commit}" != "${head_commit}" ]]; then
+              echo "Release tag ${RELEASE_TAG} already exists at ${tag_commit}, but this build checked out ${head_commit}." >&2
+              exit 1
+            fi
+          else
+            git tag "${RELEASE_TAG}" "${head_commit}"
+            git push origin "refs/tags/${RELEASE_TAG}"
+          fi
 
           release_url="https://github.com/${GH_REPO}/releases/download/${RELEASE_TAG}"
           assets=()
