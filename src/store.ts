@@ -79,7 +79,7 @@ export interface UiState {
 export function createUiState(): UiState {
   return {
     theme: "system",
-    view: "media",
+    view: "device",
     activeDeviceId: null,
     pairingTargetId: null,
     pairingAttemptId: null,

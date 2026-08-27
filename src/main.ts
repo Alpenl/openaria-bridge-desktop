@@ -11,13 +11,11 @@ import "./styles/app.css";
 import { createTransferApp } from "./app/transferApp";
 import { systemClock } from "./runtime/clock";
 import { createTauriBackend } from "./runtime/tauriBackend";
-import { createTauriMediaBackend } from "./runtime/media/tauriTransport";
 import { createDomAppView } from "./ui/views/appDom";
 import { toast } from "./ui/toast";
 
 const app = createTransferApp({
   backend: createTauriBackend(),
-  mediaBackend: createTauriMediaBackend(),
   clock: systemClock,
   toast,
   view: createDomAppView,

@@ -99,8 +99,8 @@ import {
 
 export interface TransferAppOptions {
   backend: TransferBackend;
-  /** Optional in headless legacy harnesses; production supplies the media
-   * adapter so removable-media import is the initial workspace. */
+  /** Frozen compatibility seam for headless legacy harnesses. D-049 production
+   * assembly does not supply this adapter or mount a removable-media view. */
   mediaBackend?: MediaBackend;
   clock: Clock;
   toast: Toaster;
@@ -1432,6 +1432,7 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
         });
         return;
       case "media/open":
+        if (mediaRuntime === null) return;
         if (ui().view !== "media") {
           invalidatePendingMediaUi();
           deviceNavigation.invalidate();
