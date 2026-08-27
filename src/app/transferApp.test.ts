@@ -300,6 +300,24 @@ function unsignedUploadApprovalPipeline(): PipelineSession {
   };
 }
 
+test("D-049 ignores legacy media navigation when production omits its backend", async () => {
+  const app = createTransferApp({
+    backend: createMemoryBackend(),
+    clock: createFakeClock(),
+    toast: () => {},
+    view: () => createRecordedView().appView,
+  });
+
+  try {
+    await app.start();
+    assert.equal(app.store.getState().ui.view, "device");
+    app.dispatch({ kind: "media/open" });
+    assert.equal(app.store.getState().ui.view, "device");
+  } finally {
+    app.dispose();
+  }
+});
+
 test("unsigned media import requires a second click and resets on selection or card changes", async () => {
   const backend = createMemoryBackend();
   const mediaBackend = createMemoryMediaBackend({ scan: unsignedMediaScan("scan-1") });
@@ -1065,8 +1083,8 @@ test("same display label keeps navigation and upload operations on canonical dev
 
   try {
     await app.start();
-    // Media is the Ubuntu application's first screen. Select each device as
-    // a user would so both canonical identities exercise navigation even when
+    // Select each device as a user would so both canonical identities exercise
+    // navigation even when
     // they intentionally share one display label.
     app.dispatch({ kind: "device/select", deviceId: asDeviceId(DEVICE_A) });
     await untilTask(() => backend.calls.some((call) => call.name === "listSessions" && call.args[0] === DEVICE_A));

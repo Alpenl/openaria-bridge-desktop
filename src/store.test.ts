@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
   confirmPhaseOf,
@@ -17,6 +18,19 @@ const OP_1 = "op-1" as OperationId;
 
 /** Ids arrive from LAN devices and from library keys, so they can be anything. */
 const ADVERSARIAL_IDS = ["__proto__", "constructor", "prototype", "toString", "hasOwnProperty", ""];
+
+test("D-049 production assembly starts on LAN devices without a media workspace", () => {
+  const mainSource = readFileSync(new URL("./main.ts", import.meta.url).pathname, "utf8");
+  const html = readFileSync(new URL("../index.html", import.meta.url).pathname, "utf8");
+  const domViewSource = readFileSync(new URL("./ui/views/appDom.ts", import.meta.url).pathname, "utf8");
+
+  assert.equal(createUiState().view, "device");
+  assert.equal(mainSource.includes("createTauriMediaBackend"), false);
+  assert.equal(mainSource.includes("mediaBackend:"), false);
+  assert.equal(html.includes("mediaNavItem"), false);
+  assert.equal(html.includes("介质导入"), false);
+  assert.equal(domViewSource.includes("createMediaScreen"), false);
+});
 
 function session(id: string): SessionView {
   return {
