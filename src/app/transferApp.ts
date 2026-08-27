@@ -12,6 +12,7 @@
 
 import type { Dispatch, UiAction } from "./actions";
 import type { AppView } from "./appView";
+import type { AppUpdater, AppUpdateProgress, PendingAppUpdate } from "../runtime/appUpdater";
 import { batchFeedback } from "../batchResult";
 import {
   asDeviceId,
@@ -106,6 +107,7 @@ export interface TransferAppOptions {
   toast: Toaster;
   /** Built with the dispatcher so the view can send actions back. */
   view: (dispatch: Dispatch) => AppView;
+  updater?: AppUpdater;
   store?: AppStore;
   /** How long a bulk/device-level confirmation stays armed. */
   confirmTtlMs?: number;
@@ -131,6 +133,9 @@ export interface TransferApp {
 
 const LIBRARY_RECONCILE_DEBOUNCE_MS = 2_000;
 
+type AppUpdateStatus =
+  "idle" | "checking" | "available" | "current" | "downloading" | "installing" | "restarting" | "failed";
+
 /** Settings payloads are part of an operation's identity. Keeping the fields
  * explicit makes the key stable even if callers construct config objects with
  * a different property insertion order. */
@@ -151,7 +156,7 @@ function settingsValueIntentKey(value: string | boolean): string {
 }
 
 export function createTransferApp(options: TransferAppOptions): TransferApp {
-  const { backend, clock, toast } = options;
+  const { backend, clock, toast, updater } = options;
   const store = options.store ?? createAppStore();
   const confirmTtlMs = options.confirmTtlMs ?? 4000;
   const rowConfirmTtlMs = options.rowConfirmTtlMs ?? 3000;
@@ -459,6 +464,123 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
   function showBatchFeedback(action: string, items: readonly AnyBatchItem<string>[]): void {
     const feedback = batchFeedback(action, items);
     toast(feedback.message, feedback.tone);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* application updates                                                 */
+  /* ------------------------------------------------------------------ */
+
+  let updateStatus: AppUpdateStatus = "idle";
+  let currentAppVersion: string | null = null;
+  let pendingUpdate: PendingAppUpdate | null = null;
+  let updateProgress: AppUpdateProgress | null = null;
+  let updateMessage: string | null = updater === undefined ? "此构建未启用应用内更新" : null;
+  let updateError: string | null = null;
+
+  function updateViewModel() {
+    return {
+      currentVersion: currentAppVersion ?? pendingUpdate?.currentVersion ?? null,
+      availableVersion: pendingUpdate?.version ?? null,
+      checked: updateStatus === "available" || updateStatus === "current",
+      checking: updateStatus === "checking",
+      installing: updateStatus === "downloading" || updateStatus === "installing" || updateStatus === "restarting",
+      progressLabel: updateProgressLabel(),
+      message: updateMessage,
+      error: updateError,
+      notes: pendingUpdate?.body ?? null,
+      canCheck:
+        updater !== undefined &&
+        updateStatus !== "checking" &&
+        updateStatus !== "downloading" &&
+        updateStatus !== "installing" &&
+        updateStatus !== "restarting",
+      canInstall: updater !== undefined && pendingUpdate !== null && updateStatus === "available",
+    };
+  }
+
+  function updateProgressLabel(): string | null {
+    if (updateProgress === null) return null;
+    const downloaded = formatBytes(updateProgress.downloadedBytes);
+    if (updateProgress.totalBytes === null || updateProgress.totalBytes <= 0) return `${downloaded} 已下载`;
+    const total = formatBytes(updateProgress.totalBytes);
+    const percent = Math.min(100, Math.round((updateProgress.downloadedBytes / updateProgress.totalBytes) * 100));
+    return `${percent}% · ${downloaded} / ${total}`;
+  }
+
+  function renderUpdateSettings(): void {
+    view.renderUpdateSettings(updateViewModel());
+  }
+
+  async function openUpdateSettings(): Promise<void> {
+    view.openUpdateSettings(updateViewModel());
+    if (updater !== undefined && currentAppVersion === null) {
+      try {
+        currentAppVersion = await updater.currentVersion();
+        if (!disposed) renderUpdateSettings();
+      } catch {
+        currentAppVersion = null;
+      }
+    }
+  }
+
+  function failUpdate(error: unknown): void {
+    updateStatus = "failed";
+    updateError = describeBackendError(error);
+    updateMessage = null;
+    updateProgress = null;
+    renderUpdateSettings();
+    toast(`应用更新失败：${updateError}`, "danger");
+  }
+
+  async function checkForUpdate(): Promise<void> {
+    if (updater === undefined) return;
+    await pendingUpdate?.close().catch(() => undefined);
+    pendingUpdate = null;
+    updateProgress = null;
+    updateStatus = "checking";
+    updateError = null;
+    updateMessage = "正在检查更新";
+    renderUpdateSettings();
+    try {
+      const update = await updater.check();
+      if (update === null) {
+        currentAppVersion = currentAppVersion ?? (await updater.currentVersion().catch(() => null));
+        updateStatus = "current";
+        updateMessage = "已是最新版本";
+      } else {
+        pendingUpdate = update;
+        currentAppVersion = update.currentVersion;
+        updateStatus = "available";
+        updateMessage = `发现新版本 ${update.version}`;
+      }
+      renderUpdateSettings();
+    } catch (error) {
+      failUpdate(error);
+    }
+  }
+
+  async function installUpdate(): Promise<void> {
+    if (updater === undefined || pendingUpdate === null || updateStatus !== "available") return;
+    updateStatus = "downloading";
+    updateError = null;
+    updateMessage = "正在下载更新";
+    updateProgress = { downloadedBytes: 0, totalBytes: null };
+    renderUpdateSettings();
+    try {
+      await pendingUpdate.downloadAndInstall((progress) => {
+        if (disposed) return;
+        updateStatus = "downloading";
+        updateProgress = progress;
+        renderUpdateSettings();
+      });
+      updateStatus = "restarting";
+      updateMessage = "更新已安装，正在重启";
+      updateProgress = null;
+      renderUpdateSettings();
+      await updater.relaunch();
+    } catch (error) {
+      failUpdate(error);
+    }
   }
 
   function commitSessionMutation(
@@ -1767,6 +1889,19 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
         commit({ type: "ui/theme", theme: action.theme });
         view.renderTheme(state());
         return;
+
+      case "updates/open":
+        void openUpdateSettings();
+        return;
+      case "updates/close":
+        view.closeUpdateSettings();
+        return;
+      case "updates/check":
+        void checkForUpdate();
+        return;
+      case "updates/install":
+        void installUpdate();
+        return;
     }
   }
 
@@ -1868,6 +2003,7 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
     if (disposed) return;
 
     view.renderDownloadRootLabel(state());
+    renderUpdateSettings();
     view.setNotificationsSwitch(ui().notifyEnabled);
 
     const alreadyConnected = devicesOf(state()).find((d) => d.state === "connected");

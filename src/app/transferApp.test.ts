@@ -4,8 +4,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import type { AppView } from "./appView";
+import type { AppUpdateViewModel, AppView } from "./appView";
 import { createTransferApp } from "./transferApp";
+import type { AppUpdater, AppUpdateProgress, PendingAppUpdate } from "../runtime/appUpdater";
 import { createFakeClock } from "../runtime/clock";
 import { createMemoryBackend, memoryTransferJob } from "../runtime/memoryBackend";
 import type { AppState } from "../runtime/reducer";
@@ -42,6 +43,7 @@ interface RecordedView {
   storageDownloadRootFields: string[];
   downloadRootFields: string[];
   mediaSnapshots: MediaWorkspaceSnapshot[];
+  updateModels: AppUpdateViewModel[];
   readonly storageSettingsOpens: number;
 }
 
@@ -52,6 +54,7 @@ function createRecordedView(): RecordedView {
   const storageDownloadRootFields: string[] = [];
   const downloadRootFields: string[] = [];
   const mediaSnapshots: MediaWorkspaceSnapshot[] = [];
+  const updateModels: AppUpdateViewModel[] = [];
   let trayRenders = 0;
   let storageSettingsOpens = 0;
   const record = (state: AppState): void => {
@@ -91,6 +94,13 @@ function createRecordedView(): RecordedView {
     setDownloadRootField: (value: string): void => {
       downloadRootFields.push(value);
     },
+    openUpdateSettings: (model): void => {
+      updateModels.push(model);
+    },
+    closeUpdateSettings: (): void => {},
+    renderUpdateSettings: (model): void => {
+      updateModels.push(model);
+    },
     confirmDestructive: (_message: string): boolean => false,
     setBusy: (_label: string | null): void => {},
     showFatal: (title: string): void => {
@@ -106,6 +116,7 @@ function createRecordedView(): RecordedView {
     storageDownloadRootFields,
     downloadRootFields,
     mediaSnapshots,
+    updateModels,
     get trayRenders() {
       return trayRenders;
     },
@@ -160,6 +171,34 @@ function libraryEntry(deviceId: string, sessionId: string, deviceDisplayId = DIS
     uploadedAt: null,
     uploadError: null,
     uploadRetryable: false,
+  };
+}
+
+class FakePendingUpdate implements PendingAppUpdate {
+  readonly currentVersion = "0.1.0";
+  readonly version = "0.2.0";
+  readonly date = "2026-08-27T00:00:00Z";
+  readonly body = "Bridge update";
+  closed = false;
+
+  async downloadAndInstall(onProgress: (progress: AppUpdateProgress) => void): Promise<void> {
+    onProgress({ downloadedBytes: 128, totalBytes: 256 });
+    onProgress({ downloadedBytes: 256, totalBytes: 256 });
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+  }
+}
+
+function fakeUpdater(update: PendingAppUpdate | null): AppUpdater & { relaunches: number } {
+  return {
+    relaunches: 0,
+    currentVersion: async () => "0.1.0",
+    check: async () => update,
+    async relaunch(): Promise<void> {
+      this.relaunches += 1;
+    },
   };
 }
 
@@ -386,6 +425,35 @@ test("media configure-storage action opens the existing storage settings", async
     app.dispatch({ kind: "media/configureStorage" });
     await until(() => recorded.storageSettingsOpens === 1);
     assert.equal(backend.callNames().filter((name) => name === "getStorageConfig").length, 1);
+  } finally {
+    app.dispose();
+  }
+});
+
+test("application updater checks, downloads, installs and relaunches from the settings modal", async () => {
+  const recorded = createRecordedView();
+  const updater = fakeUpdater(new FakePendingUpdate());
+  const app = createTransferApp({
+    backend: createMemoryBackend(),
+    clock: createFakeClock(),
+    toast: () => {},
+    updater,
+    view: () => recorded.appView,
+  });
+
+  try {
+    await app.start();
+    app.dispatch({ kind: "updates/open" });
+    await until(() => recorded.updateModels.some((model) => model.currentVersion === "0.1.0"));
+
+    app.dispatch({ kind: "updates/check" });
+    await until(() => recorded.updateModels.some((model) => model.availableVersion === "0.2.0" && model.canInstall));
+
+    app.dispatch({ kind: "updates/install" });
+    await until(() => updater.relaunches === 1);
+
+    assert.ok(recorded.updateModels.some((model) => model.progressLabel === "50% · 128 B / 256 B"));
+    assert.ok(recorded.updateModels.some((model) => model.message === "更新已安装，正在重启"));
   } finally {
     app.dispose();
   }

@@ -85,6 +85,12 @@ export type UiAction =
   | { readonly kind: "settings/pickDownloadRoot" }
   | { readonly kind: "settings/saveDownloadRoot"; readonly downloadRoot: string }
   | { readonly kind: "settings/setNotifications"; readonly enabled: boolean }
-  | { readonly kind: "settings/setTheme"; readonly theme: ThemePreference };
+  | { readonly kind: "settings/setTheme"; readonly theme: ThemePreference }
+
+  /* application updates */
+  | { readonly kind: "updates/open" }
+  | { readonly kind: "updates/close" }
+  | { readonly kind: "updates/check" }
+  | { readonly kind: "updates/install" };
 
 export type Dispatch = (action: UiAction) => void;

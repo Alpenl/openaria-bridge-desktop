@@ -499,6 +499,8 @@ pub fn run() {
         // `opener:default` capability permission.
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // Startup runs in four ordered stages, and the order is the point:
         //   1. load and migrate the persisted configuration (once),
         //   2. build the runtime, inert -- no threads, no timers,

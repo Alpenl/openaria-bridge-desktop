@@ -63,6 +63,9 @@ export function createDomAppView(dispatch: Dispatch): AppView {
     openDownloadRootSettings: (config: StorageConfig) => settings.openDownloadRootSettings(config),
     closeDownloadRootSettings: () => settings.closeDownloadRootSettings(),
     setDownloadRootField: (value) => settings.setDownloadRootField(value),
+    openUpdateSettings: (model) => settings.openUpdateSettings(model),
+    closeUpdateSettings: () => settings.closeUpdateSettings(),
+    renderUpdateSettings: (model) => settings.renderUpdateSettings(model),
 
     confirmDestructive: (message) => globalThis.confirm(message),
     setBusy: (label) => device.setBusy(label),

@@ -247,6 +247,8 @@ jobs:
           const config = JSON.parse(fs.readFileSync(path, "utf8"));
 
           config.version = process.env.RELEASE_VERSION;
+          config.bundle = config.bundle ?? {};
+          config.bundle.createUpdaterArtifacts = true;
           fs.writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
           NODE
 
@@ -275,6 +277,9 @@ jobs:
 
       - name: tauri build
         uses: tauri-apps/tauri-action@v0
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ needs.prepare.outputs.is_release == 'true' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Upload Tauri artifacts
         uses: actions/upload-artifact@v6
@@ -310,6 +315,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          release_url="https://github.com/${GH_REPO}/releases/download/${RELEASE_TAG}"
           assets=()
           while IFS= read -r -d '' asset; do
             assets+=("${asset}")
@@ -320,7 +326,10 @@ jobs:
                 -o -name '*.rpm' \
                 -o -name '*.dmg' \
                 -o -name '*.msi' \
-                -o -name '*-setup.exe' \) \
+                -o -name '*-setup.exe' \
+                -o -name '*.tar.gz' \
+                -o -name '*.zip' \
+                -o -name '*.sig' \) \
               -print0 | sort -z
           )
 
@@ -328,6 +337,66 @@ jobs:
             echo "No packaged desktop installers were found in the build artifacts." >&2
             exit 1
           fi
+
+          node - "${RELEASE_TAG}" "${release_url}" release-assets <<'NODE'
+          const fs = require("node:fs");
+          const path = require("node:path");
+
+          const [, , version, releaseUrl, root] = process.argv;
+          const osByRunner = new Map([
+            ["ubuntu-latest", "linux"],
+            ["macos-latest", "darwin"],
+            ["windows-latest", "windows"],
+          ]);
+          const archByRunner = new Map([
+            ["ubuntu-latest", "x86_64"],
+            ["macos-latest", "aarch64"],
+            ["windows-latest", "x86_64"],
+          ]);
+
+          function walk(dir) {
+            return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+              const full = path.join(dir, entry.name);
+              return entry.isDirectory() ? walk(full) : [full];
+            });
+          }
+
+          const files = walk(root);
+          const platforms = {};
+          for (const file of files) {
+            if (!fs.existsSync(`${file}.sig`)) continue;
+            const parts = file.split(path.sep);
+            const runner = [...osByRunner.keys()].find((name) => parts.includes(`ylx-transfer-${name}`));
+            if (runner === undefined) continue;
+            const platform = `${osByRunner.get(runner)}-${archByRunner.get(runner)}`;
+            platforms[platform] = {
+              signature: fs.readFileSync(`${file}.sig`, "utf8").trim(),
+              url: `${releaseUrl}/${encodeURIComponent(path.basename(file))}`,
+            };
+          }
+
+          if (Object.keys(platforms).length === 0) {
+            console.error("No updater artifacts with .sig sidecars were found.");
+            process.exit(1);
+          }
+
+          for (const required of ["linux-x86_64", "darwin-aarch64", "windows-x86_64"]) {
+            if (platforms[required] === undefined) {
+              console.error(`Missing updater manifest entry for ${required}.`);
+              process.exit(1);
+            }
+          }
+
+          const manifest = {
+            version,
+            notes: `Open Aria Bridge ${version}`,
+            pub_date: new Date().toISOString(),
+            platforms,
+          };
+          fs.writeFileSync("latest.json", `${JSON.stringify(manifest, null, 2)}\n`);
+          NODE
+
+          assets+=("latest.json")
 
           printf 'Release assets:\n'
           printf '  %s\n' "${assets[@]}"
