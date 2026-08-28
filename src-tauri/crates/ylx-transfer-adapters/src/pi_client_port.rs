@@ -187,7 +187,7 @@ fn to_lab_v4_session_detail_view(
 }
 
 fn decode_lower_hex_for_lab_v4(field: &str, value: &str) -> Result<Vec<u8>, PiClientError> {
-    if value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(PiClientError {
             kind: PiClientErrorKind::Other,
             message: format!("Device API v4 compatibility {field} is not hex"),
@@ -195,7 +195,7 @@ fn decode_lower_hex_for_lab_v4(field: &str, value: &str) -> Result<Vec<u8>, PiCl
     }
     let mut out = Vec::with_capacity(value.len() / 2);
     let bytes = value.as_bytes();
-    for chunk in bytes.chunks_exact(2) {
+    for chunk in bytes.as_chunks::<2>().0 {
         let text = std::str::from_utf8(chunk).map_err(|_| PiClientError {
             kind: PiClientErrorKind::Other,
             message: format!("Device API v4 compatibility {field} is not UTF-8 hex"),
