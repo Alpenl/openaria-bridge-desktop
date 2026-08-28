@@ -344,34 +344,14 @@ jobs:
           fi
 
           release_url="https://github.com/${GH_REPO}/releases/download/${RELEASE_TAG}"
-          assets=()
-          while IFS= read -r -d '' asset; do
-            assets+=("${asset}")
-          done < <(
-            find release-assets -type f \
-              \( -name '*.msi' \
-                -o -name '*-setup.exe' \
-                -o -name '*.zip' \
-                -o -name '*.sig' \) \
-              -print0 | sort -z
-          )
+          rm -rf release-upload-assets
+          mkdir -p release-upload-assets
 
-          if (( ${#assets[@]} == 0 )); then
-            echo "No packaged desktop installers were found in the build artifacts." >&2
-            exit 1
-          fi
-
-          node - "${RELEASE_TAG}" "${release_url}" release-assets <<'NODE'
+          node - "${RELEASE_TAG}" "${release_url}" release-assets release-upload-assets <<'NODE'
           const fs = require("node:fs");
           const path = require("node:path");
 
-          const [, , version, releaseUrl, root] = process.argv;
-          const osByRunner = new Map([
-            ["windows-latest", "windows"],
-          ]);
-          const archByRunner = new Map([
-            ["windows-latest", "x86_64"],
-          ]);
+          const [, , version, releaseUrl, root, outputRoot] = process.argv;
 
           function walk(dir) {
             return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
@@ -381,34 +361,69 @@ jobs:
           }
 
           const files = walk(root);
-          const platforms = {};
-          for (const file of files) {
-            if (!fs.existsSync(`${file}.sig`)) continue;
-            const parts = file.split(path.sep);
-            const runner = [...osByRunner.keys()].find((name) => parts.includes(`ylx-transfer-${name}`));
-            if (runner === undefined) continue;
-            const platform = `${osByRunner.get(runner)}-${archByRunner.get(runner)}`;
-            // GitHub Release download asset names replace spaces with dots.
-            // Generate updater URLs from that canonical asset spelling rather
-            // than the local bundle filename emitted by Tauri.
-            const assetName = path.basename(file).replaceAll(" ", ".");
-            platforms[platform] = {
-              signature: fs.readFileSync(`${file}.sig`, "utf8").trim(),
-              url: `${releaseUrl}/${encodeURIComponent(assetName)}`,
-            };
-          }
+          const signedInstallers = files
+            .filter((file) => {
+              const name = path.basename(file);
+              return (name.endsWith(".msi") || name.endsWith("-setup.exe") || name.endsWith(".zip"))
+                && fs.existsSync(`${file}.sig`);
+            })
+            .sort();
 
-          if (Object.keys(platforms).length === 0) {
-            console.error("No updater artifacts with .sig sidecars were found.");
+          if (signedInstallers.length === 0) {
+            console.error("No signed updater/installers were found in the build artifacts.");
             process.exit(1);
           }
 
-          for (const required of ["windows-x86_64"]) {
-            if (platforms[required] === undefined) {
-              console.error(`Missing updater manifest entry for ${required}.`);
-              process.exit(1);
-            }
+          const nsisUpdater = signedInstallers.find((file) =>
+            path.basename(file).endsWith("-setup.nsis.zip"),
+          );
+          const msiUpdater = signedInstallers.find((file) => path.basename(file).endsWith(".msi.zip"));
+          const nsis = signedInstallers.find((file) => path.basename(file).endsWith("-setup.exe"));
+          const msi = signedInstallers.find((file) => path.basename(file).endsWith(".msi"));
+          const zip = signedInstallers.find((file) => path.basename(file).endsWith(".zip"));
+          const updaterSource = nsisUpdater ?? msiUpdater ?? nsis ?? msi ?? zip;
+          if (updaterSource === undefined) {
+            console.error("No Windows updater asset could be selected.");
+            process.exit(1);
           }
+
+          function stagedName(file) {
+            const name = path.basename(file);
+            if (name.endsWith("-setup.nsis.zip")) {
+              return `OpenAriaBridge_${version}_windows_x86_64-nsis-updater.zip`;
+            }
+            if (name.endsWith(".msi.zip")) {
+              return `OpenAriaBridge_${version}_windows_x86_64-msi-updater.zip`;
+            }
+            if (name.endsWith(".msi")) {
+              return `OpenAriaBridge_${version}_windows_x86_64.msi`;
+            }
+            if (name.endsWith("-setup.exe")) {
+              return `OpenAriaBridge_${version}_windows_x86_64-setup.exe`;
+            }
+            if (name.endsWith(".zip")) {
+              return `OpenAriaBridge_${version}_windows_x86_64.zip`;
+            }
+            throw new Error(`Unexpected installer name: ${name}`);
+          }
+
+          const staged = new Map();
+          for (const file of signedInstallers) {
+            const assetName = stagedName(file);
+            const target = path.join(outputRoot, assetName);
+            const sigTarget = `${target}.sig`;
+            fs.copyFileSync(file, target);
+            fs.copyFileSync(`${file}.sig`, sigTarget);
+            staged.set(file, assetName);
+          }
+
+          const updaterAssetName = staged.get(updaterSource);
+          const platforms = {
+            "windows-x86_64": {
+              signature: fs.readFileSync(`${updaterSource}.sig`, "utf8").trim(),
+              url: `${releaseUrl}/${encodeURIComponent(updaterAssetName)}`,
+            },
+          };
 
           const manifest = {
             version,
@@ -416,10 +431,29 @@ jobs:
             pub_date: new Date().toISOString(),
             platforms,
           };
-          fs.writeFileSync("latest.json", `${JSON.stringify(manifest, null, 2)}\n`);
+          fs.writeFileSync(
+            path.join(outputRoot, "latest.json"),
+            `${JSON.stringify(manifest, null, 2)}\n`,
+          );
           NODE
 
-          assets+=("latest.json")
+          assets=()
+          while IFS= read -r -d '' asset; do
+            assets+=("${asset}")
+          done < <(
+            find release-upload-assets -type f \
+              \( -name '*.msi' \
+                -o -name '*-setup.exe' \
+                -o -name '*.zip' \
+                -o -name '*.sig' \
+                -o -name 'latest.json' \) \
+              -print0 | sort -z
+          )
+
+          if (( ${#assets[@]} == 0 )); then
+            echo "No release upload assets were staged." >&2
+            exit 1
+          fi
 
           printf 'Release assets:\n'
           printf '  %s\n' "${assets[@]}"
