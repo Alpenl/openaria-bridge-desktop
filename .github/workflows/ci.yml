@@ -387,9 +387,13 @@ jobs:
             const runner = [...osByRunner.keys()].find((name) => parts.includes(`ylx-transfer-${name}`));
             if (runner === undefined) continue;
             const platform = `${osByRunner.get(runner)}-${archByRunner.get(runner)}`;
+            // GitHub Release download asset names replace spaces with dots.
+            // Generate updater URLs from that canonical asset spelling rather
+            // than the local bundle filename emitted by Tauri.
+            const assetName = path.basename(file).replaceAll(" ", ".");
             platforms[platform] = {
               signature: fs.readFileSync(`${file}.sig`, "utf8").trim(),
-              url: `${releaseUrl}/${encodeURIComponent(path.basename(file))}`,
+              url: `${releaseUrl}/${encodeURIComponent(assetName)}`,
             };
           }
 
