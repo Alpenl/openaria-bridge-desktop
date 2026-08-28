@@ -1638,7 +1638,10 @@ mod tests {
             .export_source_tree(&SessionExportRequest::new(&source, &output).with_overwrite(true))
             .expect("export source tree");
 
-        assert_eq!(receipt.output_path, output);
+        assert_eq!(
+            receipt.output_path.canonicalize().expect("receipt path"),
+            output.canonicalize().expect("output path")
+        );
         assert_eq!(receipt.video_segment_count, 1);
         assert_eq!(receipt.audio_segment_count, 1);
         assert!(receipt.output_size_bytes > 0);
