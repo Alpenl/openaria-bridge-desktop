@@ -16,19 +16,6 @@ on:
         required: false
         default: ""
         type: string
-      platforms:
-        description: >-
-          Desktop platforms to build and run the recovery contract on.
-          "ubuntu" skips the macOS and Windows lanes, which is for iterating on
-          a Linux-only change; it is not cross-platform verification, so a
-          change that ships still needs a full run.
-        required: false
-        default: all
-        type: choice
-        options:
-          - all
-          - ubuntu
-
 permissions:
   contents: read
 
@@ -54,7 +41,6 @@ jobs:
         shell: bash
         env:
           REQUESTED_TAG: ${{ inputs.release_tag }}
-          REQUESTED_PLATFORMS: ${{ inputs.platforms }}
         run: |
           set -euo pipefail
 
@@ -80,14 +66,10 @@ jobs:
             is_release=true
           fi
 
-          # Only a manual dispatch may narrow the matrix, and never for a
-          # release: a published artifact is always built on all three.
-          platforms='["ubuntu-latest","macos-latest","windows-latest"]'
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" \
-                && "${REQUESTED_PLATFORMS}" == "ubuntu" \
-                && "${is_release}" == "false" ]]; then
-            platforms='["ubuntu-latest"]'
-          fi
+          # Desktop application releases are Windows-only. Linux still runs the
+          # normal frontend/Rust validation jobs above; installer packaging and
+          # app-update artifacts are produced only by the Windows runner.
+          platforms='["windows-latest"]'
 
           {
             echo "checkout_ref=${checkout_ref}"
@@ -206,9 +188,8 @@ jobs:
           -p ylx-transfer-core --test fs_recovery_contract
           --all-targets --all-features -- --nocapture
 
-  # Builds the full desktop app on all three target platforms. This is the
-  # actual cross-platform verification: a Linux workstation cannot exercise
-  # the macOS and Windows cfg-gated code or native installer packaging.
+  # Builds the shipped desktop app. The product release surface is Windows-only,
+  # so this job no longer packages macOS/Linux applications.
   tauri:
     name: tauri build (${{ matrix.platform }})
     needs: [prepare, frontend, rust]
@@ -261,6 +242,30 @@ jobs:
           workspaces: src-tauri
 
       - run: npm ci
+
+      - name: Prepare Windows ffmpeg sidecar
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install ffmpeg -y --no-progress
+          $ffmpeg = (Get-Command ffmpeg.exe).Source
+          New-Item -ItemType Directory -Force src-tauri/binaries | Out-Null
+          Copy-Item $ffmpeg src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe -Force
+          & src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe -version
+
+      - name: Enable Windows ffmpeg sidecar
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const path = "src-tauri/tauri.conf.json";
+          const config = JSON.parse(fs.readFileSync(path, "utf8"));
+
+          config.bundle = config.bundle ?? {};
+          config.bundle.externalBin = ["binaries/ffmpeg"];
+          fs.writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+          NODE
 
       # Formatting is platform-independent and already gated by the `rust`
       # job; clippy and all-target tests are not -- cfg-gated paths differ per
@@ -339,13 +344,8 @@ jobs:
             assets+=("${asset}")
           done < <(
             find release-assets -type f \
-              \( -name '*.AppImage' \
-                -o -name '*.deb' \
-                -o -name '*.rpm' \
-                -o -name '*.dmg' \
-                -o -name '*.msi' \
+              \( -name '*.msi' \
                 -o -name '*-setup.exe' \
-                -o -name '*.tar.gz' \
                 -o -name '*.zip' \
                 -o -name '*.sig' \) \
               -print0 | sort -z
@@ -362,13 +362,9 @@ jobs:
 
           const [, , version, releaseUrl, root] = process.argv;
           const osByRunner = new Map([
-            ["ubuntu-latest", "linux"],
-            ["macos-latest", "darwin"],
             ["windows-latest", "windows"],
           ]);
           const archByRunner = new Map([
-            ["ubuntu-latest", "x86_64"],
-            ["macos-latest", "aarch64"],
             ["windows-latest", "x86_64"],
           ]);
 
@@ -402,7 +398,7 @@ jobs:
             process.exit(1);
           }
 
-          for (const required of ["linux-x86_64", "darwin-aarch64", "windows-x86_64"]) {
+          for (const required of ["windows-x86_64"]) {
             if (platforms[required] === undefined) {
               console.error(`Missing updater manifest entry for ${required}.`);
               process.exit(1);

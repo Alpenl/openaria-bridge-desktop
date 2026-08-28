@@ -42,18 +42,27 @@ export function renderSectionHeadingShellHtml(eyebrowLabel: string): string {
   );
 }
 
-export function renderBulkBarHtml(kind: ToolbarKind, selectedCount: number, bulkDeleting: boolean): string {
+export function renderBulkBarHtml(
+  kind: ToolbarKind,
+  selectedCount: number,
+  bulkDeleting: boolean,
+  options: { canRemove?: boolean } = {},
+): string {
   if (selectedCount === 0) {
     return `<span class="count mono" id="sessionsCount"></span>`;
   }
   const actionLabel = kind === "device" ? "下载所选" : "上传所选";
   const removeLabel = kind === "device" ? "删除所选" : "移除所选";
+  const removeButton =
+    options.canRemove === false
+      ? ""
+      : `<button class="btn ${bulkDeleting ? "btn-danger-confirm" : "btn-danger-outline"}" style="padding:5px 11px;font-size:11px;border-radius:7px;margin-right:6px;" id="bulkRemoveBtn">${
+          bulkDeleting ? "确认" + removeLabel : removeLabel
+        }</button>`;
   return (
     `<span class="mono" style="font-size:10.5px;color:var(--text-secondary);margin-right:8px;">已选 ${selectedCount} 项</span>` +
     `<button class="btn btn-primary btn-sm" id="bulkActionBtn" style="margin-right:6px;">${actionLabel}</button>` +
-    `<button class="btn ${bulkDeleting ? "btn-danger-confirm" : "btn-danger-outline"}" style="padding:5px 11px;font-size:11px;border-radius:7px;margin-right:6px;" id="bulkRemoveBtn">${
-      bulkDeleting ? "确认" + removeLabel : removeLabel
-    }</button>` +
+    removeButton +
     `<button class="btn btn-ghost btn-sm" id="bulkClearBtn">取消</button>`
   );
 }

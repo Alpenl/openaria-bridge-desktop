@@ -89,6 +89,19 @@ test("sessionRowHtml still renders normal sessions without visible entities", ()
   assert.ok(html.includes("video/left_00000.mp4"));
 });
 
+test("summary-only sessions do not render destructive device deletion controls", () => {
+  const html = sessionRowHtml(baseSession({ files: [] }), {
+    open: true,
+    deleting: false,
+    checked: false,
+    canDelete: false,
+  });
+
+  assert.ok(!html.includes('data-action="delete"'));
+  assert.ok(html.includes("文件清单将在下载时按需读取"));
+  assert.ok(!html.includes('data-action="download-file"'));
+});
+
 test("collapsed sessions do not create hidden file rows or actions", () => {
   const html = sessionRowHtml(baseSession(), { open: false, deleting: false, checked: false });
   assert.ok(!html.includes("video/left_00000.mp4"));

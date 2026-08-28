@@ -1511,7 +1511,7 @@ fn checked_library_file_path(
     file_id: &str,
 ) -> Result<PathBuf, String> {
     let file = entry
-        .files
+        .display_files()
         .iter()
         .find(|file| file.file_id == file_id)
         .ok_or_else(|| "该文件不属于所选本地记录".to_string())?;
@@ -1600,6 +1600,7 @@ mod tests {
             date_label: "2026-08-03".to_string(),
             downloaded_at: "2026-08-03T12:00:00Z".to_string(),
             bytes: 4,
+            processed_files: Vec::new(),
             files: vec![SessionFile::new(
                 "file-1".to_string(),
                 "video/left.mp4".to_string(),
@@ -1689,6 +1690,46 @@ mod tests {
         let error =
             checked_library_file_path(Path::new("/tmp/ylx-test-library"), &test_entry(), "file-2")
                 .unwrap_err();
+        assert_eq!(error, "该文件不属于所选本地记录");
+    }
+
+    #[test]
+    fn reveal_accepts_the_processed_display_file() {
+        let root = tempfile::tempdir().expect("library root");
+        let mut entry = test_entry();
+        entry.processed_files = vec![SessionFile::new(
+            "processed-sbs-mp4".to_string(),
+            "processed/sbs.mp4".to_string(),
+            4,
+            String::new(),
+        )];
+        let path = root
+            .path()
+            .join(&entry.device_id)
+            .join(&entry.session_id)
+            .join("processed/sbs.mp4");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"abcd").unwrap();
+
+        let resolved = checked_library_file_path(root.path(), &entry, "processed-sbs-mp4")
+            .expect("processed display file resolves");
+
+        assert_eq!(resolved, path);
+    }
+
+    #[test]
+    fn reveal_rejects_raw_segments_once_a_processed_display_file_exists() {
+        let root = tempfile::tempdir().expect("library root");
+        let mut entry = test_entry();
+        entry.processed_files = vec![SessionFile::new(
+            "processed-sbs-mp4".to_string(),
+            "processed/sbs.mp4".to_string(),
+            4,
+            String::new(),
+        )];
+
+        let error = checked_library_file_path(root.path(), &entry, "file-1").unwrap_err();
+
         assert_eq!(error, "该文件不属于所选本地记录");
     }
 

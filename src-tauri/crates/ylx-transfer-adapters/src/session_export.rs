@@ -126,6 +126,57 @@ pub struct SessionExportPlan {
 }
 
 impl SessionExportPlan {
+    pub fn from_resolved_segments(
+        source_root: impl Into<PathBuf>,
+        output_path: impl Into<PathBuf>,
+        overwrite: bool,
+        mut video: SessionExportVideoInput,
+        mut audio_segments: Vec<PathBuf>,
+    ) -> Result<Self, SessionExportError> {
+        let source_root = canonical_source_root(&source_root.into())?;
+        let output_path = validate_output_path(&output_path.into(), overwrite)?;
+        match &mut video {
+            SessionExportVideoInput::SeparateEyes {
+                left_segments,
+                right_segments,
+            } => {
+                sort_segment_paths(left_segments);
+                sort_segment_paths(right_segments);
+                if left_segments.is_empty() || right_segments.is_empty() {
+                    return Err(SessionExportError::UnsupportedSource(
+                        "source must contain both left-eye and right-eye video segments"
+                            .to_string(),
+                    ));
+                }
+                if left_segments.len() != right_segments.len() {
+                    return Err(SessionExportError::UnsupportedSource(format!(
+                        "left/right segment counts differ: {} left, {} right",
+                        left_segments.len(),
+                        right_segments.len()
+                    )));
+                }
+                validate_separate_eye_pairing(left_segments, right_segments)?;
+            }
+            SessionExportVideoInput::SideBySide { segments, .. } => {
+                sort_segment_paths(segments);
+                if segments.is_empty() {
+                    return Err(SessionExportError::UnsupportedSource(
+                        "source has no side-by-side video segments".to_string(),
+                    ));
+                }
+            }
+        }
+        sort_segment_paths(&mut audio_segments);
+
+        Ok(SessionExportPlan {
+            source_root,
+            output_path,
+            overwrite,
+            video,
+            audio_segments,
+        })
+    }
+
     #[must_use]
     pub fn source_root(&self) -> &Path {
         &self.source_root
@@ -320,6 +371,13 @@ impl FfmpegSessionExporter {
         request: &SessionExportRequest,
     ) -> Result<SessionExportReceipt, SessionExportError> {
         let plan = self.build_plan(request)?;
+        self.export_plan(&plan)
+    }
+
+    pub fn export_plan(
+        &self,
+        plan: &SessionExportPlan,
+    ) -> Result<SessionExportReceipt, SessionExportError> {
         let final_output_path = plan.output_path.clone();
         let staging = TempExportDir::create_for(&final_output_path)?;
         let staged_output_path = staging.path().join("output.mp4");
@@ -820,10 +878,13 @@ fn build_ffmpeg_args(
     }
     if audio_list.is_some() {
         args.extend([
+            "-af".to_string(),
+            "aresample=async=1:first_pts=0".to_string(),
             "-c:a".to_string(),
             "aac".to_string(),
             "-b:a".to_string(),
             "192k".to_string(),
+            "-shortest".to_string(),
         ]);
     }
     args.extend([
@@ -1303,7 +1364,11 @@ mod tests {
             ]));
         assert!(args.windows(2).any(|window| window == ["-map", "2:a:0"]));
         assert!(args.windows(2).any(|window| window == ["-c:v", "libx264"]));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["-af", "aresample=async=1:first_pts=0"]));
         assert!(args.windows(2).any(|window| window == ["-c:a", "aac"]));
+        assert!(args.contains(&"-shortest".to_string()));
     }
 
     #[test]

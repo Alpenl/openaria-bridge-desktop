@@ -239,6 +239,15 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
     return id === null ? null : asDeviceId(id);
   }
 
+  function deviceSupportsSessionDeletion(deviceId: DeviceId | null): boolean {
+    if (deviceId === null) return false;
+    return (sessionsOf(state(), deviceId) ?? []).some((session) => session.files.length > 0);
+  }
+
+  function reportUnsupportedDeviceSessionDeletion(): void {
+    toast("当前 Device API v4 契约不支持删除设备端会话", "danger");
+  }
+
   /** A selection is only ever as valid as the current item list: entities that
    * disappeared between selecting and acting are dropped, so no bulk command
    * can address a session/entry that is gone. */
@@ -824,6 +833,10 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
   }
 
   function cleanupBackedUp(deviceId: DeviceId): void {
+    if (!deviceSupportsSessionDeletion(deviceId)) {
+      reportUnsupportedDeviceSessionDeletion();
+      return;
+    }
     const target = confirmTargets.cleanupBackedUp(deviceId);
     const decision = confirm.request(target, confirmTtlMs);
     if (decision.decision === "busy") return;
@@ -856,6 +869,10 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
   }
 
   async function cleanupDownloaded(deviceId: DeviceId): Promise<void> {
+    if (!deviceSupportsSessionDeletion(deviceId)) {
+      reportUnsupportedDeviceSessionDeletion();
+      return;
+    }
     const capture = viewGuard.capture();
     view.setBusy("正在核验本地副本…");
 
@@ -962,6 +979,10 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
 
   async function runBulkRemove(scope: SelectionScope): Promise<void> {
     const deviceId = activeDeviceId();
+    if (scope === "device" && !deviceSupportsSessionDeletion(deviceId)) {
+      reportUnsupportedDeviceSessionDeletion();
+      return;
+    }
     const target =
       scope === "device" ? confirmTargets.deviceBulkRemove(deviceId ?? "") : confirmTargets.libraryBulkRemove();
     const decision = confirm.request(target, confirmTtlMs);
@@ -1012,6 +1033,10 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
   /* ---- per-row destructive ---- */
 
   function removeSession(deviceId: DeviceId, sessionId: SessionId): void {
+    if (!deviceSupportsSessionDeletion(deviceId)) {
+      reportUnsupportedDeviceSessionDeletion();
+      return;
+    }
     const rowKey = rowKeyFor("device", deviceId, sessionId);
     const target = confirmTargets.deviceRowRemove(rowKey);
     const decision = confirm.request(target, rowConfirmTtlMs);

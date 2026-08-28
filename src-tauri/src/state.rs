@@ -804,6 +804,7 @@ mod tests {
             date_label: "2026-08-04".to_string(),
             downloaded_at: "2026-08-04T00:00:00Z".to_string(),
             bytes: 0,
+            processed_files: Vec::new(),
             files: Vec::new(),
             complete: true,
             publication: Some(PublicationEvidence {

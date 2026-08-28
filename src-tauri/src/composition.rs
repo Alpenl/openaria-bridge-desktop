@@ -51,6 +51,9 @@ use ylx_transfer_adapters::pi_http::{
     probe_lab_v4_device, PiHttpClient, PiHttpClientConfig, PiHttpError, PiTlsPin,
 };
 use ylx_transfer_adapters::publication_verifier::Ed25519PublicationVerifier;
+use ylx_transfer_adapters::session_export::{
+    FfmpegSessionExporter, SessionExportConfig, SessionExportPlan, SessionExportVideoInput,
+};
 
 use ylx_transfer_core::credential_vault::{
     CredentialKey, CredentialVaultError, CredentialVaultPort, Secret, SecretStatus,
@@ -126,6 +129,17 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// for its whole request timeout occupies exactly one slot; the others keep
 /// flowing.
 const HEARTBEAT_CONCURRENCY: usize = 4;
+
+/// Current Device API v4 session lists are a navigation surface, not an
+/// immutable export proof. Keep the first paint bounded and fetch full detail
+/// only for an explicit download/delete-capable legacy mutation.
+const LAB_V4_SESSION_LIST_LIMIT: u32 = 50;
+
+const LAB_V4_SESSION_DELETE_UNSUPPORTED_MESSAGE: &str =
+    "当前 Device API v4 契约不支持删除设备端会话；请在设备端存储管理中处理，或等待固件暴露明确的 destructive mutation 接口。";
+
+const PROCESSED_SESSION_FILE_ID: &str = "processed-sbs-mp4";
+const PROCESSED_SESSION_DISPLAY_PATH: &str = "processed/sbs.mp4";
 
 /// Which Device API transport contract one endpoint speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2450,6 +2464,17 @@ impl Composition {
         // the actor's newly bound session identity.
         authenticated = authenticated_client_for(&handle, client)?;
 
+        if api_profile == DeviceApiProfile::LabHttpV4 {
+            let page = handle
+                .list_sessions_with(&authenticated, None, Some(LAB_V4_SESSION_LIST_LIMIT))
+                .map_err(|error| authenticated_request_error("读取设备会话目录失败", error))?;
+            return Ok(page
+                .sessions
+                .into_iter()
+                .map(session_summary_to_view)
+                .collect());
+        }
+
         let mut summaries = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen_cursors = HashSet::new();
@@ -2458,14 +2483,12 @@ impl Composition {
             let page = handle
                 .list_sessions_with(&authenticated, cursor.as_deref(), Some(500))
                 .map_err(|error| authenticated_request_error("读取设备会话目录失败", error))?;
-            if api_profile != DeviceApiProfile::LabHttpV4 {
-                match &catalog_revision {
-                    Some(expected) if expected != &page.catalog_revision => {
-                        return Err("读取期间设备会话目录发生变化，请重试".to_string());
-                    }
-                    None => catalog_revision = Some(page.catalog_revision.clone()),
-                    _ => {}
+            match &catalog_revision {
+                Some(expected) if expected != &page.catalog_revision => {
+                    return Err("读取期间设备会话目录发生变化，请重试".to_string());
                 }
+                None => catalog_revision = Some(page.catalog_revision.clone()),
+                _ => {}
             }
             summaries.extend(page.sessions);
             let Some(next) = page.next_cursor else {
@@ -2494,9 +2517,7 @@ impl Composition {
                     ))
                 }
             };
-            if api_profile != DeviceApiProfile::LabHttpV4 {
-                ensure_summary_matches_detail(&summary, &detail)?;
-            }
+            ensure_summary_matches_detail(&summary, &detail)?;
             sessions.push(session_detail_to_view(detail));
         }
         Ok(sessions)
@@ -2511,6 +2532,7 @@ impl Composition {
         library: &[LibraryEntry],
     ) -> Result<Vec<SessionView>, String> {
         let library_root = self.library_root();
+        let api_profile = self.resolve_binding(device_id)?.endpoint.api_profile;
         let mut sessions = self.try_list_sessions(device_id)?;
         for view in &mut sessions {
             let entry = library.iter().find(|entry| {
@@ -2519,7 +2541,7 @@ impl Composition {
             });
             let complete_local = entry
                 .map(|entry| {
-                    library_entry_covers_session(entry, &view.session)
+                    library_entry_covers_session_for_profile(entry, &view.session, api_profile)
                         && entry_has_complete_local_files(&library_root, entry)
                 })
                 .unwrap_or(false);
@@ -2590,6 +2612,9 @@ impl Composition {
             &candidate.local_files,
         )?;
         let binding = self.resolve_binding(device_id)?;
+        if binding.endpoint.api_profile == DeviceApiProfile::LabHttpV4 {
+            return Err(LAB_V4_SESSION_DELETE_UNSUPPORTED_MESSAGE.to_string());
+        }
         let idempotency_key = downloaded_cleanup_idempotency_key(
             binding.identity.device_id().as_str(),
             &candidate.session_id,
@@ -2650,6 +2675,9 @@ impl Composition {
         candidate: &DownloadedCleanupCandidate,
         library: &[LibraryEntry],
     ) -> Result<(), String> {
+        if self.resolve_binding(device_id)?.endpoint.api_profile == DeviceApiProfile::LabHttpV4 {
+            return Err(LAB_V4_SESSION_DELETE_UNSUPPORTED_MESSAGE.to_string());
+        }
         self.revalidate_backed_up_candidate(device_id, candidate, library)?;
         self.delete_downloaded_candidate(device_id, candidate)
     }
@@ -2734,6 +2762,9 @@ impl Composition {
     /// no-op'ing.
     pub fn delete_session(&self, device_id: &str, session_id: &str) -> Result<(), String> {
         let binding = self.resolve_binding(device_id)?;
+        if binding.endpoint.api_profile == DeviceApiProfile::LabHttpV4 {
+            return Err(LAB_V4_SESSION_DELETE_UNSUPPORTED_MESSAGE.to_string());
+        }
         let client = binding.client;
         let handle = binding.handle;
         // Three network round trips, none of them holding a lock, each
@@ -2800,6 +2831,41 @@ fn session_detail_to_view(detail: SessionDetailView) -> SessionView {
         download_status: DownloadStatus::None,
         backed_up: false,
     }
+}
+
+fn session_summary_to_view(summary: SessionSummaryView) -> SessionView {
+    SessionView {
+        session: Session {
+            id: summary.session_id,
+            revision: summary.revision,
+            date_label: summary.captured_at,
+            duration_seconds: summary.duration_seconds,
+            total_bytes: summary.total_bytes,
+            video_bytes: summary.video_bytes,
+            imu_samples: None,
+            // Device API v4 list pages are intentionally summary-only. Pulling
+            // detail for every row made first paint and ordinary refresh scale
+            // with N+1 network calls; explicit downloads still fetch detail.
+            files: Vec::new(),
+        },
+        download_status: DownloadStatus::None,
+        backed_up: false,
+    }
+}
+
+fn library_entry_covers_session_for_profile(
+    entry: &LibraryEntry,
+    session: &Session,
+    api_profile: DeviceApiProfile,
+) -> bool {
+    if api_profile == DeviceApiProfile::LabHttpV4 && session.files.is_empty() {
+        return entry.complete
+            && entry
+                .publication
+                .as_ref()
+                .is_some_and(|publication| publication.revision == session.revision);
+    }
+    library_entry_covers_session(entry, session)
 }
 
 fn library_entry_covers_session(entry: &LibraryEntry, session: &Session) -> bool {
@@ -3047,6 +3113,11 @@ pub(crate) fn project_library_entries(
         .cloned()
         .map(|mut entry| {
             entry.complete = entry_has_complete_local_files(library_root, &entry);
+            if !entry.processed_files.is_empty()
+                && !entry_has_complete_processed_files(library_root, &entry)
+            {
+                entry.processed_files.clear();
+            }
             entry
         })
         .collect()
@@ -3116,6 +3187,23 @@ fn entry_has_complete_local_files(library_root: &Path, entry: &LibraryEntry) -> 
                 &entry.files,
             )
             .is_ok()
+        })
+}
+
+fn entry_has_complete_processed_files(library_root: &Path, entry: &LibraryEntry) -> bool {
+    if entry.processed_files.is_empty() {
+        return false;
+    }
+    let unique_file_ids = entry
+        .processed_files
+        .iter()
+        .map(|file| file.file_id.as_str())
+        .collect::<HashSet<_>>();
+    unique_file_ids.len() == entry.processed_files.len()
+        && entry_search_roots(library_root, entry).iter().any(|root| {
+            entry.processed_files.iter().all(|file| {
+                resolve_downloaded_file(root, &entry.device_id, &entry.session_id, file).is_ok()
+            })
         })
 }
 
@@ -3474,9 +3562,11 @@ fn same_library_entry(left: Option<&LibraryEntry>, right: Option<&LibraryEntry>)
                 && left.date_label == right.date_label
                 && left.downloaded_at == right.downloaded_at
                 && left.bytes == right.bytes
+                && left.processed_files == right.processed_files
                 && left.files == right.files
                 && left.complete == right.complete
                 && left.publication == right.publication
+                && left.library_root == right.library_root
                 && left.object_receipts == right.object_receipts
                 && left.upload_projection == right.upload_projection
                 && left.upload_status == right.upload_status
@@ -4199,6 +4289,248 @@ fn verified_file_key(file: &crate::models::SessionFile) -> (String, String, u64,
     )
 }
 
+#[derive(Debug, Clone, Default)]
+struct PublicationFileMetadata {
+    role: String,
+    media_type: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionExportFileClass {
+    VideoLeft,
+    VideoRight,
+    VideoStereo,
+    Audio,
+    Other,
+}
+
+fn publication_file_metadata(payload: &[u8]) -> HashMap<(String, String), PublicationFileMetadata> {
+    let mut out = HashMap::new();
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return out;
+    };
+    let Some(files) = value.get("files").and_then(serde_json::Value::as_array) else {
+        return out;
+    };
+    for file in files {
+        let Some(id) = file.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(display_path) = file.get("display_path").and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        out.insert(
+            (id.to_string(), display_path.to_string()),
+            PublicationFileMetadata {
+                role: file
+                    .get("role")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase(),
+                media_type: file
+                    .get("media_type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase(),
+            },
+        );
+    }
+    out
+}
+
+fn export_file_class(
+    file: &SessionFile,
+    metadata: Option<&PublicationFileMetadata>,
+) -> SessionExportFileClass {
+    let path = file.display_path.to_ascii_lowercase();
+    let role = metadata.map(|meta| meta.role.as_str()).unwrap_or("");
+    let media_type = metadata.map(|meta| meta.media_type.as_str()).unwrap_or("");
+    if role.starts_with("audio")
+        || media_type.starts_with("audio/")
+        || path.starts_with("audio/")
+        || path.ends_with(".wav")
+        || path.ends_with(".aac")
+        || path.ends_with(".m4a")
+    {
+        return SessionExportFileClass::Audio;
+    }
+    if role == "video.left"
+        || role == "video_left"
+        || path.starts_with("video/left_")
+        || path.contains("/left_")
+    {
+        return SessionExportFileClass::VideoLeft;
+    }
+    if role == "video.right"
+        || role == "video_right"
+        || path.starts_with("video/right_")
+        || path.contains("/right_")
+    {
+        return SessionExportFileClass::VideoRight;
+    }
+    if role == "video.raw-side-by-side"
+        || role == "video.side-by-side"
+        || role == "video.stereo"
+        || role == "video_stereo"
+        || path.contains("side-by-side")
+        || path.contains("sbs")
+        || path.contains("stereo")
+    {
+        return SessionExportFileClass::VideoStereo;
+    }
+    SessionExportFileClass::Other
+}
+
+fn processed_output_path(
+    library_root: &Path,
+    device_id: &str,
+    session_id: &str,
+) -> Result<PathBuf, String> {
+    derive_target_path_for_file(
+        library_root,
+        device_id,
+        session_id,
+        PROCESSED_SESSION_FILE_ID,
+        Some(PROCESSED_SESSION_DISPLAY_PATH),
+    )
+    .map_err(|error| {
+        format!("processed MP4 输出路径不安全（{PROCESSED_SESSION_DISPLAY_PATH}）：{error:?}")
+    })
+}
+
+fn prepare_processed_output_parent(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "processed MP4 输出路径缺少父目录".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("无法创建 processed MP4 输出目录：{error}"))?;
+    let metadata = fs::symlink_metadata(parent)
+        .map_err(|error| format!("无法检查 processed MP4 输出目录：{error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "processed MP4 输出目录必须是真实目录：{}",
+            parent.display()
+        ));
+    }
+    Ok(())
+}
+
+fn ffmpeg_export_config() -> SessionExportConfig {
+    let Some(path) = resolve_bundled_ffmpeg_path() else {
+        return SessionExportConfig::system_ffmpeg();
+    };
+    SessionExportConfig::system_ffmpeg().with_ffmpeg_path(path)
+}
+
+fn resolve_bundled_ffmpeg_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("OPENARIA_FFMPEG") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            candidates.push(PathBuf::from(trimmed));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("ffmpeg.exe"));
+            candidates.push(parent.join("ffmpeg"));
+            candidates.push(parent.join("binaries").join("ffmpeg.exe"));
+            candidates.push(parent.join("binaries").join("ffmpeg"));
+        }
+    }
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let binaries = PathBuf::from(manifest_dir).join("binaries");
+        #[cfg(target_os = "windows")]
+        candidates.push(binaries.join("ffmpeg-x86_64-pc-windows-msvc.exe"));
+        #[cfg(target_os = "linux")]
+        candidates.push(binaries.join("ffmpeg-x86_64-unknown-linux-gnu"));
+        #[cfg(target_os = "macos")]
+        candidates.push(binaries.join("ffmpeg-aarch64-apple-darwin"));
+    }
+    candidates.into_iter().find(|path| {
+        fs::symlink_metadata(path)
+            .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+            .unwrap_or(false)
+    })
+}
+
+fn maybe_build_processed_session_file(
+    library_root: &Path,
+    device_id: &str,
+    session_id: &str,
+    session_files: &[SessionFile],
+    verified_files: &HashMap<(String, String, u64, String), (PathBuf, u64)>,
+    publication_payload: &[u8],
+) -> Result<Option<SessionFile>, String> {
+    let metadata = publication_file_metadata(publication_payload);
+    let mut left_segments = Vec::new();
+    let mut right_segments = Vec::new();
+    let mut stereo_segments = Vec::new();
+    let mut audio_segments = Vec::new();
+    for file in session_files {
+        let path = verified_files
+            .get(&verified_file_key(file))
+            .map(|(path, _)| path.clone())
+            .ok_or_else(|| format!("缺少已校验的本地文件：{}", file.display_path))?;
+        let class = export_file_class(
+            file,
+            metadata.get(&(file.file_id.clone(), file.display_path.clone())),
+        );
+        match class {
+            SessionExportFileClass::VideoLeft => left_segments.push(path),
+            SessionExportFileClass::VideoRight => right_segments.push(path),
+            SessionExportFileClass::VideoStereo => stereo_segments.push(path),
+            SessionExportFileClass::Audio => audio_segments.push(path),
+            SessionExportFileClass::Other => {}
+        }
+    }
+
+    let video = if !left_segments.is_empty() || !right_segments.is_empty() {
+        SessionExportVideoInput::SeparateEyes {
+            left_segments,
+            right_segments,
+        }
+    } else if !stereo_segments.is_empty() {
+        SessionExportVideoInput::SideBySide {
+            segments: stereo_segments,
+            // The device-side source can be MP4/H.264, MJPEG, or a retained
+            // legacy shape. Re-encoding keeps the output uniformly playable
+            // and lets the same audio path be muxed with a bounded `-shortest`.
+            copy_video: false,
+        }
+    } else {
+        return Ok(None);
+    };
+
+    let output_path = processed_output_path(library_root, device_id, session_id)?;
+    prepare_processed_output_parent(&output_path)?;
+    let source_root = library_root.join(device_id).join(session_id);
+    let plan = SessionExportPlan::from_resolved_segments(
+        source_root,
+        output_path.clone(),
+        true,
+        video,
+        audio_segments,
+    )
+    .map_err(|error| format!("无法准备下载后视频合并计划：{error}"))?;
+    let receipt = FfmpegSessionExporter::new(ffmpeg_export_config())
+        .export_plan(&plan)
+        .map_err(|error| format!("下载后视频合并失败：{error}"))?;
+    let sha256 = hash_file(&receipt.output_path).map_err(|error| {
+        format!(
+            "计算 processed MP4 哈希失败（{}）：{error}",
+            receipt.output_path.display()
+        )
+    })?;
+    Ok(Some(SessionFile::new(
+        PROCESSED_SESSION_FILE_ID.to_string(),
+        PROCESSED_SESSION_DISPLAY_PATH.to_string(),
+        receipt.output_size_bytes,
+        sha256.to_hex(),
+    )))
+}
+
 fn apply_terminal_download_with_resolver<F>(
     library: &mut Vec<LibraryEntry>,
     library_root: &Path,
@@ -4317,20 +4649,52 @@ where
         }
 
         let complete = files_cover_inventory(&merged_files, &session_files);
+        let existing_processed_files = if same_revision {
+            existing_index
+                .map(|index| library[index].processed_files.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let processed_files = if complete {
+            match maybe_build_processed_session_file(
+                library_root,
+                device_id,
+                session_id,
+                &session_files,
+                &verified_files,
+                spec.publication().payload(),
+            ) {
+                Ok(Some(file)) => vec![file],
+                Ok(None) => existing_processed_files,
+                Err(error) => {
+                    eprintln!(
+                        "[composition] completed download for {}/{} but post-download media \
+                         preprocessing was not published ({error})",
+                        device_id, session_id
+                    );
+                    existing_processed_files
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let downloaded_at = chrono::Utc::now().to_rfc3339();
         match existing_index {
             Some(index) => {
                 let existing = &mut library[index];
                 let files_changed = existing.files != merged_files;
+                let processed_changed = existing.processed_files != processed_files;
                 let publication_changed = existing.publication.as_ref() != Some(&publication);
                 existing.files = merged_files;
+                existing.processed_files = processed_files;
                 existing.bytes = total_bytes;
                 existing.date_label = spec.date_label().to_string();
                 existing.downloaded_at = downloaded_at;
                 existing.complete = complete;
                 existing.library_root = Some(library_root.to_string_lossy().into_owned());
                 existing.publication = Some(publication.clone());
-                if files_changed || publication_changed {
+                if files_changed || processed_changed || publication_changed {
                     existing.upload_status = UploadStatus::None;
                     existing.upload_retryable = false;
                     existing.uploaded_at = None;
@@ -4344,6 +4708,7 @@ where
                 date_label: spec.date_label().to_string(),
                 downloaded_at,
                 bytes: total_bytes,
+                processed_files,
                 files: merged_files,
                 complete,
                 library_root: Some(library_root.to_string_lossy().into_owned()),
@@ -9564,6 +9929,7 @@ mod tests {
             date_label: "today".to_string(),
             downloaded_at: "now".to_string(),
             bytes: 1,
+            processed_files: Vec::new(),
             files: vec![SessionFile::new(
                 "file-terminal".to_string(),
                 "video/terminal.mp4".to_string(),
@@ -9620,6 +9986,7 @@ mod tests {
             date_label: "today".to_string(),
             downloaded_at: "just now".to_string(),
             bytes,
+            processed_files: Vec::new(),
             files,
             complete: true,
             publication: None,
@@ -11399,6 +11766,7 @@ mod tests {
             date_label: "earlier".to_string(),
             downloaded_at: "earlier".to_string(),
             bytes: 3,
+            processed_files: Vec::new(),
             files: vec![first],
             complete: false,
             publication: Some(publication_evidence_from_job_spec(&spec)),
@@ -13525,6 +13893,7 @@ mod tests {
                 date_label: "today".to_string(),
                 downloaded_at: "now".to_string(),
                 bytes: 1,
+                processed_files: Vec::new(),
                 files: vec![SessionFile::new(
                     "file-terminal".to_string(),
                     "video/terminal.mp4".to_string(),

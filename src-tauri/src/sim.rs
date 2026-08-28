@@ -474,6 +474,7 @@ async fn finish_transfer(app: &AppHandle, key: &str, sent_bytes: u64, error: Opt
                                         date_label: session.date_label.clone(),
                                         downloaded_at: "刚刚".to_string(),
                                         bytes: session.video_bytes,
+                                        processed_files: Vec::new(),
                                         files: session.files.clone(),
                                         complete: true,
                                         publication: None,

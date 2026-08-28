@@ -17,8 +17,17 @@ import { deviceSummaryHtml, emptyStateHtml, sessionRowHtml } from "../deviceView
 import { selectDeviceList } from "../listSelector";
 import { renderBulkBarHtml, renderSectionHeadingShellHtml, renderToolbarHtml } from "../toolbar";
 import { syncToolbar } from "./listEvents";
+import type { SessionView } from "../../types";
 
 const PAIRING_RING_CIRCUMFERENCE = 226.1;
+
+function supportsDeviceSessionDeletion(sessions: readonly SessionView[]): boolean {
+  // Legacy Device Session rows carry immutable file inventory in the list
+  // projection and support row/bulk DELETE. Device API v4 list rows are
+  // summary-only; the current v4 contract intentionally exposes no destructive
+  // session-deletion mutation.
+  return sessions.some((session) => session.files.length > 0);
+}
 
 export interface DeviceScreen {
   renderRail(state: AppState): void;
@@ -191,6 +200,7 @@ export function createDeviceScreen(dispatch: Dispatch): DeviceScreen {
     const refreshFailed = sessionsState.error !== null;
     const pending = sessions.filter((s) => s.downloadStatus === "none" || s.downloadStatus === "failed");
     const anyDownloading = sessions.some((s) => s.downloadStatus === "downloading");
+    const canDeleteFromDevice = supportsDeviceSessionDeletion(sessions);
     const downloadAllBtn = !hasSessionSnapshot
       ? `<button class="btn btn-ghost" disabled>${refreshing ? "正在读取设备数据…" : "会话列表不可用"}</button>`
       : pending.length > 0
@@ -203,14 +213,15 @@ export function createDeviceScreen(dispatch: Dispatch): DeviceScreen {
     const cleanupConfirming =
       confirmPhaseOf(state.ui, confirmTargets.cleanupBackedUp(device.id)).phase === "confirming";
     const cleanupBtn =
-      backedUp.length > 0
+      canDeleteFromDevice && backedUp.length > 0
         ? cleanupConfirming
           ? `<button class="btn btn-danger-confirm" id="cleanupBtn">确认清理 ${backedUp.length} 项</button>`
           : `<button class="btn btn-ghost" id="cleanupBtn">清理已备份数据<span class="mono" style="opacity:.8;margin-left:2px;">(${backedUp.length})</span></button>`
         : "";
-    const cleanupDownloadedBtn = sessions.some((session) => session.downloadStatus === "done")
-      ? `<button class="btn btn-danger-outline" id="cleanupDownloadedBtn">删除 Pi 已下载数据</button>`
-      : "";
+    const cleanupDownloadedBtn =
+      canDeleteFromDevice && sessions.some((session) => session.downloadStatus === "done")
+        ? `<button class="btn btn-danger-outline" id="cleanupDownloadedBtn">删除 Pi 已下载数据</button>`
+        : "";
 
     topbar.innerHTML =
       `<div class="topbar-identity"><span class="heartbeat"></span>` +
@@ -258,12 +269,17 @@ export function createDeviceScreen(dispatch: Dispatch): DeviceScreen {
 
     const ui = state.ui;
     const ownerId = ui.activeDeviceId ?? "";
-    const list = selectDeviceList(ui, sessionsOf(state, ui.activeDeviceId) ?? []);
+    const sessions = sessionsOf(state, ui.activeDeviceId) ?? [];
+    const canDeleteFromDevice = supportsDeviceSessionDeletion(sessions);
+    const list = selectDeviceList(ui, sessions);
     syncToolbar(content, filterFor(ui, "device"));
 
     const bulkConfirming = confirmPhaseOf(ui, confirmTargets.deviceBulkRemove(ownerId)).phase === "confirming";
     const right = elOpt("sectionHeadingRight");
-    if (right) right.innerHTML = renderBulkBarHtml("device", list.selectedKeys.length, bulkConfirming);
+    if (right)
+      right.innerHTML = renderBulkBarHtml("device", list.selectedKeys.length, bulkConfirming, {
+        canRemove: canDeleteFromDevice,
+      });
 
     const countEl = elOpt("sessionsCount");
     if (countEl) countEl.textContent = list.countText;
@@ -278,6 +294,7 @@ export function createDeviceScreen(dispatch: Dispatch): DeviceScreen {
             open: ui.openRows.has(rowKey),
             deleting: confirmPhaseOf(ui, confirmTargets.deviceRowRemove(rowKey)).phase === "confirming",
             checked: ui.deviceSelection.has(session.id),
+            canDelete: canDeleteFromDevice && session.files.length > 0,
           });
         })
         .join("");

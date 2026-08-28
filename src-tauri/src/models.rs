@@ -153,6 +153,13 @@ pub struct LibraryEntry {
     pub date_label: String,
     pub downloaded_at: String,
     pub bytes: u64,
+    /// User-facing, locally derived files produced after a complete session
+    /// download. These are deliberately separate from `files`: uploads,
+    /// backup proofs, and Pi-cleanup eligibility continue to use the original
+    /// signed session inventory, while the library view can show the playable
+    /// preprocessed result first.
+    #[serde(default)]
+    pub processed_files: Vec<SessionFile>,
     pub files: Vec<SessionFile>,
     /// Whether `files` covers the complete immutable Pi session inventory.
     /// Legacy entries have no signed revision/hash evidence, so absence of
@@ -249,6 +256,24 @@ impl LibraryEntry {
         format!("{}|{}", self.device_id, self.session_id)
     }
 
+    pub fn display_files(&self) -> &[SessionFile] {
+        if self.processed_files.is_empty() {
+            &self.files
+        } else {
+            &self.processed_files
+        }
+    }
+
+    pub fn display_bytes(&self) -> u64 {
+        if self.processed_files.is_empty() {
+            self.bytes
+        } else {
+            self.processed_files
+                .iter()
+                .fold(0_u64, |total, file| total.saturating_add(file.bytes))
+        }
+    }
+
     /// The persistence record is intentionally richer than the RPC view.
     /// Publication bytes, signatures, public keys, and object-store receipts
     /// are backend evidence used to authorize future work; they are not UI
@@ -269,8 +294,8 @@ impl LibraryEntry {
             session_id: self.session_id.clone(),
             date_label: self.date_label.clone(),
             downloaded_at: self.downloaded_at.clone(),
-            bytes: self.bytes,
-            files: self.files.clone(),
+            bytes: self.display_bytes(),
+            files: self.display_files().to_vec(),
             complete: self.complete,
             upload_status: self.upload_status,
             upload_retryable: self.upload_retryable,
@@ -547,6 +572,7 @@ mod tests {
             date_label: "2026-08-03".to_string(),
             downloaded_at: "just now".to_string(),
             bytes: 0,
+            processed_files: Vec::new(),
             files: Vec::new(),
             complete: false,
             publication: None,
@@ -647,6 +673,7 @@ mod tests {
             date_label: "2026-08-03".to_string(),
             downloaded_at: "just now".to_string(),
             bytes: 42,
+            processed_files: Vec::new(),
             files: vec![SessionFile::new(
                 "file-1".to_string(),
                 "video/file.mp4".to_string(),
@@ -684,6 +711,31 @@ mod tests {
         assert!(value.get("payload").is_none());
         assert!(value.get("signature").is_none());
         assert!(value.get("publicKey").is_none());
+    }
+
+    #[test]
+    fn library_view_prefers_processed_files_without_losing_signed_inventory() {
+        let mut entry = empty_library_entry(&format!("ylx-abcdef01{}", "1".repeat(56)));
+        entry.bytes = 100;
+        entry.files = vec![SessionFile::new(
+            "raw-left".to_string(),
+            "video/left_00000.mp4".to_string(),
+            100,
+            "a".repeat(64),
+        )];
+        entry.processed_files = vec![SessionFile::new(
+            "processed-sbs-mp4".to_string(),
+            "processed/sbs.mp4".to_string(),
+            40,
+            "b".repeat(64),
+        )];
+
+        let view = entry.view();
+
+        assert_eq!(entry.files[0].display_path, "video/left_00000.mp4");
+        assert_eq!(view.bytes, 40);
+        assert_eq!(view.files.len(), 1);
+        assert_eq!(view.files[0].display_path, "processed/sbs.mp4");
     }
 
     #[test]

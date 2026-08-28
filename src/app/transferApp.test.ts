@@ -1174,6 +1174,14 @@ test("same display label keeps navigation and upload operations on canonical dev
 
 test("session mutation operation errors remain visible and structured without becoming item failures", async () => {
   const backend = createMemoryBackend({ snapshot: { devices: [device(DEVICE_A)] } });
+  backend.setSessions(DEVICE_A, [
+    {
+      ...session("s1"),
+      files: [{ fileId: "file-1", displayPath: "video/left_00000.mp4", bytes: 100, sha256: "0".repeat(64) }],
+      downloadStatus: "done",
+      backedUp: true,
+    },
+  ]);
   const operationError = {
     code: "cleanup_catalog_unavailable",
     message: "无法读取设备会话清单",
@@ -1212,6 +1220,50 @@ test("session mutation operation errors remain visible and structured without be
     assert.equal(resource?.error, operationError.message);
     assert.ok(toasts.some((toast) => toast.tone === "danger" && toast.message.includes(operationError.message)));
     assert.ok(!toasts.some((toast) => toast.message.includes("成功 0 项")));
+  } finally {
+    app.dispose();
+  }
+});
+
+test("summary-only device sessions never call destructive deletion commands", async () => {
+  const backend = createMemoryBackend({ snapshot: { devices: [device(DEVICE_A)] } });
+  backend.setSessions(DEVICE_A, [session("s1")]);
+  const toasts: Array<{ message: string; tone: string }> = [];
+  const app = createTransferApp({
+    backend,
+    clock: createFakeClock(),
+    toast: (message, tone) => toasts.push({ message, tone }),
+    view: () => createRecordedView().appView,
+  });
+
+  try {
+    await app.start();
+    app.dispatch({ kind: "device/select", deviceId: asDeviceId(DEVICE_A) });
+    await untilTask(() => backend.calls.some((call) => call.name === "listSessions" && call.args[0] === DEVICE_A));
+    await until(() => app.store.getState().sessions.get(DEVICE_A)?.value?.length === 1);
+
+    app.dispatch({ kind: "session/remove", deviceId: asDeviceId(DEVICE_A), sessionId: asSessionId("s1") });
+    app.dispatch({ kind: "session/remove", deviceId: asDeviceId(DEVICE_A), sessionId: asSessionId("s1") });
+
+    app.dispatch({ kind: "device/cleanupBackedUp", deviceId: asDeviceId(DEVICE_A) });
+    app.dispatch({ kind: "device/cleanupBackedUp", deviceId: asDeviceId(DEVICE_A) });
+
+    app.dispatch({ kind: "device/cleanupDownloaded", deviceId: asDeviceId(DEVICE_A) });
+
+    app.dispatch({ kind: "list/select", scope: "device", key: "s1", selected: true });
+    app.dispatch({ kind: "list/bulkRemove", scope: "device" });
+    app.dispatch({ kind: "list/bulkRemove", scope: "device" });
+
+    await Promise.resolve();
+
+    assert.ok(!backend.callNames().includes("deleteSessions"));
+    assert.ok(!backend.callNames().includes("cleanupBackedUp"));
+    assert.ok(!backend.callNames().includes("previewDownloadedCleanup"));
+    assert.ok(
+      toasts.some(
+        (toast) => toast.tone === "danger" && toast.message.includes("Device API v4 契约不支持删除设备端会话"),
+      ),
+    );
   } finally {
     app.dispose();
   }

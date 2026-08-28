@@ -50,7 +50,7 @@ export function emptyStateHtml(title: string, body: string): string {
 
 export function sessionRowHtml(
   session: SessionView,
-  opts: { open: boolean; deleting: boolean; checked: boolean },
+  opts: { open: boolean; deleting: boolean; checked: boolean; canDelete?: boolean },
 ): string {
   // `session.id`/`session.dateLabel` (and each file's ids/labels) are deserialized
   // straight from a Pi HTTP response body (see pi_http.rs's `SessionSummary`/
@@ -80,22 +80,27 @@ export function sessionRowHtml(
           ? `<button class="btn btn-ghost btn-sm" data-action="download" data-session="${idAttr}">重新下载</button>`
           : `<button class="btn btn-primary btn-sm" data-action="download" data-session="${idAttr}">下载</button>`;
 
-  const deleteBtn = opts.deleting
-    ? `<button class="btn btn-danger-confirm btn-sm" data-action="delete" data-session="${idAttr}">确认删除</button>`
-    : `<button class="btn btn-danger-outline btn-sm" data-action="delete" data-session="${idAttr}">删除</button>`;
+  const deleteBtn =
+    opts.canDelete === false
+      ? ""
+      : opts.deleting
+        ? `<button class="btn btn-danger-confirm btn-sm" data-action="delete" data-session="${idAttr}">确认删除</button>`
+        : `<button class="btn btn-danger-outline btn-sm" data-action="delete" data-session="${idAttr}">删除</button>`;
 
   const filesHtml = opts.open
-    ? session.files
-        .map((f) => {
-          const pathText = escapeHtml(f.displayPath);
-          const fileIdAttr = escapeAttr(f.fileId);
-          return (
-            `<li class="file-row"><span class="file-path">${pathText}</span>` +
-            `<span class="file-size mono">${formatBytes(f.bytes)}</span>` +
-            `<button class="btn btn-ghost btn-sm" data-action="download-file" data-session="${idAttr}" data-file-id="${fileIdAttr}">下载</button></li>`
-          );
-        })
-        .join("")
+    ? session.files.length === 0
+      ? `<li class="file-row"><span class="file-path">文件清单将在下载时按需读取</span><span class="file-size mono">--</span></li>`
+      : session.files
+          .map((f) => {
+            const pathText = escapeHtml(f.displayPath);
+            const fileIdAttr = escapeAttr(f.fileId);
+            return (
+              `<li class="file-row"><span class="file-path">${pathText}</span>` +
+              `<span class="file-size mono">${formatBytes(f.bytes)}</span>` +
+              `<button class="btn btn-ghost btn-sm" data-action="download-file" data-session="${idAttr}" data-file-id="${fileIdAttr}">下载</button></li>`
+            );
+          })
+          .join("")
     : "";
 
   return (
