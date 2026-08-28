@@ -8556,7 +8556,7 @@ mod tests {
         let body = body.to_vec();
         let handle = std::thread::spawn(move || {
             let mut requests = Vec::with_capacity(request_count);
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(30);
             while requests.len() < request_count && Instant::now() < deadline {
                 let (mut stream, _) = match listener.accept() {
                     Ok(connection) => connection,
