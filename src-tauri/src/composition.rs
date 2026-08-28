@@ -8533,9 +8533,12 @@ mod tests {
     }
 
     /// Serves a small loopback HTTP response to the real S3 adapter and
-    /// records each request line. The tests use explicit path-style rows, so
-    /// binding IPv4 loopback avoids hostname resolution differences between
-    /// CI hosts while still exercising the real adapter.
+    /// records each non-empty request line. The tests use explicit path-style
+    /// rows, so binding IPv4 loopback avoids hostname resolution differences
+    /// between CI hosts while still exercising the real adapter. Some Windows
+    /// runner network stacks can briefly open and abort an idle connection
+    /// before the real request; those empty preconnects are ignored because
+    /// they carry no URL-style evidence.
     fn spawn_s3_test_server(
         status: u16,
         body: &[u8],
@@ -8566,25 +8569,40 @@ mod tests {
                     }
                     Err(_) => break,
                 };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("configure S3 test stream read timeout");
                 let mut request = Vec::new();
                 let mut chunk = [0u8; 4096];
                 loop {
-                    let read = stream.read(&mut chunk).unwrap_or(0);
-                    if read == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&chunk[..read]);
-                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                        break;
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            request.extend_from_slice(&chunk[..read]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            break;
+                        }
+                        Err(_) => break,
                     }
                 }
-                requests.push(
-                    String::from_utf8_lossy(&request)
-                        .lines()
-                        .next()
-                        .unwrap_or_default()
-                        .to_string(),
-                );
+                let request_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if request_line.trim().is_empty() {
+                    continue;
+                }
+                requests.push(request_line);
                 let reason = match status {
                     204 => "No Content",
                     404 => "Not Found",
