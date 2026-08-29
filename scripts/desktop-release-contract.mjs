@@ -322,13 +322,34 @@ function decodeSigningFiles({ root, updaterPubkey, name, scratch }) {
   return { publicKey, signature };
 }
 
-export function verifyReleaseSignatures({ root, updaterPubkey, version }) {
+function runMinisign(arguments_) {
+  execFileSync("minisign", arguments_, { stdio: "inherit" });
+}
+
+export function verifyReleaseSignatures(
+  { root, updaterPubkey, version },
+  { runVerifier = runMinisign, temporaryRoot = tmpdir() } = {},
+) {
   const names = releaseNames(version);
-  const scratch = mkdtempSync(path.join(tmpdir(), "openaria-updater-signature-"));
-  for (const name of [names.setup, names.msi]) {
-    const { publicKey, signature } = decodeSigningFiles({ root, updaterPubkey, name, scratch });
-    execFileSync("minisign", ["-Vm", path.join(root, name), "-x", signature, "-p", publicKey], { stdio: "inherit" });
+  const scratch = mkdtempSync(path.join(temporaryRoot, "openaria-updater-signature-"));
+  let failure;
+  try {
+    for (const name of [names.setup, names.msi]) {
+      const { publicKey, signature } = decodeSigningFiles({ root, updaterPubkey, name, scratch });
+      runVerifier(["-Vm", path.join(root, name), "-x", signature, "-p", publicKey]);
+    }
+  } catch (error) {
+    failure = error;
+  } finally {
+    try {
+      rmSync(scratch, { recursive: true, force: false });
+    } catch (error) {
+      failure = failure
+        ? new AggregateError([failure, error], "Release signature verification and scratch cleanup both failed")
+        : error;
+    }
   }
+  if (failure) throw failure;
 }
 
 export function inspectPortableExecutable(bytes, label) {
@@ -452,11 +473,26 @@ function sevenZipEntries(listing) {
     .filter((entry) => typeof entry.Path === "string");
 }
 
-export function requireUniqueArchiveEntry(listing, expectedPath, label, maxBytes = Number.MAX_SAFE_INTEGER) {
+function windowsArchiveBasename(value) {
+  return path.posix
+    .basename(value.replaceAll("\\", "/"))
+    .replace(/[ .]+$/u, "")
+    .replace(/[A-Z]/g, (character) => character.toLowerCase());
+}
+
+export function requireUniqueArchiveEntry(
+  listing,
+  expectedPath,
+  label,
+  maxBytes = Number.MAX_SAFE_INTEGER,
+  { windowsNameSemantics = false } = {},
+) {
   const expectedBasename = path.posix.basename(expectedPath);
   const matches = sevenZipEntries(listing).filter((entry) => {
     const normalized = entry.Path.replaceAll("\\", "/");
-    return path.posix.basename(normalized) === expectedBasename;
+    return windowsNameSemantics
+      ? windowsArchiveBasename(normalized) === windowsArchiveBasename(expectedBasename)
+      : path.posix.basename(normalized) === expectedBasename;
   });
   invariant(matches.length === 1, `${label}: expected exactly one ${expectedBasename}; found ${matches.length}`);
   const normalized = matches[0].Path.replaceAll("\\", "/");
@@ -569,6 +605,7 @@ export function inspectWindowsReleaseArchitecture({ root, assetsRoot, version, s
     NSIS_APPLICATION,
     "NSIS application payload",
     MAX_APPLICATION_BYTES,
+    { windowsNameSemantics: true },
   );
   const summaryEntry = requireUniqueArchiveEntry(
     listArchive(sevenZip, "Compound", msi),

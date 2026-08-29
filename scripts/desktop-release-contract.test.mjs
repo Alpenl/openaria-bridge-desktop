@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -16,6 +16,7 @@ import {
   validateLatestManifest,
   validatePublishedReleaseMetadata,
   validateVersionSources,
+  verifyReleaseSignatures,
 } from "./desktop-release-contract.mjs";
 import {
   draftOwnershipMarker,
@@ -187,6 +188,16 @@ test("archive entry gates reject missing, duplicate, nested, and oversized paylo
     () => requireUniqueArchiveEntry(`${listing}\n${listing}`, "ylx-transfer.exe", "NSIS application"),
     /expected exactly one/,
   );
+  for (const collidingName of ["YLX-TRANSFER.EXE", "ylx-transfer.exe.", "ylx-transfer.exe "]) {
+    const collision = `${listing}\nPath = ${collidingName}\nSize = 33713152\nPacked Size =\n`;
+    assert.throws(
+      () =>
+        requireUniqueArchiveEntry(collision, "ylx-transfer.exe", "NSIS application", 64 * 1024 * 1024, {
+          windowsNameSemantics: true,
+        }),
+      /expected exactly one .* found 2/,
+    );
+  }
   assert.throws(
     () =>
       requireUniqueArchiveEntry("Path = nested/ylx-transfer.exe\nSize = 10\n", "ylx-transfer.exe", "NSIS application"),
@@ -196,6 +207,49 @@ test("archive entry gates reject missing, duplicate, nested, and oversized paylo
     () => requireUniqueArchiveEntry(listing, "ylx-transfer.exe", "NSIS application", 1024),
     /exceeds the byte limit/,
   );
+});
+
+test("signature verification removes its exact scratch directory on success and verifier failure", (context) => {
+  const temporary = mkdtempSync(path.join(tmpdir(), "desktop-release-signature-cleanup-"));
+  context.after(() => rmSync(temporary, { recursive: true, force: true }));
+  const assets = path.join(temporary, "assets");
+  const scratchRoot = path.join(temporary, "scratch");
+  mkdirSync(assets);
+  mkdirSync(scratchRoot);
+  for (const name of [
+    `OpenAriaBridge_${VERSION}_windows_x86_64-setup.exe`,
+    `OpenAriaBridge_${VERSION}_windows_x86_64.msi`,
+  ]) {
+    writeFileSync(path.join(assets, name), "test asset");
+    writeFileSync(path.join(assets, `${name}.sig`), FAKE_SIGNATURE);
+  }
+  const request = {
+    root: assets,
+    updaterPubkey: Buffer.from("test updater public key").toString("base64"),
+    version: VERSION,
+  };
+
+  let verifierCalls = 0;
+  verifyReleaseSignatures(request, {
+    temporaryRoot: scratchRoot,
+    runVerifier: () => {
+      verifierCalls += 1;
+    },
+  });
+  assert.equal(verifierCalls, 2);
+  assert.deepEqual(readdirSync(scratchRoot), []);
+
+  assert.throws(
+    () =>
+      verifyReleaseSignatures(request, {
+        temporaryRoot: scratchRoot,
+        runVerifier: () => {
+          throw new Error("controlled verifier failure");
+        },
+      }),
+    /controlled verifier failure/,
+  );
+  assert.deepEqual(readdirSync(scratchRoot), []);
 });
 
 test("source versions and Windows bundle targets have one release authority", () => {
