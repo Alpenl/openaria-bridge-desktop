@@ -1788,6 +1788,25 @@ async function freeTcpPort() {
   return port;
 }
 
+function createWebviewAutomationProfile() {
+  return mkdtempSync(path.join(os.tmpdir(), "openaria-webview2-acceptance-"));
+}
+
+function removeWebviewAutomationProfile(folder, evidence) {
+  if (!folder) return;
+  try {
+    rmSync(folder, { recursive: true, force: true, maxRetries: 8, retryDelay: 250 });
+    evidence?.event("webview2_user_data_folder_removed", { folder });
+  } catch (error) {
+    // WebView2 may keep a short-lived child process after the app exits. Cleanup
+    // is best effort so a locked runner temp file cannot mask the acceptance result.
+    evidence?.event("webview2_user_data_folder_cleanup_failed", {
+      folder,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
 class CdpClient {
   constructor(websocket) {
     this.websocket = websocket;
@@ -1865,19 +1884,40 @@ class CdpClient {
 }
 
 async function webviewTargets(port) {
-  const response = await globalThis.fetch(`http://127.0.0.1:${port}/json/list`, {
-    signal: globalThis.AbortSignal.timeout(2_000),
-  });
-  if (!response.ok) throw new Error(`WebView2 CDP endpoint returned HTTP ${response.status}`);
-  return response.json();
+  const errors = [];
+  for (const host of ["127.0.0.1", "localhost", "[::1]"]) {
+    try {
+      const response = await globalThis.fetch(`http://${host}:${port}/json/list`, {
+        signal: globalThis.AbortSignal.timeout(2_000),
+      });
+      if (!response.ok) throw new Error(`WebView2 CDP endpoint returned HTTP ${response.status}`);
+      return response.json();
+    } catch (error) {
+      errors.push(`${host}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  throw new Error(`WebView2 CDP endpoint unavailable on port ${port} (${errors.join("; ")})`);
 }
 
-async function connectAppWebview(port, excludedTargetId = null, timeoutMs = APP_START_TIMEOUT_MS) {
+async function connectAppWebview(port, excludedTargetId = null, timeoutMs = APP_START_TIMEOUT_MS, evidence = null) {
   const deadline = Date.now() + timeoutMs;
+  const startedAt = Date.now();
+  let attempts = 0;
+  let endpointSuccesses = 0;
+  let lastTargets = [];
   let lastError;
   while (Date.now() < deadline) {
+    attempts += 1;
     try {
       const targets = await webviewTargets(port);
+      endpointSuccesses += 1;
+      lastTargets = targets.map((target) => ({
+        id: target.id ?? null,
+        type: target.type ?? null,
+        title: target.title ?? null,
+        url: target.url ?? null,
+        has_websocket: Boolean(target.webSocketDebuggerUrl),
+      }));
       for (const target of targets) {
         if (target.id === excludedTargetId || target.type !== "page" || !target.webSocketDebuggerUrl) continue;
         let client;
@@ -1897,9 +1937,17 @@ async function connectAppWebview(port, excludedTargetId = null, timeoutMs = APP_
     }
     await delay(500);
   }
-  throw new Error(
-    `Open Aria Bridge WebView2 target was not observable: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
-  );
+  const diagnostics = {
+    port,
+    excluded_target_id: excludedTargetId,
+    attempts,
+    endpoint_successes: endpointSuccesses,
+    elapsed_ms: Date.now() - startedAt,
+    last_targets: lastTargets,
+    last_error: lastError instanceof Error ? lastError.message : String(lastError ?? "none"),
+  };
+  evidence?.event("webview2_observation_failed", diagnostics);
+  throw new Error(`Open Aria Bridge WebView2 target was not observable: ${JSON.stringify(diagnostics)}`);
 }
 
 const UPDATE_UI_STATE = `(() => {
@@ -2111,6 +2159,7 @@ async function runAcceptance({ root, config, version, baselineRoot, candidateRoo
   let oldClient;
   let newProcess;
   let controlled;
+  let webviewUserDataFolder;
   try {
     evidence.set("runner", {
       platform: process.platform,
@@ -2154,9 +2203,14 @@ async function runAcceptance({ root, config, version, baselineRoot, candidateRoo
     });
 
     const debugPort = await freeTcpPort();
+    // WebView2 shares a browser process per user-data folder. A unique folder
+    // guarantees that this run's remote-debugging argument is applied instead
+    // of being ignored by a browser process left by another application/run.
+    webviewUserDataFolder = createWebviewAutomationProfile();
     const appEnvironment = {
       ...process.env,
       WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${debugPort}`,
+      WEBVIEW2_USER_DATA_FOLDER: webviewUserDataFolder,
       NO_PROXY: "github.com,127.0.0.1,localhost",
       no_proxy: "github.com,127.0.0.1,localhost",
     };
@@ -2178,9 +2232,10 @@ async function runAcceptance({ root, config, version, baselineRoot, candidateRoo
       pid: oldPid,
       executable: installedBootstrap.executable,
       debug_port: debugPort,
+      webview2_user_data_folder: webviewUserDataFolder,
     });
 
-    const oldWebview = await connectAppWebview(debugPort);
+    const oldWebview = await connectAppWebview(debugPort, null, APP_START_TIMEOUT_MS, evidence);
     oldClient = oldWebview.client;
     evidence.event("bootstrap_webview_attached", {
       target_id: oldWebview.target.id,
@@ -2301,7 +2356,7 @@ async function runAcceptance({ root, config, version, baselineRoot, candidateRoo
 
     oldClient.close();
     oldClient = null;
-    const newWebview = await connectAppWebview(debugPort, oldWebview.target.id, APP_START_TIMEOUT_MS);
+    const newWebview = await connectAppWebview(debugPort, oldWebview.target.id, APP_START_TIMEOUT_MS, evidence);
     const newClient = newWebview.client;
     try {
       evidence.event("target_webview_attached", {
@@ -2388,7 +2443,11 @@ async function runAcceptance({ root, config, version, baselineRoot, candidateRoo
         timeout: 15_000,
       });
     }
-    if (controlled?.cleaned !== true) restoreControlledEnvironment(controlled?.tls, controlled?.hosts, evidence);
+    try {
+      if (controlled?.cleaned !== true) restoreControlledEnvironment(controlled?.tls, controlled?.hosts, evidence);
+    } finally {
+      removeWebviewAutomationProfile(webviewUserDataFolder, evidence);
+    }
   }
 }
 
