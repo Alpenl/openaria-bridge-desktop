@@ -322,6 +322,8 @@ test("Release is staged, accepted through the old production updater, then publi
   assert.match(acceptanceClient, /webview2_debug_policy_restored/);
   assert.match(acceptanceClient, /created_keys = @\(\$createdKeys\)/);
   assert.match(acceptanceClient, /Sort-Object \{ \$_\.Length \} -Descending/);
+  assert.doesNotMatch(acceptanceClient, /Get-Member -MemberType NoteProperty/);
+  assert.match(acceptanceClient, /\$key\.GetValueNames\(\)/);
   assert.match(acceptanceClient, /GetSubKeyNames\(\)/);
   assert.match(acceptanceClient, /webview2_debug_environment_overrides_removed/);
   assert.match(acceptanceClient, /delete appEnvironment\[name\]/);

@@ -1991,11 +1991,8 @@ if (Test-Path -LiteralPath $keyPath) {
     }
   } else {
     Remove-ItemProperty -LiteralPath $keyPath -Name $valueName -Force -ErrorAction SilentlyContinue
-    $remaining = @(Get-ItemProperty -LiteralPath $keyPath -ErrorAction SilentlyContinue |
-      Get-Member -MemberType NoteProperty |
-      Where-Object { $_.Name -notmatch "^PS" })
-    $children = @(Get-ChildItem -LiteralPath $keyPath -ErrorAction SilentlyContinue)
-    if ($remaining.Count -eq 0 -and $children.Count -eq 0) {
+    $key = Get-Item -LiteralPath $keyPath -ErrorAction Stop
+    if (@($key.GetValueNames()).Count -eq 0 -and @($key.GetSubKeyNames()).Count -eq 0) {
       Remove-Item -LiteralPath $keyPath -Force -ErrorAction SilentlyContinue
     }
   }
