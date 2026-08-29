@@ -121,11 +121,15 @@ test("postverify rejects x86 payloads and malformed PE or MSI architecture bytes
   const x86 = portableExecutable(0x14c, 0x10b);
   const x64Summary = msiSummaryInformation();
   const x86Summary = msiSummaryInformation({ template: "Intel;0", pageCount: 200 });
+  const localizedSummary = msiSummaryInformation({ template: "x64;1033" });
+  const mixedLanguageSummary = msiSummaryInformation({ template: "x64;0,1033" });
   const staleSchema = msiSummaryInformation({ pageCount: 150 });
   const tamperedPe = Buffer.from(setup);
   tamperedPe.write("PX\0\0", 0x80, "binary");
   const tamperedSummary = Buffer.from(x64Summary);
   tamperedSummary.writeUInt32LE(0xfffffff0, 60);
+
+  assert.deepEqual(parseMsiSummaryInformation(mixedLanguageSummary).languages, ["0", "1033"]);
 
   assert.throws(
     () =>
@@ -145,6 +149,17 @@ test("postverify rejects x86 payloads and malformed PE or MSI architecture bytes
       }),
     /MSI Template platform Intel does not target x64/,
   );
+  for (const summary of [localizedSummary, mixedLanguageSummary]) {
+    assert.throws(
+      () =>
+        validateWindowsBundleArchitecture({
+          setupBytes: setup,
+          applicationBytes: x64,
+          msiSummaryBytes: summary,
+        }),
+      /MSI Template languages .* differ from the canonical language-neutral closure 0/,
+    );
+  }
   assert.throws(
     () =>
       validateWindowsBundleArchitecture({

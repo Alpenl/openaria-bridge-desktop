@@ -422,7 +422,7 @@ export function parseMsiSummaryInformation(summary, label = "MSI") {
     `${label} PID_TEMPLATE is not canonical ASCII`,
   );
   const template = templateBytes.subarray(0, -1).toString("ascii");
-  const match = template.match(/^([^;,]+);(0|[1-9]\d*(?:,(?:0|[1-9]\d*))*)$/);
+  const match = template.match(/^([^;,]+);((?:0|[1-9]\d*)(?:,(?:0|[1-9]\d*))*)$/);
   invariant(match !== null, `${label} PID_TEMPLATE syntax is invalid`);
   invariant(summary.readUInt32LE(pageCountOffset) === 3, `${label} PID_PAGECOUNT must be VT_I4`);
   invariant(pageCountOffset + 8 <= sectionEnd, `${label} PID_PAGECOUNT is truncated`);
@@ -487,6 +487,10 @@ export function validateWindowsBundleArchitecture({
   const msi = parseMsiSummaryInformation(msiSummaryBytes, msiLabel);
   invariant(application.machine === PE_MACHINE_AMD64, `${applicationLabel} is not Windows x86_64`);
   invariant(msi.platform === "x64", `${msiLabel} Template platform ${msi.platform} does not target x64`);
+  invariant(
+    msi.languages.length === 1 && msi.languages[0] === "0",
+    `${msiLabel} Template languages ${msi.languages.join(",")} differ from the canonical language-neutral closure 0`,
+  );
   invariant(msi.page_count >= 200, `${msiLabel} Page Count ${msi.page_count} is below the x64 minimum 200`);
   return { application, msi, setup_stub: setup };
 }
