@@ -286,6 +286,8 @@ test("Release is staged, accepted through the old production updater, then publi
   const acceptanceClient = readFileSync(path.resolve(import.meta.dirname, "windows-updater-acceptance.mjs"), "utf8");
   assert.match(tauri, /Smoke controlled updater TLS certificate setup/);
   assert.match(tauri, /windows-updater-acceptance\.mjs smoke-controlled-tls/);
+  assert.match(tauri, /Smoke absent WebView2 policy value restoration/);
+  assert.match(tauri, /windows-updater-acceptance\.mjs smoke-webview-policy-restore/);
   assert.match(acceptanceClient, /Get-PSDrive -Name Cert/);
   assert.match(acceptanceClient, /New-PSDrive -Name Cert -PSProvider Certificate/);
   assert.match(acceptanceClient, /spawnSync\(\s*"pwsh\.exe"/);
@@ -301,6 +303,10 @@ test("Release is staged, accepted through the old production updater, then publi
   assert.doesNotMatch(acceptanceClient, /X509Store/);
   assert.doesNotMatch(acceptanceClient, /Import-Certificate/);
   assert.match(acceptanceClient, /command === "smoke-controlled-tls"/);
+  assert.match(acceptanceClient, /command === "smoke-webview-policy-restore"/);
+  assert.match(acceptanceClient, /policy\.key_existed === false/);
+  assert.match(acceptanceClient, /policy\.value_existed === false/);
+  assert.match(acceptanceClient, /created_keys_remaining/);
   assert.match(acceptanceClient, /createWebviewAutomationProfile\(\)/);
   assert.match(acceptanceClient, /webview2_user_data_folder: webviewUserDataFolder/);
   assert.match(acceptanceClient, /user_data_registry_path/);
