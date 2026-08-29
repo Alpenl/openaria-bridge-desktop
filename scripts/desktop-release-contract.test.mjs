@@ -244,6 +244,7 @@ test("Release is staged, accepted through the old production updater, then publi
   assert.ok(baselineStart >= 0 && tauriStart > baselineStart && draftStart > tauriStart);
   assert.ok(acceptanceStart > draftStart && publicationStart > acceptanceStart);
 
+  const baseline = workflow.slice(baselineStart, tauriStart);
   const draft = workflow.slice(draftStart, acceptanceStart);
   const acceptance = workflow.slice(acceptanceStart, publicationStart);
   const publication = workflow.slice(publicationStart);
@@ -282,6 +283,22 @@ test("Release is staged, accepted through the old production updater, then publi
   assert.match(acceptance, /--ownership release-candidate\/release-ownership\.json/);
   assert.match(acceptance, /Install unchanged public baseline and update through its production updater/);
   const acceptanceClient = readFileSync(path.resolve(import.meta.dirname, "windows-updater-acceptance.mjs"), "utf8");
+  const captureStart = acceptanceClient.indexOf("async function capturePrePublishBaseline(");
+  const recheckStart = acceptanceClient.indexOf("async function authenticatedGithubJson(");
+  const capture = acceptanceClient.slice(captureStart, recheckStart);
+  const historyStart = acceptanceClient.indexOf("async function fetchPublicReleaseHistory(");
+  const historyEnd = acceptanceClient.indexOf("export function validateDispatchPreflight(");
+  const history = acceptanceClient.slice(historyStart, historyEnd);
+  assert.match(
+    baseline,
+    /Capture latest before publishing the target Release[^]*GITHUB_TOKEN: \$\{\{ github\.token \}\}/,
+  );
+  assert.match(capture, /authenticatedGithubJson\([^]*releases\/latest/);
+  assert.match(capture, /authenticatedGithubJson\([^]*git\/ref\/tags/);
+  assert.match(history, /authenticatedGithubJson\(/);
+  assert.match(capture, /fetchBytes\(config\.updater_endpoint/);
+  assert.match(capture, /fetchBytes\([^]*"anonymous bootstrap installer"/);
+  assert.match(capture, /fetchBytes\([^]*"anonymous bootstrap signature"/);
   assert.doesNotMatch(acceptanceClient, /method:\s*["'](?:POST|PATCH|PUT|DELETE)["']/);
   assert.match(publication, /needs:[^]*windows-updater-acceptance/);
   assert.match(publication, /desktop-release-commit-point\.mjs publish/);
@@ -329,8 +346,9 @@ test("Release history closure parses bounded JSON pages instead of a pagination 
   const acceptance = readFileSync(path.resolve(import.meta.dirname, "windows-updater-acceptance.mjs"), "utf8");
   const commitPoint = readFileSync(path.resolve(import.meta.dirname, "desktop-release-commit-point.mjs"), "utf8");
   assert.match(acceptance, /for \(let page = 1; page <= 20; page \+= 1\)/);
-  assert.match(acceptance, /parseJson\(pageBytes, `public Release history page \$\{page\}`\)/);
+  assert.match(acceptance, /authenticatedGithubJson\(url, `public Release history page \$\{page\}`\)/);
   assert.match(acceptance, /Array\.isArray\(releases\)/);
+  assert.doesNotMatch(acceptance, /fetchBytes\(url, `public Release history page \$\{page\}`\)/);
   assert.match(commitPoint, /for \(let page = 1; page <= 20; page \+= 1\)/);
   assert.match(commitPoint, /Array\.isArray\(values\)/);
   assert.doesNotMatch(`${acceptance}\n${commitPoint}`, /--paginate|\bslurp\b/);

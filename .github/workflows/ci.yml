@@ -312,6 +312,7 @@ jobs:
           "${tool_root}/minisign" -v
       - name: Capture latest before publishing the target Release
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.prepare.outputs.app_version }}
         run: >-
           node scripts/windows-updater-acceptance.mjs capture-baseline
