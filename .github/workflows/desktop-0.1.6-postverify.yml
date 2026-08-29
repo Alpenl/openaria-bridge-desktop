@@ -1,0 +1,148 @@
+name: Desktop 0.1.6 Read-only Postverify
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: openaria-desktop-release-publication
+  cancel-in-progress: false
+
+env:
+  RELEASE_VERSION: 0.1.6
+  RELEASE_ID: "379011766"
+  SOURCE_COMMIT: ab579abb92a03c1b8d3da7b3752fdfdf63051e1b
+  SOURCE_RUN_ID: "33257516567"
+  SOURCE_RUN_ATTEMPT: "1"
+  PREFLIGHT_ARTIFACT_ID: "9716255532"
+  CANDIDATE_ARTIFACT_ID: "9716434253"
+  ACCEPTANCE_ARTIFACT_ID: "9716450265"
+  PUBLICATION_ARTIFACT_ID: "9716456600"
+
+jobs:
+  verify:
+    name: immutable 0.1.6 anonymous bytes and source provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+      - name: Require owner dispatch from the current default-branch HEAD
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"
+          default_head="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${default_branch}" --jq .sha)"
+          test "${GITHUB_EVENT_NAME}" = "workflow_dispatch"
+          test "${GITHUB_RUN_ATTEMPT}" = "1"
+          test "${GITHUB_ACTOR}" = "${GITHUB_REPOSITORY_OWNER}"
+          test "${GITHUB_REF}" = "refs/heads/${default_branch}"
+          test "${GITHUB_SHA}" = "${default_head}"
+      - name: Download exact owned candidate by numeric artifact ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          artifact-ids: ${{ env.CANDIDATE_ARTIFACT_ID }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: source-candidate
+      - name: Download exact pre-publish acceptance by numeric artifact ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          artifact-ids: ${{ env.ACCEPTANCE_ARTIFACT_ID }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: source-acceptance
+      - name: Download exact immutable-setting preflight by numeric artifact ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          artifact-ids: ${{ env.PREFLIGHT_ARTIFACT_ID }}
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: source-preflight
+      - name: Download and verify pinned postverify tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_root="${RUNNER_TEMP}/openaria-postverify-tools"
+          mkdir -p "${tool_root}"
+          archive="${tool_root}/$(node -p 'require("./scripts/release-tools.json").minisign.archive')"
+          url="$(node -p 'require("./scripts/release-tools.json").minisign.url')"
+          expected_bytes="$(node -p 'require("./scripts/release-tools.json").minisign.bytes')"
+          expected_sha="$(node -p 'require("./scripts/release-tools.json").minisign.sha256')"
+          binary_path="$(node -p 'require("./scripts/release-tools.json").minisign.binary_path')"
+          curl --fail --location --silent --show-error --retry 3 --retry-all-errors \
+            --connect-timeout 20 --max-time 120 --max-filesize "${expected_bytes}" \
+            "${url}" --output "${archive}"
+          test "$(wc -c < "${archive}")" = "${expected_bytes}"
+          echo "${expected_sha}  ${archive}" | sha256sum --check --strict
+          tar -xzf "${archive}" -C "${tool_root}"
+          install -m 0755 "${tool_root}/${binary_path}" "${tool_root}/minisign"
+
+          seven_archive="${tool_root}/$(node -p 'require("./scripts/release-tools.json").seven_zip.archive')"
+          seven_url="$(node -p 'require("./scripts/release-tools.json").seven_zip.url')"
+          seven_bytes="$(node -p 'require("./scripts/release-tools.json").seven_zip.bytes')"
+          seven_sha="$(node -p 'require("./scripts/release-tools.json").seven_zip.sha256')"
+          seven_binary_path="$(node -p 'require("./scripts/release-tools.json").seven_zip.binary_path')"
+          seven_binary_bytes="$(node -p 'require("./scripts/release-tools.json").seven_zip.binary_bytes')"
+          seven_binary_sha="$(node -p 'require("./scripts/release-tools.json").seven_zip.binary_sha256')"
+          curl --fail --location --silent --show-error --retry 3 --retry-all-errors \
+            --connect-timeout 20 --max-time 120 --max-filesize "${seven_bytes}" \
+            "${seven_url}" --output "${seven_archive}"
+          test "$(wc -c < "${seven_archive}")" = "${seven_bytes}"
+          echo "${seven_sha}  ${seven_archive}" | sha256sum --check --strict
+          tar -xJf "${seven_archive}" -C "${tool_root}"
+          seven_binary="${tool_root}/${seven_binary_path}"
+          test "$(wc -c < "${seven_binary}")" = "${seven_binary_bytes}"
+          echo "${seven_binary_sha}  ${seven_binary}" | sha256sum --check --strict
+          chmod 0755 "${seven_binary}"
+          echo "${tool_root}" >> "${GITHUB_PATH}"
+          echo "OPENARIA_SEVEN_ZIP=${seven_binary}" >> "${GITHUB_ENV}"
+      - name: Verify immutable 0.1.6 source and anonymous published bytes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          node scripts/desktop-release-postverify.mjs verify
+          --repository "${GITHUB_REPOSITORY}"
+          --version "${RELEASE_VERSION}"
+          --release-id "${RELEASE_ID}"
+          --source-commit "${SOURCE_COMMIT}"
+          --source-run-id "${SOURCE_RUN_ID}"
+          --source-run-attempt "${SOURCE_RUN_ATTEMPT}"
+          --preflight-artifact-id "${PREFLIGHT_ARTIFACT_ID}"
+          --candidate-artifact-id "${CANDIDATE_ARTIFACT_ID}"
+          --acceptance-artifact-id "${ACCEPTANCE_ARTIFACT_ID}"
+          --publication-artifact-id "${PUBLICATION_ARTIFACT_ID}"
+          --preflight source-preflight
+          --candidate source-candidate
+          --acceptance source-acceptance
+          --seven-zip "${OPENARIA_SEVEN_ZIP}"
+          --verifier-commit "${GITHUB_SHA}"
+          --output published-release-verification
+      - name: Upload read-only postpublish evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: openaria-read-only-postverify-0.1.6-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+          path: published-release-verification

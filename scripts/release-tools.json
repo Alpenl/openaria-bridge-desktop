@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "minisign": {
     "version": "0.12",
     "target": "linux-x86_64",
@@ -10,5 +10,18 @@
     "binary_path": "minisign-linux/x86_64/minisign",
     "license": "ISC",
     "source": "https://github.com/jedisct1/minisign/tree/0.12"
+  },
+  "seven_zip": {
+    "version": "26.02",
+    "target": "linux-x86_64",
+    "archive": "7z2602-linux-x64.tar.xz",
+    "url": "https://www.7-zip.org/a/7z2602-linux-x64.tar.xz",
+    "sha256": "41aaba7b1235304ab5aa0624530c67ae829496cd29e875925271efdccc28c03e",
+    "bytes": 1571416,
+    "binary_path": "7zz",
+    "binary_sha256": "1676a968815b92e865bc0ffeecee3fa284ba4402bf23dc2bec2412c4b502e922",
+    "binary_bytes": 2882112,
+    "license": "LGPL-2.1-or-later AND BSD-3-Clause AND LicenseRef-unRAR-restriction",
+    "source": "https://github.com/ip7z/7zip/tree/26.02"
   }
 }
