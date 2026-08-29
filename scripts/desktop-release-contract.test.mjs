@@ -301,6 +301,11 @@ test("Release is staged, accepted through the old production updater, then publi
   assert.doesNotMatch(acceptanceClient, /X509Store/);
   assert.doesNotMatch(acceptanceClient, /Import-Certificate/);
   assert.match(acceptanceClient, /command === "smoke-controlled-tls"/);
+  assert.match(acceptanceClient, /createWebviewAutomationProfile\(\)/);
+  assert.match(acceptanceClient, /WEBVIEW2_USER_DATA_FOLDER: webviewUserDataFolder/);
+  assert.match(acceptanceClient, /webview2_user_data_folder: webviewUserDataFolder/);
+  assert.match(acceptanceClient, /webview2_observation_failed/);
+  assert.match(acceptanceClient, /removeWebviewAutomationProfile\(webviewUserDataFolder, evidence\)/);
   const captureStart = acceptanceClient.indexOf("async function capturePrePublishBaseline(");
   const recheckStart = acceptanceClient.indexOf("async function authenticatedGithubJson(");
   const capture = acceptanceClient.slice(captureStart, recheckStart);
