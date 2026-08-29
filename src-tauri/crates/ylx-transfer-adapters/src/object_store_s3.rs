@@ -8,8 +8,9 @@
 //! # What this implements
 //!
 //! `CreateMultipartUpload` → `UploadPart` (per part) → `CompleteMultipartUpload`
-//! → `HeadObject`-based `verify_object`, plus `AbortMultipartUpload` for
-//! cleanup. Uses [`rusty_s3`] (a Sans-IO SigV4 signing library — it builds
+//! → `HeadObject`-based `verify_object`, plus immutable PUT, bounded GET,
+//! bounded `ListObjectsV2`, and `AbortMultipartUpload` for cleanup. Uses
+//! [`rusty_s3`] (a Sans-IO SigV4 signing library — it builds
 //! and signs presigned URLs but performs no I/O itself) to do the actual
 //! request signing, and [`ureq`] (a small blocking HTTP client, rustls by
 //! default, no async runtime) to send them. This keeps the adapter blocking
@@ -23,8 +24,8 @@
 //!
 //! # Completion binding and real digests (issue #1, commits 69/70)
 //!
-//! [`ObjectStorePort::verify_completed_object`] issues its HEAD (and, when
-//! it needs one, its GET) **at the completion's `versionId`** and rejects
+//! [`ObjectStorePort::verify_completed_object`] issues its HEAD and its GET
+//! **at the completion's `versionId`** and rejects
 //! any read-back whose ETag/version id is not the one
 //! `CompleteMultipartUpload` returned. On a bucket without versioning
 //! there is no version to pin, so the ETag comparison is the whole
@@ -32,10 +33,11 @@
 //! ([`ObjectStoreError::CompletionMismatch`]) rather than certifying
 //! whatever another writer left at the key.
 //!
-//! Content digests are never taken on faith from metadata: if HEAD
-//! reports a trusted **full-object** `x-amz-checksum-sha256` it is used,
-//! otherwise the object is streamed back through a SHA-256 hasher (64 KiB
-//! at a time, never buffered whole). A checksum header that is present but
+//! Content digests are never taken on faith from metadata or a HEAD
+//! checksum. Every verification streams the exact remote object through a
+//! SHA-256 hasher (64 KiB at a time, never buffered whole), and binds that
+//! GET to HEAD's size, ETag, version, source-digest metadata, and any
+//! full-object server checksum. A checksum header that is present but
 //! unusable is [`ObjectStoreError::MalformedChecksum`] — fail closed.
 //!
 //! # Transport policy pinned by this adapter
@@ -58,7 +60,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use rusty_s3::actions::{
     AbortMultipartUpload, CompleteMultipartUpload, CreateMultipartUpload, GetObject, HeadObject,
-    UploadPart as S3UploadPartAction,
+    ListObjectsV2, PutObject, UploadPart as S3UploadPartAction,
 };
 use rusty_s3::{Bucket, Credentials, S3Action};
 use sha2::{Digest, Sha256};
@@ -66,14 +68,20 @@ use ureq::{http, Agent};
 
 pub use rusty_s3::UrlStyle;
 use ylx_transfer_core::library::object_store_port::{
-    CompletedUpload, DigestProof, ExpectedObject, InitiateUploadRequest, MultipartUploadHandle,
-    ObjectKey, ObjectStoreError, ObjectStorePort, PartETag, PartNumber, SourceSha256, UploadId,
-    VerifiedObjectReceipt,
+    sha256_of, CompletedUpload, DigestProof, ExpectedObject, ImmutableObjectRequest,
+    InitiateUploadRequest, ListedObject, MultipartUploadHandle, ObjectKey, ObjectListPage,
+    ObjectReadback, ObjectStoreError, ObjectStorePort, PartETag, PartNumber, SourceSha256,
+    UploadId, VerifiedObjectReceipt,
 };
 
 /// Object metadata header carrying the caller-computed source hash.
 /// Never compared against a multipart ETag — see module docs.
 const SOURCE_SHA256_META_HEADER: &str = "x-amz-meta-source-sha256";
+
+/// Console writes admission acknowledgements with the shorter Boto3
+/// metadata spelling. Exact byte verification does not trust either header,
+/// but exposing both lets callers retain useful transport evidence.
+const SHA256_META_HEADER: &str = "x-amz-meta-sha256";
 
 /// S3's own server-side SHA-256 checksum of the stored object, when the
 /// backend keeps one. Base64, not hex.
@@ -357,17 +365,20 @@ impl S3ObjectStore {
         ObjectStoreError::Network(sanitize_remote_text(raw.as_bytes(), &self.credentials))
     }
 
-    /// Streams the object back through a SHA-256 hasher without ever
-    /// holding it in memory. This is commit 70's fallback for backends
-    /// with no trusted full-object checksum, and it reads exactly the
-    /// version it is asked for.
+    /// Streams one HEAD-bound object version through a SHA-256 hasher
+    /// without ever holding the object in memory. The response must repeat
+    /// the same transport identity and metadata before any body bytes are
+    /// accepted. HEAD's bound size is the hard byte ceiling; a GET
+    /// `Content-Length`, when the transport preserves one, must repeat it.
+    /// Chunked S3 proxies remain compatible without turning verification
+    /// into an unbounded read.
     fn streamed_content_digest(
         &self,
         key: &ObjectKey,
-        version_id: Option<&str>,
-    ) -> Result<(SourceSha256, u64), ObjectStoreError> {
+        head: &HeadFacts,
+    ) -> Result<(SourceSha256, u64, ServerChecksum), ObjectStoreError> {
         let mut action = GetObject::new(&self.bucket, Some(&self.credentials), &key.0);
-        if let Some(version) = version_id {
+        if let Some(version) = head.version_id.as_deref() {
             action.query_mut().insert("versionId", version.to_string());
         }
         let url = action.sign(SIGNED_URL_TTL);
@@ -404,6 +415,73 @@ impl S3ObjectStore {
             ));
         }
 
+        if let Some(raw_content_length) =
+            exactly_one_object_header(key, &headers, "content-length", "GET")?
+        {
+            let content_length = raw_content_length.parse::<u64>().map_err(|error| {
+                ObjectStoreError::VerificationMismatch {
+                    key: key.clone(),
+                    detail: format!("GET Content-Length is not an unsigned decimal: {error}"),
+                }
+            })?;
+            if content_length != head.content_length {
+                return Err(ObjectStoreError::VerificationMismatch {
+                    key: key.clone(),
+                    detail: format!(
+                        "GET Content-Length {content_length} does not match HEAD {}",
+                        head.content_length
+                    ),
+                });
+            }
+        }
+
+        let etag = required_readback_header(key, &headers, "etag")?
+            .trim_matches('"')
+            .to_string();
+        if etag.is_empty() || etag != head.etag {
+            return Err(ObjectStoreError::VerificationMismatch {
+                key: key.clone(),
+                detail: format!("GET ETag {etag:?} does not match HEAD {:?}", head.etag),
+            });
+        }
+
+        let version_id = exactly_one_object_header(key, &headers, "x-amz-version-id", "GET")?;
+        if version_id != head.version_id.as_deref() {
+            return Err(ObjectStoreError::VerificationMismatch {
+                key: key.clone(),
+                detail: format!(
+                    "GET version {:?} does not match HEAD {:?}",
+                    version_id, head.version_id
+                ),
+            });
+        }
+
+        let source_sha256 = SourceSha256::from_hex(required_readback_header(
+            key,
+            &headers,
+            SOURCE_SHA256_META_HEADER,
+        )?)
+        .map_err(|error| ObjectStoreError::MalformedChecksum {
+            key: key.clone(),
+            detail: format!("GET {SOURCE_SHA256_META_HEADER} is not a valid SHA-256: {error}"),
+        })?;
+        if source_sha256 != head.source_sha256 {
+            return Err(ObjectStoreError::VerificationMismatch {
+                key: key.clone(),
+                detail: format!(
+                    "GET source_sha256 metadata {} does not match HEAD {}",
+                    source_sha256, head.source_sha256
+                ),
+            });
+        }
+
+        // Duplicate checksum headers are ambiguous even when one value looks
+        // usable. `parse_server_checksum` then retains its existing strict
+        // FULL_OBJECT/COMPOSITE semantics.
+        let _ = exactly_one_object_header(key, &headers, CHECKSUM_SHA256_HEADER, "GET")?;
+        let _ = exactly_one_object_header(key, &headers, CHECKSUM_TYPE_HEADER, "GET")?;
+        let get_server_checksum = parse_server_checksum(key, &headers)?;
+
         let mut reader = response.body_mut().as_reader();
         let mut hasher = Sha256::new();
         let mut buffer = vec![0u8; DIGEST_READ_CHUNK];
@@ -415,10 +493,37 @@ impl S3ObjectStore {
             if read == 0 {
                 break;
             }
+            total = total.checked_add(read as u64).ok_or_else(|| {
+                ObjectStoreError::VerificationMismatch {
+                    key: key.clone(),
+                    detail: "GET body length overflowed u64".to_string(),
+                }
+            })?;
+            if total > head.content_length {
+                return Err(ObjectStoreError::VerificationMismatch {
+                    key: key.clone(),
+                    detail: format!(
+                        "GET returned more than HEAD's bound {} bytes",
+                        head.content_length
+                    ),
+                });
+            }
             hasher.update(&buffer[..read]);
-            total = total.saturating_add(read as u64);
         }
-        Ok((SourceSha256::from_bytes(hasher.finalize().into()), total))
+        if total != head.content_length {
+            return Err(ObjectStoreError::VerificationMismatch {
+                key: key.clone(),
+                detail: format!(
+                    "GET returned {total} bytes but HEAD bound {}",
+                    head.content_length
+                ),
+            });
+        }
+        Ok((
+            SourceSha256::from_bytes(hasher.finalize().into()),
+            total,
+            get_server_checksum,
+        ))
     }
 
     /// Removes an object (all of it — no version pinning). Not part of
@@ -649,6 +754,235 @@ fn validate_contiguous(parts: &[PartETag]) -> Result<(), ObjectStoreError> {
 }
 
 impl ObjectStorePort for S3ObjectStore {
+    fn put_object_if_absent(
+        &self,
+        request: &ImmutableObjectRequest,
+    ) -> Result<bool, ObjectStoreError> {
+        if sha256_of(&request.bytes) != request.source_sha256 {
+            return Err(ObjectStoreError::Config(
+                "immutable object bytes do not match source_sha256".to_string(),
+            ));
+        }
+        let sha_hex = request.source_sha256.to_hex();
+        let mut action = PutObject::new(&self.bucket, Some(&self.credentials), &request.key.0);
+        action
+            .headers_mut()
+            .insert("if-none-match", "*".to_string());
+        action
+            .headers_mut()
+            .insert(SOURCE_SHA256_META_HEADER, sha_hex.clone());
+        action
+            .headers_mut()
+            .insert("content-type", request.content_type.clone());
+        let url = action.sign(SIGNED_URL_TTL);
+        let headers = [
+            ("if-none-match", "*"),
+            (SOURCE_SHA256_META_HEADER, sha_hex.as_str()),
+            ("content-type", request.content_type.as_str()),
+        ];
+        let response = self.send_upload(http::Method::PUT, url, &headers, request.bytes.clone())?;
+        match response.status {
+            200 | 201 => Ok(true),
+            412 => Ok(false),
+            _ => Err(map_error_response(
+                &response,
+                ErrorContext::Key(&request.key),
+                &self.credentials,
+            )),
+        }
+    }
+
+    fn read_object_bounded(
+        &self,
+        key: &ObjectKey,
+        maximum_bytes: u64,
+    ) -> Result<ObjectReadback, ObjectStoreError> {
+        let action = GetObject::new(&self.bucket, Some(&self.credentials), &key.0);
+        let url = action.sign(SIGNED_URL_TTL);
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(url.as_str())
+            .header(http::header::ACCEPT_ENCODING, "identity")
+            .body(Vec::new())
+            .map_err(|error| {
+                ObjectStoreError::Config(format!("failed to build bounded GET request: {error}"))
+            })?;
+        let mut response = self
+            .readback_agent
+            .run(request)
+            .map_err(|error| self.network_error("bounded object read failed", &error))?;
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        check_no_redirect(status, &headers, &self.credentials)?;
+        if status != 200 {
+            let (body, body_truncated) =
+                read_bounded_response_body(response.body_mut().as_reader()).map_err(|error| {
+                    self.network_error("failed reading bounded GET error response", &error)
+                })?;
+            return Err(map_error_response(
+                &RawResponse {
+                    status,
+                    headers,
+                    body,
+                    body_truncated,
+                },
+                ErrorContext::Key(key),
+                &self.credentials,
+            ));
+        }
+        let content_length = header_str(&headers, "content-length")
+            .ok_or_else(|| ObjectStoreError::VerificationMismatch {
+                key: key.clone(),
+                detail: "bounded GET response has no Content-Length".to_string(),
+            })?
+            .parse::<u64>()
+            .map_err(|error| ObjectStoreError::VerificationMismatch {
+                key: key.clone(),
+                detail: format!("bounded GET Content-Length is invalid: {error}"),
+            })?;
+        if content_length > maximum_bytes {
+            return Err(ObjectStoreError::VerificationMismatch {
+                key: key.clone(),
+                detail: format!(
+                    "object is {content_length} bytes, exceeding bounded read limit {maximum_bytes}"
+                ),
+            });
+        }
+        let capacity = usize::try_from(content_length).map_err(|_| {
+            ObjectStoreError::VerificationMismatch {
+                key: key.clone(),
+                detail: "bounded GET Content-Length does not fit this platform".to_string(),
+            }
+        })?;
+        let mut bytes = Vec::with_capacity(capacity);
+        let mut reader = response.body_mut().as_reader();
+        let mut chunk = vec![0_u8; DIGEST_READ_CHUNK];
+        loop {
+            let read = reader.read(&mut chunk).map_err(|error| {
+                self.network_error("failed reading bounded GET response", &error)
+            })?;
+            if read == 0 {
+                break;
+            }
+            if bytes.len().saturating_add(read) > capacity {
+                return Err(ObjectStoreError::VerificationMismatch {
+                    key: key.clone(),
+                    detail: "bounded GET returned more bytes than Content-Length".to_string(),
+                });
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        if bytes.len() != capacity {
+            return Err(ObjectStoreError::VerificationMismatch {
+                key: key.clone(),
+                detail: format!(
+                    "bounded GET returned {} bytes, expected {content_length}",
+                    bytes.len()
+                ),
+            });
+        }
+        let etag = header_str(&headers, "etag")
+            .map(|value| value.trim_matches('"').to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ObjectStoreError::VerificationMismatch {
+                key: key.clone(),
+                detail: "bounded GET response has no ETag".to_string(),
+            })?;
+        let source_sha256_metadata = header_str(&headers, SOURCE_SHA256_META_HEADER)
+            .or_else(|| header_str(&headers, SHA256_META_HEADER))
+            .map(SourceSha256::from_hex)
+            .transpose()?;
+        Ok(ObjectReadback {
+            key: key.clone(),
+            bytes,
+            etag,
+            version_id: header_str(&headers, "x-amz-version-id").map(str::to_string),
+            source_sha256_metadata,
+            content_type: header_str(&headers, "content-type").map(str::to_string),
+        })
+    }
+
+    fn list_objects_bounded(
+        &self,
+        prefix: &str,
+        maximum_keys: u16,
+    ) -> Result<ObjectListPage, ObjectStoreError> {
+        if !(1..=1000).contains(&maximum_keys) {
+            return Err(ObjectStoreError::Config(
+                "bounded object listing requires maximum_keys in 1..=1000".to_string(),
+            ));
+        }
+        let mut action = ListObjectsV2::new(&self.bucket, Some(&self.credentials));
+        action.with_prefix(prefix.to_string());
+        action.with_max_keys(usize::from(maximum_keys));
+        let url = action.sign(SIGNED_URL_TTL);
+        let response = self.send(http::Method::GET, url, &[], Vec::new())?;
+        let context_key = ObjectKey(prefix.to_string());
+        if response.status != 200 {
+            return Err(map_error_response(
+                &response,
+                ErrorContext::Key(&context_key),
+                &self.credentials,
+            ));
+        }
+        let body = std::str::from_utf8(&response.body).map_err(|error| {
+            ObjectStoreError::VerificationMismatch {
+                key: context_key.clone(),
+                detail: format!("ListObjectsV2 response is not UTF-8 XML: {error}"),
+            }
+        })?;
+        let parsed = ListObjectsV2::parse_response(body).map_err(|error| {
+            ObjectStoreError::VerificationMismatch {
+                key: context_key.clone(),
+                detail: format!("ListObjectsV2 response is invalid XML: {error}"),
+            }
+        })?;
+        if parsed.contents.len() > usize::from(maximum_keys) {
+            return Err(ObjectStoreError::VerificationMismatch {
+                key: context_key,
+                detail: format!(
+                    "ListObjectsV2 returned {} keys above requested maximum {maximum_keys}",
+                    parsed.contents.len()
+                ),
+            });
+        }
+        let advertised_truncation = match extract_xml_tag(body, "IsTruncated").as_deref() {
+            Some("true") => true,
+            Some("false") | None => false,
+            Some(other) => {
+                return Err(ObjectStoreError::VerificationMismatch {
+                    key: context_key,
+                    detail: format!("ListObjectsV2 IsTruncated is invalid: {other}"),
+                });
+            }
+        };
+        let mut objects = Vec::with_capacity(parsed.contents.len());
+        for object in parsed.contents {
+            if !object.key.starts_with(prefix) {
+                return Err(ObjectStoreError::VerificationMismatch {
+                    key: ObjectKey(object.key),
+                    detail: "ListObjectsV2 returned a key outside the requested prefix".to_string(),
+                });
+            }
+            let etag = object.etag.trim_matches('"').to_string();
+            if etag.is_empty() {
+                return Err(ObjectStoreError::VerificationMismatch {
+                    key: ObjectKey(object.key),
+                    detail: "ListObjectsV2 returned an object without an ETag".to_string(),
+                });
+            }
+            objects.push(ListedObject {
+                key: ObjectKey(object.key),
+                size_bytes: object.size,
+                etag,
+            });
+        }
+        Ok(ObjectListPage {
+            objects,
+            is_truncated: advertised_truncation || parsed.next_continuation_token.is_some(),
+        })
+    }
+
     fn initiate_multipart_upload(
         &self,
         request: InitiateUploadRequest,
@@ -880,6 +1214,7 @@ struct HeadFacts {
 }
 
 /// What the backend's own checksum headers are worth for this object.
+#[derive(Clone, Copy)]
 enum ServerChecksum {
     /// A trusted digest of the whole object's bytes.
     FullObject(SourceSha256),
@@ -891,6 +1226,44 @@ enum ServerChecksum {
 
 fn header_str<'h>(headers: &'h http::HeaderMap, name: &str) -> Option<&'h str> {
     headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+fn exactly_one_object_header<'h>(
+    key: &ObjectKey,
+    headers: &'h http::HeaderMap,
+    name: &str,
+    operation: &str,
+) -> Result<Option<&'h str>, ObjectStoreError> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ObjectStoreError::VerificationMismatch {
+            key: key.clone(),
+            detail: format!("{operation} response contains duplicate {name} headers"),
+        });
+    }
+    value
+        .to_str()
+        .map(Some)
+        .map_err(|_| ObjectStoreError::VerificationMismatch {
+            key: key.clone(),
+            detail: format!("{operation} response contains a non-text {name} header"),
+        })
+}
+
+fn required_readback_header<'h>(
+    key: &ObjectKey,
+    headers: &'h http::HeaderMap,
+    name: &str,
+) -> Result<&'h str, ObjectStoreError> {
+    exactly_one_object_header(key, headers, name, "GET")?.ok_or_else(|| {
+        ObjectStoreError::VerificationMismatch {
+            key: key.clone(),
+            detail: format!("GET response is missing {name}"),
+        }
+    })
 }
 
 /// Commit 70's "malformed/absent checksum" semantics, pinned in one place:
@@ -966,19 +1339,25 @@ impl S3ObjectStore {
             ));
         }
 
-        let content_length: u64 = header_str(&resp.headers, "content-length")
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| ObjectStoreError::ServerError {
-                status: resp.status,
-                detail: "HEAD response missing Content-Length".to_string(),
-            })?;
-        let etag = header_str(&resp.headers, "etag")
+        let content_length: u64 =
+            exactly_one_object_header(key, &resp.headers, "content-length", "HEAD")?
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| ObjectStoreError::ServerError {
+                    status: resp.status,
+                    detail: "HEAD response missing Content-Length".to_string(),
+                })?;
+        let etag = exactly_one_object_header(key, &resp.headers, "etag", "HEAD")?
             .map(|s| s.trim_matches('"').to_string())
             .ok_or_else(|| ObjectStoreError::ServerError {
                 status: resp.status,
                 detail: "HEAD response missing ETag".to_string(),
             })?;
-        let source_sha256_header = header_str(&resp.headers, SOURCE_SHA256_META_HEADER)
+        let source_sha256_header = exactly_one_object_header(
+            key,
+            &resp.headers,
+            SOURCE_SHA256_META_HEADER,
+            "HEAD",
+        )?
             .ok_or_else(|| ObjectStoreError::MalformedChecksum {
                 key: key.clone(),
                 detail: format!(
@@ -992,10 +1371,13 @@ impl S3ObjectStore {
             }
         })?;
 
+        let _ = exactly_one_object_header(key, &resp.headers, CHECKSUM_SHA256_HEADER, "HEAD")?;
+        let _ = exactly_one_object_header(key, &resp.headers, CHECKSUM_TYPE_HEADER, "HEAD")?;
         Ok(HeadFacts {
             content_length,
             etag,
-            version_id: header_str(&resp.headers, "x-amz-version-id").map(str::to_string),
+            version_id: exactly_one_object_header(key, &resp.headers, "x-amz-version-id", "HEAD")?
+                .map(str::to_string),
             source_sha256,
             server_checksum: parse_server_checksum(key, &resp.headers)?,
         })
@@ -1028,23 +1410,13 @@ impl S3ObjectStore {
             });
         }
 
-        let (actual, proof) = match head.server_checksum {
-            ServerChecksum::FullObject(digest) => (digest, DigestProof::ServerChecksum),
-            ServerChecksum::Unusable => {
-                let (digest, streamed_len) =
-                    self.streamed_content_digest(key, head.version_id.as_deref())?;
-                if streamed_len != head.content_length {
-                    return Err(ObjectStoreError::VerificationMismatch {
-                        key: key.clone(),
-                        detail: format!(
-                            "read-back returned {streamed_len} bytes but HEAD reported {} — the object changed under us",
-                            head.content_length
-                        ),
-                    });
-                }
-                (digest, DigestProof::StreamedReadback)
-            }
-        };
+        // HEAD metadata and even a backend-generated checksum are supporting
+        // evidence, not a substitute for reading the public bytes. Marker
+        // publication may proceed only after this exact object/version has
+        // survived a bounded streaming GET.
+        let (actual, streamed_len, get_server_checksum) =
+            self.streamed_content_digest(key, &head)?;
+        debug_assert_eq!(streamed_len, head.content_length);
         if actual != expected.source_sha256 {
             return Err(ObjectStoreError::DigestMismatch {
                 key: key.clone(),
@@ -1053,13 +1425,26 @@ impl S3ObjectStore {
             });
         }
 
+        for (source, checksum) in [("HEAD", head.server_checksum), ("GET", get_server_checksum)] {
+            if let ServerChecksum::FullObject(server_digest) = checksum {
+                if server_digest != actual {
+                    return Err(ObjectStoreError::VerificationMismatch {
+                        key: key.clone(),
+                        detail: format!(
+                            "{source} full-object checksum {server_digest} does not match streamed GET digest {actual}"
+                        ),
+                    });
+                }
+            }
+        }
+
         Ok(VerifiedObjectReceipt {
             key: key.clone(),
             etag: head.etag,
             version_id: head.version_id,
             size_bytes: head.content_length,
             source_sha256: head.source_sha256,
-            digest_proof: proof,
+            digest_proof: DigestProof::StreamedReadback,
         })
     }
 }
@@ -1087,8 +1472,9 @@ mod tests {
     use tiny_http::{Header, Response as TinyResponse, Server, StatusCode};
     use url::Url;
     use ylx_transfer_core::library::object_store_port::{
-        CompletedUpload, DigestProof, ExpectedObject, InitiateUploadRequest, MultipartUploadHandle,
-        ObjectKey, ObjectStoreError, ObjectStorePort, PartNumber, SourceSha256, UploadId,
+        CompletedUpload, DigestProof, ExpectedObject, ImmutableObjectRequest,
+        InitiateUploadRequest, MultipartUploadHandle, ObjectKey, ObjectStoreError, ObjectStorePort,
+        PartNumber, SourceSha256, UploadId,
     };
 
     use super::{
@@ -1267,7 +1653,16 @@ mod tests {
 
             stream
                 .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 3\r\nConnection: close\r\n\r\na",
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "Content-Type: application/octet-stream\r\n",
+                        "Content-Length: 3\r\n",
+                        "ETag: \"etag-slow\"\r\n",
+                        "x-amz-meta-source-sha256: ",
+                        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\r\n",
+                        "Connection: close\r\n\r\na"
+                    )
+                    .as_bytes(),
                 )
                 .expect("write first stored byte");
             stream.flush().expect("flush first stored byte");
@@ -1293,10 +1688,18 @@ mod tests {
         let mut config = test_config(endpoint);
         config.request_timeout = idle_timeout;
         let store = S3ObjectStore::new(config).expect("adapter constructs");
+        let expected_digest = SourceSha256::from_bytes(Sha256::digest(b"abc").into());
+        let head = super::HeadFacts {
+            content_length: 3,
+            etag: "etag-slow".to_string(),
+            version_id: None,
+            source_sha256: expected_digest,
+            server_checksum: super::ServerChecksum::Unusable,
+        };
 
         let started_at = std::time::Instant::now();
-        let (digest, size) = store
-            .streamed_content_digest(&ObjectKey("session/video.mp4".to_string()), None)
+        let (digest, size, _) = store
+            .streamed_content_digest(&ObjectKey("session/video.mp4".to_string()), &head)
             .expect("regular read progress must keep S3 verification alive");
         let elapsed = started_at.elapsed();
         server.join().expect("slow S3 server exits cleanly");
@@ -1306,10 +1709,159 @@ mod tests {
             "test transfer must exceed the configured idle timeout to prove it is not cumulative"
         );
         assert_eq!(size, 3);
+        assert_eq!(digest, expected_digest);
+    }
+
+    #[test]
+    fn immutable_put_signs_precondition_digest_and_content_type_headers() {
+        let (endpoint, rx, server) =
+            spawn_fake_s3_server(vec![(200, vec![], Vec::new()), (412, vec![], Vec::new())]);
+        let store = S3ObjectStore::new(test_config(endpoint)).expect("adapter constructs");
+        let bytes = b"{\"schema\":\"ylx.bucket-publication.v4\"}\n".to_vec();
+        let sha256 = SourceSha256::from_bytes(Sha256::digest(&bytes).into());
+        let sha256_hex = sha256.to_hex();
+        let request = ImmutableObjectRequest {
+            key: ObjectKey("publication/__ylx_evidence__/publication.json".to_string()),
+            bytes: bytes.clone(),
+            source_sha256: sha256,
+            content_type: "application/json".to_string(),
+        };
+
+        assert!(store
+            .put_object_if_absent(&request)
+            .expect("the first conditional PUT succeeds"));
+        assert!(!store
+            .put_object_if_absent(&request)
+            .expect("HTTP 412 is the typed already-exists result"));
+
+        for _ in 0..2 {
+            let captured = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("server captured conditional PUT");
+            assert_eq!(captured.method, "PUT");
+            assert_eq!(captured.body, bytes);
+            assert!(captured.url.contains("X-Amz-Signature="));
+            let header = |name: &str| {
+                captured
+                    .headers
+                    .iter()
+                    .find(|(observed, _)| observed.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value.as_str())
+            };
+            assert_eq!(header("if-none-match"), Some("*"));
+            assert_eq!(header("content-type"), Some("application/json"));
+            assert_eq!(
+                header(super::SOURCE_SHA256_META_HEADER),
+                Some(sha256_hex.as_str())
+            );
+        }
+        server.join().expect("fake S3 server exits cleanly");
+    }
+
+    #[test]
+    fn bounded_readback_requires_exact_length_and_preserves_object_identity() {
+        let bytes = b"exact-admission".to_vec();
+        let sha256 = SourceSha256::from_bytes(Sha256::digest(&bytes).into());
+        let headers = vec![
+            ("ETag", "\"etag-admission\"".to_string()),
+            ("x-amz-version-id", "version-7".to_string()),
+            (super::SOURCE_SHA256_META_HEADER, sha256.to_hex()),
+            ("Content-Type", "application/json".to_string()),
+        ];
+        let (endpoint, rx, server) = spawn_fake_s3_server(vec![
+            (200, headers.clone(), bytes.clone()),
+            (200, headers, bytes.clone()),
+        ]);
+        let store = S3ObjectStore::new(test_config(endpoint)).expect("adapter constructs");
+        let key = ObjectKey("publication/__ylx_evidence__/admission.json".to_string());
+
+        let readback = store
+            .read_object_bounded(&key, bytes.len() as u64)
+            .expect("exactly bounded GET succeeds");
+        assert_eq!(readback.key, key);
+        assert_eq!(readback.bytes, bytes);
+        assert_eq!(readback.etag, "etag-admission");
+        assert_eq!(readback.version_id.as_deref(), Some("version-7"));
+        assert_eq!(readback.source_sha256_metadata, Some(sha256));
+        assert_eq!(readback.content_type.as_deref(), Some("application/json"));
+
+        let error = store
+            .read_object_bounded(&key, bytes.len() as u64 - 1)
+            .expect_err("oversize Content-Length must fail before a truncated read");
+        assert!(matches!(
+            error,
+            ObjectStoreError::VerificationMismatch { key: failed, .. } if failed == key
+        ));
+        for _ in 0..2 {
+            let captured = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("server captured bounded GET");
+            assert_eq!(captured.method, "GET");
+            assert!(captured.url.contains("X-Amz-Signature="));
+            assert!(captured.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("accept-encoding") && value == "identity"
+            }));
+        }
+        server.join().expect("fake S3 server exits cleanly");
+    }
+
+    #[test]
+    fn bounded_listing_signs_prefix_and_preserves_size_and_truncation() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <EncodingType>url</EncodingType>
+  <MaxKeys>2</MaxKeys>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>next-page</NextContinuationToken>
+  <Contents>
+    <Key>publication%2F__ylx_evidence__%2Fadmission-019a0030.json</Key>
+    <LastModified>2026-08-29T00:00:00Z</LastModified>
+    <ETag>&quot;etag-1&quot;</ETag>
+    <Size>1129</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+  <Contents>
+    <Key>publication%2F__ylx_evidence__%2Fadmission-019a0031.json</Key>
+    <LastModified>2026-08-29T00:00:01Z</LastModified>
+    <ETag>&quot;etag-2&quot;</ETag>
+    <Size>1259</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+</ListBucketResult>"#
+            .to_vec();
+        let (endpoint, rx, server) = spawn_fake_s3_server(vec![(200, vec![], xml)]);
+        let store = S3ObjectStore::new(test_config(endpoint)).expect("adapter constructs");
+        let prefix = "publication/__ylx_evidence__/admission-";
+
+        let page = store
+            .list_objects_bounded(prefix, 2)
+            .expect("bounded signed ListObjectsV2 succeeds");
+        assert!(page.is_truncated);
+        assert_eq!(page.objects.len(), 2);
+        assert_eq!(page.objects[0].size_bytes, 1129);
+        assert_eq!(page.objects[0].etag, "etag-1");
         assert_eq!(
-            digest,
-            SourceSha256::from_bytes(Sha256::digest(b"abc").into())
+            page.objects[0].key.0,
+            "publication/__ylx_evidence__/admission-019a0030.json"
         );
+
+        let captured = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(captured.method, "GET");
+        let captured_url = Url::parse("http://127.0.0.1")
+            .unwrap()
+            .join(&captured.url)
+            .unwrap();
+        let query_value = |name: &str| {
+            captured_url
+                .query_pairs()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.into_owned())
+        };
+        assert_eq!(query_value("list-type").as_deref(), Some("2"));
+        assert_eq!(query_value("max-keys").as_deref(), Some("2"));
+        assert_eq!(query_value("prefix").as_deref(), Some(prefix));
+        assert!(captured.url.contains("X-Amz-Signature="));
+        server.join().expect("fake S3 server exits cleanly");
     }
 
     #[test]
@@ -1779,7 +2331,15 @@ mod tests {
                 ],
                 Vec::new(),
             ),
-            (200, vec![], stored.clone()),
+            (
+                200,
+                vec![
+                    ("ETag", "\"etag-1\"".to_string()),
+                    ("Content-Length", stored.len().to_string()),
+                    (super::SOURCE_SHA256_META_HEADER, claimed.to_hex()),
+                ],
+                stored.clone(),
+            ),
         ]);
         let store = S3ObjectStore::new(test_config(endpoint)).expect("adapter constructs");
 
@@ -1813,23 +2373,25 @@ mod tests {
         }
     }
 
-    /// A trusted full-object checksum makes the extra read unnecessary —
-    /// and the receipt says which proof was used.
+    /// A trusted full-object checksum is supporting evidence only. The
+    /// adapter must still GET the remote object and the receipt must say the
+    /// bytes were streamed back.
     #[test]
-    fn a_full_object_server_checksum_is_trusted_and_skips_the_read_back() {
+    fn a_full_object_server_checksum_still_requires_streamed_read_back() {
         let content = b"server-checksummed object".to_vec();
         let digest = SourceSha256::from_bytes(Sha256::digest(&content).into());
-        let (endpoint, rx, handle) = spawn_fake_s3_server(vec![(
-            200,
-            vec![
-                ("ETag", "\"etag-1\"".to_string()),
-                ("Content-Length", content.len().to_string()),
-                (super::SOURCE_SHA256_META_HEADER, digest.to_hex()),
-                (super::CHECKSUM_SHA256_HEADER, BASE64.encode(digest.0)),
-                (super::CHECKSUM_TYPE_HEADER, "FULL_OBJECT".to_string()),
-            ],
-            Vec::new(),
-        )]);
+        let identity_headers = vec![
+            ("ETag", "\"etag-1\"".to_string()),
+            ("x-amz-version-id", "version-1".to_string()),
+            ("Content-Length", content.len().to_string()),
+            (super::SOURCE_SHA256_META_HEADER, digest.to_hex()),
+            (super::CHECKSUM_SHA256_HEADER, BASE64.encode(digest.0)),
+            (super::CHECKSUM_TYPE_HEADER, "FULL_OBJECT".to_string()),
+        ];
+        let (endpoint, rx, handle) = spawn_fake_s3_server(vec![
+            (200, identity_headers.clone(), Vec::new()),
+            (200, identity_headers, content.clone()),
+        ]);
         let store = S3ObjectStore::new(test_config(endpoint)).expect("adapter constructs");
 
         let receipt = store
@@ -1842,14 +2404,130 @@ mod tests {
             )
             .expect("a matching trusted checksum verifies");
 
-        let _ = rx.recv_timeout(Duration::from_secs(5)).expect("HEAD sent");
+        let head = rx.recv_timeout(Duration::from_secs(5)).expect("HEAD sent");
+        let get = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("GET is mandatory even with a full-object checksum");
         handle.join().expect("server thread exits cleanly");
 
-        assert_eq!(receipt.digest_proof, DigestProof::ServerChecksum);
+        assert_eq!(head.method, "HEAD");
+        assert_eq!(get.method, "GET");
         assert!(
-            rx.recv_timeout(Duration::from_millis(200)).is_err(),
-            "a trusted full-object checksum must not trigger a read-back"
+            get.url.contains("versionId=version-1"),
+            "GET must pin the exact version returned by HEAD: {}",
+            get.url
         );
+        assert_eq!(receipt.version_id.as_deref(), Some("version-1"));
+        assert_eq!(receipt.digest_proof, DigestProof::StreamedReadback);
+    }
+
+    #[test]
+    fn matching_head_checksum_does_not_hide_get_failure_or_body_drift() {
+        let expected_bytes = b"expected remote bytes".to_vec();
+        let expected_digest = SourceSha256::from_bytes(Sha256::digest(&expected_bytes).into());
+        let head_headers = vec![
+            ("ETag", "\"etag-readback\"".to_string()),
+            ("Content-Length", expected_bytes.len().to_string()),
+            (super::SOURCE_SHA256_META_HEADER, expected_digest.to_hex()),
+            (
+                super::CHECKSUM_SHA256_HEADER,
+                BASE64.encode(expected_digest.0),
+            ),
+            (super::CHECKSUM_TYPE_HEADER, "FULL_OBJECT".to_string()),
+        ];
+        let key = ObjectKey("session/derived.mp4".to_string());
+        let expected = ExpectedObject {
+            size_bytes: expected_bytes.len() as u64,
+            source_sha256: expected_digest,
+        };
+        let marker_bytes = b"{\"schema\":\"ylx.bucket-publication.v4\"}\n".to_vec();
+        let marker = ImmutableObjectRequest {
+            key: ObjectKey("session/publication.json".to_string()),
+            source_sha256: SourceSha256::from_bytes(Sha256::digest(&marker_bytes).into()),
+            bytes: marker_bytes,
+            content_type: "application/json".to_string(),
+        };
+
+        let (endpoint, rx, server) = spawn_fake_s3_server(vec![
+            (200, head_headers.clone(), Vec::new()),
+            (503, vec![], b"read unavailable".to_vec()),
+        ]);
+        let store = S3ObjectStore::new(test_config(endpoint)).expect("adapter constructs");
+        let get_failure = store
+            .verify_object(&key, &expected)
+            .and_then(|_| store.put_object_if_absent(&marker));
+        assert!(get_failure.is_err(), "GET failure must fail verification");
+        assert_eq!(
+            rx.iter().map(|request| request.method).collect::<Vec<_>>(),
+            vec!["HEAD", "GET"]
+        );
+        server.join().expect("fake S3 server exits cleanly");
+
+        let mut drifted_bytes = expected_bytes.clone();
+        drifted_bytes[0] ^= 0x20;
+        let (endpoint, rx, server) = spawn_fake_s3_server(vec![
+            (200, head_headers.clone(), Vec::new()),
+            (200, head_headers, drifted_bytes.clone()),
+        ]);
+        let store = S3ObjectStore::new(test_config(endpoint)).expect("adapter constructs");
+        let drift = store
+            .verify_object(&key, &expected)
+            .and_then(|_| store.put_object_if_absent(&marker));
+        assert!(matches!(
+            drift,
+            Err(ObjectStoreError::DigestMismatch { actual, .. })
+                if actual == SourceSha256::from_bytes(Sha256::digest(&drifted_bytes).into())
+        ));
+        assert_eq!(
+            rx.iter().map(|request| request.method).collect::<Vec<_>>(),
+            vec!["HEAD", "GET"]
+        );
+        server.join().expect("fake S3 server exits cleanly");
+    }
+
+    #[test]
+    fn streamed_readback_rejects_identity_or_metadata_drift() {
+        let bytes = b"identity-bound bytes".to_vec();
+        let digest = SourceSha256::from_bytes(Sha256::digest(&bytes).into());
+        let head_headers = vec![
+            ("ETag", "\"etag-head\"".to_string()),
+            ("x-amz-version-id", "version-head".to_string()),
+            ("Content-Length", bytes.len().to_string()),
+            (super::SOURCE_SHA256_META_HEADER, digest.to_hex()),
+        ];
+        let get_headers = vec![
+            ("ETag", "\"etag-other\"".to_string()),
+            ("x-amz-version-id", "version-head".to_string()),
+            ("Content-Length", bytes.len().to_string()),
+            (
+                super::SOURCE_SHA256_META_HEADER,
+                SourceSha256::from_bytes([0x55; 32]).to_hex(),
+            ),
+        ];
+        let (endpoint, rx, server) = spawn_fake_s3_server(vec![
+            (200, head_headers, Vec::new()),
+            (200, get_headers, bytes.clone()),
+        ]);
+        let store = S3ObjectStore::new(test_config(endpoint)).expect("adapter constructs");
+
+        let result = store.verify_object(
+            &ObjectKey("session/receipt.json".to_string()),
+            &ExpectedObject {
+                size_bytes: bytes.len() as u64,
+                source_sha256: digest,
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(ObjectStoreError::VerificationMismatch { detail, .. })
+                if detail.contains("GET ETag")
+        ));
+        assert_eq!(
+            rx.iter().map(|request| request.method).collect::<Vec<_>>(),
+            vec!["HEAD", "GET"]
+        );
+        server.join().expect("fake S3 server exits cleanly");
     }
 
     /// A *composite* checksum is a checksum of part checksums — the same
@@ -1872,7 +2550,19 @@ mod tests {
                 ],
                 Vec::new(),
             ),
-            (200, vec![], content.clone()),
+            (
+                200,
+                vec![
+                    ("ETag", "\"etag-2\"".to_string()),
+                    ("Content-Length", content.len().to_string()),
+                    (super::SOURCE_SHA256_META_HEADER, digest.to_hex()),
+                    (
+                        super::CHECKSUM_SHA256_HEADER,
+                        format!("{}-2", BASE64.encode([0u8; 32])),
+                    ),
+                ],
+                content.clone(),
+            ),
         ]);
         let store = S3ObjectStore::new(test_config(endpoint)).expect("adapter constructs");
 

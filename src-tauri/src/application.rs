@@ -6,7 +6,7 @@
 //! should only adapt their wire DTOs to methods on [`TransferApplication`];
 //! they must not make persistence or network decisions themselves.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -16,7 +16,11 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use crate::composition::Composition;
-use crate::models::{Device, LibraryView, SessionView, StorageConfig, StorageConfigView, Transfer};
+use crate::models::{
+    Device, LibraryView, SessionCatalogAuthority, SessionDiscoveryDiagnosticView,
+    SessionPageCapabilities, SessionPageView, SessionPaginationUnavailableReason,
+    SessionVerificationView, SessionView, StorageConfig, StorageConfigView, Transfer,
+};
 use crate::state::AppData;
 
 /// Maximum number of values accepted by a batch RPC. Keeping this at the
@@ -168,6 +172,14 @@ pub struct ApplicationSnapshot {
 struct SessionsUpdatePayload {
     device_id: String,
     sessions: Vec<SessionView>,
+    diagnostics: Vec<SessionDiscoveryDiagnosticView>,
+    catalog_revision: Option<String>,
+    next_cursor: Option<String>,
+    has_more: bool,
+    catalog_authority: SessionCatalogAuthority,
+    pagination_supported: bool,
+    pagination_unavailable_reason: Option<SessionPaginationUnavailableReason>,
+    capabilities: SessionPageCapabilities,
 }
 
 /// The outcome for one item in a non-dispatching batch command. Keeping the
@@ -385,6 +397,26 @@ struct LocalProjection {
     storage: StorageConfigView,
 }
 
+#[derive(Debug, Clone)]
+struct PublishedSessionCatalog {
+    catalog_revision: Option<String>,
+    connection_epoch: u64,
+    next_cursor: Option<String>,
+    diagnostics: Vec<SessionDiscoveryDiagnosticView>,
+    seen_cursors: HashSet<String>,
+    catalog_authority: SessionCatalogAuthority,
+    pagination_supported: bool,
+    pagination_unavailable_reason: Option<SessionPaginationUnavailableReason>,
+    capabilities: SessionPageCapabilities,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionReadAuthorization {
+    pub connection_epoch: u64,
+    pub session_revision: String,
+    pub verification: Option<SessionVerificationView>,
+}
+
 /// The only state exposed by the atomic snapshot and non-session revisioned
 /// reads. `list_sessions` is the one scoped refresh exception: it performs its
 /// device I/O without this lock, then publishes and returns the exact fetched
@@ -398,6 +430,7 @@ struct PublishedResources {
     transfers: Revisioned<Vec<Transfer>>,
     storage: Revisioned<StorageConfigView>,
     sessions: HashMap<String, Revisioned<Vec<SessionView>>>,
+    session_catalogs: HashMap<String, PublishedSessionCatalog>,
     session_revisions: HashMap<String, u64>,
     auxiliary_revisions: HashMap<Resource, u64>,
 }
@@ -411,6 +444,7 @@ impl PublishedResources {
             transfers: Revisioned::new(0, projection.transfers),
             storage: Revisioned::new(0, projection.storage),
             sessions: HashMap::new(),
+            session_catalogs: HashMap::new(),
             session_revisions: HashMap::new(),
             auxiliary_revisions: HashMap::new(),
         }
@@ -477,8 +511,17 @@ impl TransferApplication {
         composition: Arc<Composition>,
         app_data_dir: PathBuf,
     ) -> Result<Self, String> {
-        // This seed happens before `start()` enables recovery/background
-        // writers. It is the first immutable publication visible to RPC.
+        // Unexpected process interruption is not a supported recovery path.
+        // Close every old non-terminal download before the first immutable
+        // publication, so startup can never replay or schedule stale work.
+        let interrupted = composition.fail_interrupted_downloads_on_startup()?;
+        if interrupted > 0 {
+            eprintln!(
+                "[application] marked {interrupted} download job(s) interrupted by the previous process as failed"
+            );
+        }
+        // This seed happens before `start()` enables background writers. It
+        // is the first immutable publication visible to RPC.
         let projection = Self::project_local_resources(&state, &composition)?;
         Ok(Self(Arc::new(ApplicationInner {
             state,
@@ -699,8 +742,9 @@ impl TransferApplication {
         self.subscribe(Arc::new(TauriEventSink(app.clone())))
     }
 
-    /// Start recovery and background loops exactly once, after managed state
-    /// and the event sink have been registered.
+    /// Start background loops exactly once, after managed state and the event
+    /// sink have been registered. Previous-process downloads were already
+    /// failed before the initial snapshot; this method never replays them.
     pub fn start(&self, app: AppHandle) {
         if !self.0.started.swap(true, Ordering::SeqCst) {
             let subscription = self.bind_tauri(&app);
@@ -709,7 +753,6 @@ impl TransferApplication {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .replace(subscription);
-            self.0.composition.recover_on_startup();
             self.0.composition.start_background_loops(app);
         }
     }
@@ -867,7 +910,7 @@ impl TransferApplication {
     /// keep independent watermarks even though both draw from the same global
     /// monotonic sequence.
     pub fn publish_sessions(&self, device_id: &str, sessions: Vec<SessionView>) -> Publication {
-        let (revision, sessions) = {
+        let (revision, sessions, capabilities) = {
             let mut published = self
                 .0
                 .publications
@@ -878,11 +921,27 @@ impl TransferApplication {
             published
                 .sessions
                 .insert(device_id.to_string(), envelope.clone());
-            (revision, envelope.value)
+            let capabilities = published
+                .session_catalogs
+                .get(device_id)
+                .map(|catalog| catalog.capabilities.clone())
+                .unwrap_or_default();
+            published.session_catalogs.remove(device_id);
+            (revision, envelope.value, capabilities)
         };
         let payload = SessionsUpdatePayload {
             device_id: device_id.to_string(),
             sessions,
+            diagnostics: Vec::new(),
+            catalog_revision: None,
+            next_cursor: None,
+            has_more: false,
+            catalog_authority: SessionCatalogAuthority::Unavailable,
+            pagination_supported: false,
+            pagination_unavailable_reason: Some(
+                SessionPaginationUnavailableReason::CatalogRevisionUnavailable,
+            ),
+            capabilities,
         };
         self.deliver(
             Resource::Sessions.event_name(false),
@@ -890,16 +949,447 @@ impl TransferApplication {
         )
     }
 
+    pub(crate) fn validate_session_page_request(
+        &self,
+        device_id: &str,
+        cursor: Option<&str>,
+        catalog_revision: Option<&str>,
+    ) -> Result<Option<u64>, String> {
+        match (cursor, catalog_revision) {
+            (None, None) => Ok(None),
+            (Some(cursor), Some(catalog_revision)) => {
+                if cursor.is_empty() || catalog_revision.is_empty() {
+                    return Err("会话分页 cursor 和 catalogRevision 不能为空".to_string());
+                }
+                let published = self
+                    .0
+                    .publications
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let catalog = published
+                    .session_catalogs
+                    .get(device_id)
+                    .ok_or_else(|| "会话分页快照已失效，请从第一页重新刷新".to_string())?;
+                if catalog.catalog_revision.as_deref() != Some(catalog_revision) {
+                    return Err("设备会话目录 revision 已变化，请从第一页重新刷新".to_string());
+                }
+                if !catalog.pagination_supported {
+                    return Err("当前设备会话目录没有快照级 revision，无法安全加载更多".to_string());
+                }
+                if catalog.next_cursor.as_deref() != Some(cursor)
+                    || catalog.seen_cursors.contains(cursor)
+                {
+                    return Err("会话分页 cursor 已失效或已使用，请从第一页重新刷新".to_string());
+                }
+                Ok(Some(catalog.connection_epoch))
+            }
+            _ => Err(
+                "首次会话刷新不得携带分页状态；加载更多必须同时提供 cursor 和 catalogRevision"
+                    .to_string(),
+            ),
+        }
+    }
+
+    pub(crate) fn validate_session_detail_request(
+        &self,
+        device_id: &str,
+        session_id: &str,
+        session_revision: &str,
+        catalog_revision: Option<&str>,
+    ) -> Result<SessionReadAuthorization, String> {
+        let published = self
+            .0
+            .publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let catalog = published
+            .session_catalogs
+            .get(device_id)
+            .ok_or_else(|| "会话目录快照已失效，请先刷新列表".to_string())?;
+        if catalog.catalog_revision.as_deref() != catalog_revision {
+            return Err("设备会话目录 revision 已变化，请刷新列表后重试".to_string());
+        }
+        if !catalog.capabilities.session_detail.supported {
+            return Err("当前设备协商结果不支持读取会话详情".to_string());
+        }
+        let summary = published
+            .sessions
+            .get(device_id)
+            .and_then(|sessions| {
+                sessions
+                    .value
+                    .iter()
+                    .find(|item| item.session.id == session_id)
+            })
+            .ok_or_else(|| "会话不在当前已加载目录中，请刷新或加载对应页面".to_string())?;
+        if summary.session.revision != session_revision {
+            return Err("会话 revision 已变化，请刷新列表后重试".to_string());
+        }
+        validate_session_verification(catalog, summary)?;
+        Ok(SessionReadAuthorization {
+            connection_epoch: catalog.connection_epoch,
+            session_revision: summary.session.revision.clone(),
+            verification: summary.verification.clone(),
+        })
+    }
+
+    pub(crate) fn authorize_session_artifact_request(
+        &self,
+        device_id: &str,
+        session_id: &str,
+    ) -> Result<SessionReadAuthorization, String> {
+        let published = self
+            .0
+            .publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let catalog = published
+            .session_catalogs
+            .get(device_id)
+            .ok_or_else(|| "会话目录快照已失效，请先刷新列表".to_string())?;
+        if !catalog.capabilities.artifact_download.supported
+            || !catalog.capabilities.session_detail.supported
+        {
+            return Err("当前设备协商结果不支持读取并下载会话工件".to_string());
+        }
+        let summary = published
+            .sessions
+            .get(device_id)
+            .and_then(|sessions| {
+                sessions
+                    .value
+                    .iter()
+                    .find(|item| item.session.id == session_id)
+            })
+            .ok_or_else(|| "会话不在当前已加载目录中，请刷新或加载对应页面".to_string())?;
+        validate_session_verification(catalog, summary)?;
+        Ok(SessionReadAuthorization {
+            connection_epoch: catalog.connection_epoch,
+            session_revision: summary.session.revision.clone(),
+            verification: summary.verification.clone(),
+        })
+    }
+
+    pub(crate) fn publish_session_page(
+        &self,
+        device_id: &str,
+        request_cursor: Option<&str>,
+        expected_catalog_revision: Option<&str>,
+        connection_epoch: u64,
+        page: SessionPageView,
+    ) -> Result<(Publication, SessionPageView), String> {
+        let catalog_identity_valid = match page.catalog_authority {
+            SessionCatalogAuthority::DeviceSnapshot => {
+                page.catalog_revision
+                    .as_deref()
+                    .is_some_and(|revision| !revision.is_empty())
+                    && page.pagination_supported
+                    && page.pagination_unavailable_reason.is_none()
+            }
+            SessionCatalogAuthority::Unavailable => {
+                page.catalog_revision.is_none()
+                    && !page.pagination_supported
+                    && page.pagination_unavailable_reason
+                        == Some(SessionPaginationUnavailableReason::CatalogRevisionUnavailable)
+            }
+        };
+        if !catalog_identity_valid
+            || page.has_more != page.next_cursor.is_some()
+            || page.next_cursor.as_deref().is_some_and(str::is_empty)
+            || !page.pagination_supported && (page.has_more || page.next_cursor.is_some())
+        {
+            return Err("设备返回了无效的会话分页元数据".to_string());
+        }
+
+        let response = page.clone();
+        let (revision, sessions, catalog) = {
+            let mut published = self
+                .0
+                .publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (mut sessions, mut seen_cursors, mut diagnostics) = match request_cursor {
+                None => (Vec::new(), HashSet::new(), Vec::new()),
+                Some(cursor) => {
+                    let expected = expected_catalog_revision
+                        .ok_or_else(|| "加载更多缺少 catalogRevision，请重新刷新".to_string())?;
+                    let current = published
+                        .session_catalogs
+                        .get(device_id)
+                        .ok_or_else(|| "会话分页快照已失效，请重新刷新".to_string())?;
+                    if current.catalog_revision.as_deref() != Some(expected)
+                        || page.catalog_revision.as_deref() != Some(expected)
+                        || current.connection_epoch != connection_epoch
+                        || current.catalog_authority != page.catalog_authority
+                        || current.pagination_supported != page.pagination_supported
+                        || current.pagination_unavailable_reason
+                            != page.pagination_unavailable_reason
+                        || current.capabilities != page.capabilities
+                        || current.next_cursor.as_deref() != Some(cursor)
+                        || current.seen_cursors.contains(cursor)
+                    {
+                        return Err("会话分页快照已变化或 cursor 已失效，请重新刷新".to_string());
+                    }
+                    let sessions = published
+                        .sessions
+                        .get(device_id)
+                        .map(|value| value.value.clone())
+                        .ok_or_else(|| "会话分页缓存已失效，请重新刷新".to_string())?;
+                    let mut seen = current.seen_cursors.clone();
+                    seen.insert(cursor.to_string());
+                    (sessions, seen, current.diagnostics.clone())
+                }
+            };
+            if request_cursor.is_none() && expected_catalog_revision.is_some()
+                || request_cursor.is_some()
+                    && expected_catalog_revision != page.catalog_revision.as_deref()
+            {
+                return Err("会话分页请求与目录 revision 不一致".to_string());
+            }
+            if page
+                .next_cursor
+                .as_ref()
+                .is_some_and(|next| seen_cursors.contains(next))
+            {
+                return Err("设备返回了重复的会话分页 cursor".to_string());
+            }
+            if let Err(error) = merge_session_views(&mut sessions, page.items.clone()) {
+                if request_cursor.is_some() {
+                    published.session_catalogs.remove(device_id);
+                }
+                return Err(error);
+            }
+            if let Err(error) =
+                merge_session_diagnostics(&mut diagnostics, page.diagnostics.clone())
+            {
+                if request_cursor.is_some() {
+                    published.session_catalogs.remove(device_id);
+                }
+                return Err(error);
+            }
+            let catalog = PublishedSessionCatalog {
+                catalog_revision: page.catalog_revision.clone(),
+                connection_epoch,
+                next_cursor: page.next_cursor.clone(),
+                diagnostics,
+                seen_cursors: std::mem::take(&mut seen_cursors),
+                catalog_authority: page.catalog_authority,
+                pagination_supported: page.pagination_supported,
+                pagination_unavailable_reason: page.pagination_unavailable_reason,
+                capabilities: page.capabilities.clone(),
+            };
+            let revision = published.allocate_session(device_id);
+            published.sessions.insert(
+                device_id.to_string(),
+                Revisioned::new(revision, sessions.clone()),
+            );
+            published
+                .session_catalogs
+                .insert(device_id.to_string(), catalog.clone());
+            (revision, sessions, catalog)
+        };
+        let publication = self.deliver(
+            Resource::Sessions.event_name(false),
+            &Revisioned::new(
+                revision,
+                SessionsUpdatePayload {
+                    device_id: device_id.to_string(),
+                    sessions,
+                    diagnostics: catalog.diagnostics.clone(),
+                    catalog_revision: catalog.catalog_revision.clone(),
+                    next_cursor: catalog.next_cursor.clone(),
+                    has_more: catalog.next_cursor.is_some(),
+                    catalog_authority: catalog.catalog_authority,
+                    pagination_supported: catalog.pagination_supported,
+                    pagination_unavailable_reason: catalog.pagination_unavailable_reason,
+                    capabilities: catalog.capabilities,
+                },
+            ),
+        );
+        Ok((publication, response))
+    }
+
+    pub(crate) fn publish_session_detail(
+        &self,
+        device_id: &str,
+        catalog_revision: Option<&str>,
+        expected_connection_epoch: u64,
+        detail: SessionView,
+    ) -> Result<Publication, String> {
+        let (revision, sessions, catalog) = {
+            let mut published = self
+                .0
+                .publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let catalog = published
+                .session_catalogs
+                .get(device_id)
+                .filter(|catalog| {
+                    catalog.catalog_revision.as_deref() == catalog_revision
+                        && catalog.connection_epoch == expected_connection_epoch
+                })
+                .cloned()
+                .ok_or_else(|| "会话目录快照或设备连接已变化，详情结果已丢弃".to_string())?;
+            let mut sessions = published
+                .sessions
+                .get(device_id)
+                .map(|value| value.value.clone())
+                .ok_or_else(|| "会话目录缓存已失效，详情结果已丢弃".to_string())?;
+            let position = sessions
+                .iter()
+                .position(|item| item.session.id == detail.session.id)
+                .ok_or_else(|| "会话不在当前已加载目录中，详情结果已丢弃".to_string())?;
+            if sessions[position].session.revision != detail.session.revision {
+                return Err("会话 revision 已变化，详情结果已丢弃".to_string());
+            }
+            if sessions[position].verification != detail.verification {
+                return Err("会话 gateway verification 已变化，详情结果已丢弃".to_string());
+            }
+            sessions[position] = detail;
+            let revision = published.allocate_session(device_id);
+            published.sessions.insert(
+                device_id.to_string(),
+                Revisioned::new(revision, sessions.clone()),
+            );
+            (revision, sessions, catalog)
+        };
+        Ok(self.deliver(
+            Resource::Sessions.event_name(false),
+            &Revisioned::new(
+                revision,
+                SessionsUpdatePayload {
+                    device_id: device_id.to_string(),
+                    sessions,
+                    diagnostics: catalog.diagnostics.clone(),
+                    catalog_revision: catalog.catalog_revision.clone(),
+                    next_cursor: catalog.next_cursor.clone(),
+                    has_more: catalog.next_cursor.is_some(),
+                    catalog_authority: catalog.catalog_authority,
+                    pagination_supported: catalog.pagination_supported,
+                    pagination_unavailable_reason: catalog.pagination_unavailable_reason,
+                    capabilities: catalog.capabilities,
+                },
+            ),
+        ))
+    }
+
     /// Reserve a session-scope revision when a mutation committed but its
     /// post-mutation catalog could not be read. There is intentionally no
     /// value/event to cache; the next successful refresh receives a newer
     /// device-scoped revision.
     pub fn advance_session_revision(&self, device_id: &str) -> u64 {
-        self.0
+        let mut published = self
+            .0
             .publications
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .allocate_session(device_id)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        published.session_catalogs.remove(device_id);
+        published.allocate_session(device_id)
+    }
+
+    /// Retires opaque cursors and revision-bound details when a connection
+    /// lifecycle transition begins. Rows may remain visible while offline,
+    /// but no operation can append to or fetch detail against that cache.
+    pub(crate) fn invalidate_session_catalog(&self, device_id: &str) {
+        let canonical_id = self
+            .resolve_session_operation_scope(device_id)
+            .unwrap_or_else(|_| device_id.to_string());
+        let mut published = self
+            .0
+            .publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        published.session_catalogs.remove(&canonical_id);
+        published.allocate_session(&canonical_id);
+    }
+}
+
+fn merge_session_views(
+    existing: &mut Vec<SessionView>,
+    incoming: Vec<SessionView>,
+) -> Result<(), String> {
+    let mut seen = existing
+        .iter()
+        .map(|item| item.session.id.as_str())
+        .collect::<HashSet<_>>();
+    for candidate in &incoming {
+        if !seen.insert(candidate.session.id.as_str()) {
+            return Err(format!(
+                "设备在同一个会话目录 cursor chain 中重复返回 sessionId {}",
+                candidate.session.id
+            ));
+        }
+    }
+    drop(seen);
+    validate_session_page_order(existing, &incoming)?;
+    existing.extend(incoming);
+    Ok(())
+}
+
+fn validate_session_page_order(
+    existing: &[SessionView],
+    incoming: &[SessionView],
+) -> Result<(), String> {
+    let validate_pair = |newer: &SessionView, older: &SessionView| {
+        let newer_timestamp = chrono::DateTime::parse_from_rfc3339(&newer.session.date_label)
+            .map_err(|_| "设备会话目录 started_at 不是有效的 RFC 3339 时间".to_string())?;
+        let older_timestamp = chrono::DateTime::parse_from_rfc3339(&older.session.date_label)
+            .map_err(|_| "设备会话目录 started_at 不是有效的 RFC 3339 时间".to_string())?;
+        if newer_timestamp > older_timestamp
+            || (newer_timestamp == older_timestamp && newer.session.id > older.session.id)
+        {
+            Ok(())
+        } else {
+            Err("设备会话目录没有按 (started_at, session_id) newest-first 严格排序".to_string())
+        }
+    };
+
+    for pair in incoming.windows(2) {
+        validate_pair(&pair[0], &pair[1])?;
+    }
+    if let (Some(previous), Some(next)) = (existing.last(), incoming.first()) {
+        validate_pair(previous, next)?;
+    }
+    Ok(())
+}
+
+fn merge_session_diagnostics(
+    existing: &mut Vec<SessionDiscoveryDiagnosticView>,
+    incoming: Vec<SessionDiscoveryDiagnosticView>,
+) -> Result<(), String> {
+    for diagnostic in incoming {
+        if existing
+            .iter()
+            .any(|current| current.quarantine_id == diagnostic.quarantine_id)
+        {
+            return Err(format!(
+                "设备在同一个会话目录 cursor chain 中重复返回 quarantineId {}",
+                diagnostic.quarantine_id
+            ));
+        }
+        existing.push(diagnostic);
+    }
+    Ok(())
+}
+
+fn validate_session_verification(
+    catalog: &PublishedSessionCatalog,
+    summary: &SessionView,
+) -> Result<(), String> {
+    match catalog.capabilities.profile {
+        crate::models::SessionApiProfile::LegacyPinnedTlsV1 => Ok(()),
+        crate::models::SessionApiProfile::LabHttpV4 => summary
+            .verification
+            .as_ref()
+            .filter(|verification| verification.permits_detail_for(&summary.session.revision))
+            .map(|_| ())
+            .ok_or_else(|| {
+                "该会话缺少可用且与当前 revision 匹配的 gateway verification".to_string()
+            }),
+        crate::models::SessionApiProfile::Unknown => {
+            Err("设备 API profile 未知，不能读取会话详情或下载工件".to_string())
+        }
     }
 }
 
@@ -1036,6 +1526,16 @@ pub fn emit_sessions_event<R: Runtime>(
         SessionsUpdatePayload {
             device_id: device_id.to_string(),
             sessions,
+            diagnostics: Vec::new(),
+            catalog_revision: None,
+            next_cursor: None,
+            has_more: false,
+            catalog_authority: SessionCatalogAuthority::Unavailable,
+            pagination_supported: false,
+            pagination_unavailable_reason: Some(
+                SessionPaginationUnavailableReason::CatalogRevisionUnavailable,
+            ),
+            capabilities: SessionPageCapabilities::default(),
         },
     )
 }
@@ -1044,9 +1544,17 @@ pub fn emit_sessions_event<R: Runtime>(
 mod tests {
     use super::*;
     use crate::models::{
-        DeviceState, DownloadStatus, Session, SessionFile, StorageUrlStyle, TransferDirection,
-        TransferState, UploadStatus,
+        DeviceState, DownloadStatus, Session, SessionApiProfile, SessionCapability,
+        SessionCapabilitySource, SessionFile, SessionVerificationValidatorView,
+        SessionVerificationVerdict, StorageUrlStyle, TransferDirection, TransferState,
+        UploadStatus,
     };
+    use ylx_transfer_core::domain::{
+        DeviceId as DomainDeviceId, FileId as DomainFileId, JobFileSpec, JobIdentity, JobSpec,
+        PublicationMaterial, SessionId as DomainSessionId,
+    };
+    use ylx_transfer_core::persistence::{JobStateTag, TerminalOutcome, TransferStore};
+    use ylx_transfer_core::transfer::recovery::INTERRUPTED_DOWNLOAD_FAILURE_CODE;
 
     const RPC_FIXTURE: &str = include_str!("../../fixtures/rpc/application_contract.json");
     const DEVICE_A: &str = "ylx-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
@@ -1116,11 +1624,12 @@ mod tests {
     }
 
     fn fixture_session(id: &str) -> SessionView {
+        let manifest_sha256 = "a".repeat(64);
         SessionView {
             session: Session {
                 id: id.to_string(),
-                revision: format!("revision-{id}"),
-                date_label: "2026-08-04".to_string(),
+                revision: format!("sha256:{manifest_sha256}"),
+                date_label: "2026-08-04T00:00:00Z".to_string(),
                 duration_seconds: 1.0,
                 total_bytes: 1,
                 video_bytes: 1,
@@ -1129,6 +1638,34 @@ mod tests {
             },
             download_status: DownloadStatus::None,
             backed_up: false,
+            verification: Some(SessionVerificationView {
+                verdict: SessionVerificationVerdict::Usable,
+                actor: "gateway".to_string(),
+                validator: SessionVerificationValidatorView {
+                    name: "fixture-validator".to_string(),
+                    version: "1".to_string(),
+                    build_sha256: "b".repeat(64),
+                },
+                manifest_sha256,
+                verified_at: "2026-08-04T00:00:00Z".to_string(),
+                diagnostics: Vec::new(),
+                manifest_digest_valid: true,
+            }),
+        }
+    }
+
+    fn fixture_session_at(id: &str, started_at: &str) -> SessionView {
+        let mut session = fixture_session(id);
+        session.session.date_label = started_at.to_string();
+        session
+    }
+
+    fn fixture_diagnostic(id: &str, message: &str) -> SessionDiscoveryDiagnosticView {
+        SessionDiscoveryDiagnosticView {
+            quarantine_id: id.to_string(),
+            code: crate::models::SessionDiscoveryDiagnosticCode::ManifestInvalid,
+            observed_at: "2026-08-29T12:00:00Z".to_string(),
+            message: message.to_string(),
         }
     }
 
@@ -1373,6 +1910,798 @@ mod tests {
         assert_eq!(published.session_revisions.get("device-b"), Some(&3));
     }
 
+    fn fixture_session_page(
+        items: Vec<SessionView>,
+        next_cursor: Option<&str>,
+        catalog_revision: &str,
+    ) -> SessionPageView {
+        SessionPageView {
+            items,
+            diagnostics: Vec::new(),
+            next_cursor: next_cursor.map(str::to_string),
+            has_more: next_cursor.is_some(),
+            catalog_revision: Some(catalog_revision.to_string()),
+            catalog_authority: SessionCatalogAuthority::DeviceSnapshot,
+            pagination_supported: true,
+            pagination_unavailable_reason: None,
+            capabilities: SessionPageCapabilities {
+                profile: SessionApiProfile::LabHttpV4,
+                session_deletion: SessionCapability {
+                    supported: false,
+                    source: SessionCapabilitySource::ProfileContract,
+                },
+                session_detail: SessionCapability {
+                    supported: true,
+                    source: SessionCapabilitySource::ProfileContract,
+                },
+                artifact_download: SessionCapability {
+                    supported: true,
+                    source: SessionCapabilitySource::DeviceDescriptor,
+                },
+                capture_status: SessionCapability {
+                    supported: true,
+                    source: SessionCapabilitySource::ProfileContract,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn stable_page_merge_reaches_session_boundaries_without_reordering() {
+        for total in [1_usize, 50, 51, 200] {
+            let source = (0..total)
+                .map(|index| {
+                    let started_at = chrono::DateTime::parse_from_rfc3339("2026-08-04T12:00:00Z")
+                        .unwrap()
+                        - chrono::Duration::seconds(index as i64);
+                    fixture_session_at(
+                        &format!("session-{index:04}"),
+                        &started_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut merged = Vec::new();
+            for page in source.chunks(50) {
+                merge_session_views(&mut merged, page.to_vec()).unwrap();
+            }
+            assert_eq!(merged.len(), total, "all {total} sessions remain reachable");
+            assert_eq!(
+                merged
+                    .iter()
+                    .map(|item| item.session.id.as_str())
+                    .collect::<Vec<_>>(),
+                source
+                    .iter()
+                    .map(|item| item.session.id.as_str())
+                    .collect::<Vec<_>>(),
+                "server order remains stable at the {total}-item boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn quarantine_diagnostics_reject_same_or_different_payload_for_one_identity() {
+        let diagnostic = fixture_diagnostic(
+            "550e8400-e29b-41d4-a716-446655440000",
+            "manifest failed validation",
+        );
+        let mut merged = Vec::new();
+        merge_session_diagnostics(&mut merged, vec![diagnostic.clone()]).unwrap();
+        assert!(merge_session_diagnostics(&mut merged, vec![diagnostic.clone()]).is_err());
+        assert_eq!(merged, vec![diagnostic.clone()]);
+
+        let mut conflict = diagnostic;
+        conflict.message = "different observation for the same stable id".to_string();
+        assert!(merge_session_diagnostics(&mut merged, vec![conflict]).is_err());
+    }
+
+    #[test]
+    fn one_cursor_chain_rejects_same_or_different_payload_for_one_session_identity() {
+        let mut original = fixture_session("session-a");
+        original.session.files = vec![fixture_file_a()];
+        let mut merged = vec![original.clone()];
+
+        let same = merge_session_views(&mut merged, vec![original.clone()]);
+        assert!(same.is_err());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].session.files, vec![fixture_file_a()]);
+
+        let mut changed = fixture_session("session-a");
+        changed.session.revision = format!("sha256:{}", "c".repeat(64));
+        changed.verification.as_mut().unwrap().manifest_sha256 = "c".repeat(64);
+        let different = merge_session_views(&mut merged, vec![changed]);
+        assert!(different.is_err());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].session.revision, original.session.revision);
+        assert_eq!(merged[0].session.files, vec![fixture_file_a()]);
+    }
+
+    #[test]
+    fn opaque_cursor_is_exactly_replayed_once_then_invalidated() {
+        let (root, application) = test_application("session-page-opaque-cursor");
+        let cursor = "opaque:%2Fnot-an-offset?token=a+b==";
+        let catalog_revision = format!("sha256:{}", "a".repeat(64));
+        let first = fixture_session_page(
+            vec![fixture_session_at("session-a", "2026-08-04T00:00:02Z")],
+            Some(cursor),
+            &catalog_revision,
+        );
+        application
+            .publish_session_page(DEVICE_A, None, None, 7, first)
+            .expect("publish first page");
+        application
+            .validate_session_page_request(DEVICE_A, Some(cursor), Some(&catalog_revision))
+            .expect("opaque cursor is accepted without decoding");
+
+        let second = fixture_session_page(
+            vec![fixture_session_at("session-b", "2026-08-04T00:00:01Z")],
+            None,
+            &catalog_revision,
+        );
+        application
+            .publish_session_page(DEVICE_A, Some(cursor), Some(&catalog_revision), 7, second)
+            .expect("append second page");
+
+        let published = application
+            .0
+            .publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            published.sessions[DEVICE_A]
+                .value
+                .iter()
+                .map(|item| item.session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["session-a", "session-b"]
+        );
+        drop(published);
+        assert!(application
+            .validate_session_page_request(DEVICE_A, Some(cursor), Some(&catalog_revision),)
+            .is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cross_page_duplicate_session_retires_only_the_cursor_chain_before_publication() {
+        let (root, application) = test_application("session-page-duplicate-identity");
+        let sink = Arc::new(RecordingEventSink::default());
+        let _subscription = application.subscribe(sink.clone());
+        let cursor = "opaque-next";
+        let revision_a = format!("sha256:{}", "a".repeat(64));
+        application
+            .publish_session_page(
+                DEVICE_A,
+                None,
+                None,
+                7,
+                fixture_session_page(
+                    vec![fixture_session("session-a")],
+                    Some(cursor),
+                    &revision_a,
+                ),
+            )
+            .expect("publish first page");
+
+        let (before_revision, before_value, before_global_revision) = {
+            let published = application
+                .0
+                .publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let sessions = published
+                .sessions
+                .get(DEVICE_A)
+                .expect("published first page");
+            (
+                sessions.revision,
+                serde_json::to_value(&sessions.value).expect("serialize first page"),
+                published.global_revision,
+            )
+        };
+        let error = application
+            .publish_session_page(
+                DEVICE_A,
+                Some(cursor),
+                Some(&revision_a),
+                7,
+                fixture_session_page(vec![fixture_session("session-a")], None, &revision_a),
+            )
+            .expect_err("one cursor chain must reject a repeated session id");
+        assert!(error.contains("sessionId"), "unexpected error: {error}");
+
+        let published = application
+            .0
+            .publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sessions = published
+            .sessions
+            .get(DEVICE_A)
+            .expect("first page remains visible");
+        assert_eq!(sessions.revision, before_revision);
+        assert_eq!(
+            serde_json::to_value(&sessions.value).expect("serialize rejected state"),
+            before_value
+        );
+        assert_eq!(published.global_revision, before_global_revision);
+        assert!(!published.session_catalogs.contains_key(DEVICE_A));
+        drop(published);
+        assert_eq!(
+            sink.events().len(),
+            1,
+            "the rejected page must not emit an event"
+        );
+        assert!(application
+            .validate_session_page_request(DEVICE_A, Some(cursor), Some(&revision_a))
+            .is_err());
+        assert!(application
+            .validate_session_detail_request(
+                DEVICE_A,
+                "session-a",
+                &format!("sha256:{}", "a".repeat(64)),
+                Some(&revision_a),
+            )
+            .is_err());
+
+        let revision_b = format!("sha256:{}", "b".repeat(64));
+        let mut replacement = fixture_session("session-a");
+        replacement.session.revision = format!("sha256:{}", "c".repeat(64));
+        replacement.session.total_bytes = 2;
+        replacement.verification.as_mut().unwrap().manifest_sha256 = "c".repeat(64);
+        application
+            .publish_session_page(
+                DEVICE_A,
+                None,
+                None,
+                8,
+                fixture_session_page(vec![replacement], None, &revision_b),
+            )
+            .expect("a fresh catalog revision may replace the same session id");
+        let published = application
+            .0
+            .publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(published.sessions[DEVICE_A].value[0].session.total_bytes, 2);
+        assert_eq!(
+            published.session_catalogs[DEVICE_A].catalog_revision,
+            Some(revision_b)
+        );
+        drop(published);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cross_page_duplicate_quarantine_identity_rejects_same_and_different_payloads_atomically() {
+        for (case, duplicate_message) in [
+            ("same", "manifest failed validation"),
+            ("different", "conflicting diagnostic payload"),
+        ] {
+            let (root, application) = test_application(&format!("diagnostic-duplicate-{case}"));
+            let sink = Arc::new(RecordingEventSink::default());
+            let _subscription = application.subscribe(sink.clone());
+            let cursor = "opaque-next";
+            let catalog_revision = format!("sha256:{}", "d".repeat(64));
+            let quarantine_id = "550e8400-e29b-41d4-a716-446655440000";
+            let mut first = fixture_session_page(
+                vec![fixture_session_at("session-a", "2026-08-04T00:00:02Z")],
+                Some(cursor),
+                &catalog_revision,
+            );
+            first.diagnostics.push(fixture_diagnostic(
+                quarantine_id,
+                "manifest failed validation",
+            ));
+            application
+                .publish_session_page(DEVICE_A, None, None, 7, first)
+                .expect("publish first page");
+
+            let (before_revision, before_value, before_global_revision) = {
+                let published = application
+                    .0
+                    .publications
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let sessions = published
+                    .sessions
+                    .get(DEVICE_A)
+                    .expect("published first page");
+                (
+                    sessions.revision,
+                    serde_json::to_value(&sessions.value).expect("serialize first page"),
+                    published.global_revision,
+                )
+            };
+            let mut duplicate = fixture_session_page(
+                vec![fixture_session_at("session-b", "2026-08-04T00:00:01Z")],
+                None,
+                &catalog_revision,
+            );
+            duplicate
+                .diagnostics
+                .push(fixture_diagnostic(quarantine_id, duplicate_message));
+            let error = application
+                .publish_session_page(
+                    DEVICE_A,
+                    Some(cursor),
+                    Some(&catalog_revision),
+                    7,
+                    duplicate,
+                )
+                .expect_err("one cursor chain must reject a repeated quarantine id");
+            assert!(
+                error.contains("quarantineId"),
+                "unexpected {case} error: {error}"
+            );
+
+            let published = application
+                .0
+                .publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let sessions = published
+                .sessions
+                .get(DEVICE_A)
+                .expect("first page remains visible");
+            assert_eq!(sessions.revision, before_revision, "{case}");
+            assert_eq!(
+                serde_json::to_value(&sessions.value).expect("serialize rejected state"),
+                before_value,
+                "{case}"
+            );
+            assert_eq!(published.global_revision, before_global_revision, "{case}");
+            assert!(!published.session_catalogs.contains_key(DEVICE_A), "{case}");
+            drop(published);
+            assert_eq!(
+                sink.events().len(),
+                1,
+                "{case} rejected page emitted an event"
+            );
+            assert!(application
+                .validate_session_page_request(DEVICE_A, Some(cursor), Some(&catalog_revision),)
+                .is_err());
+            assert!(application
+                .validate_session_detail_request(
+                    DEVICE_A,
+                    "session-a",
+                    &format!("sha256:{}", "a".repeat(64)),
+                    Some(&catalog_revision),
+                )
+                .is_err());
+            std::fs::remove_dir_all(root).ok();
+        }
+    }
+
+    #[test]
+    fn cross_page_newest_first_boundary_is_strict_at_items_50_and_51() {
+        let first_fifty = || {
+            (0..50)
+                .map(|index| {
+                    let id = if index == 49 {
+                        "session-boundary-b".to_string()
+                    } else {
+                        format!("session-{index:02}")
+                    };
+                    fixture_session_at(&id, &format!("2026-08-04T00:00:{:02}Z", 59 - index))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (case, invalid) in [
+            (
+                "newer-timestamp",
+                fixture_session_at("session-boundary-a", "2026-08-04T00:00:11Z"),
+            ),
+            (
+                "same-timestamp-higher-id",
+                fixture_session_at("session-boundary-c", "2026-08-04T00:00:10Z"),
+            ),
+        ] {
+            let (root, application) = test_application(&format!("newest-first-{case}"));
+            let sink = Arc::new(RecordingEventSink::default());
+            let _subscription = application.subscribe(sink.clone());
+            let cursor = "opaque-item-51";
+            let catalog_revision = format!("sha256:{}", "e".repeat(64));
+            application
+                .publish_session_page(
+                    DEVICE_A,
+                    None,
+                    None,
+                    7,
+                    fixture_session_page(first_fifty(), Some(cursor), &catalog_revision),
+                )
+                .expect("publish the first 50 ordered sessions");
+            let (before_revision, before_value, before_global_revision) = {
+                let published = application
+                    .0
+                    .publications
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let sessions = published
+                    .sessions
+                    .get(DEVICE_A)
+                    .expect("published first page");
+                (
+                    sessions.revision,
+                    serde_json::to_value(&sessions.value).expect("serialize first page"),
+                    published.global_revision,
+                )
+            };
+
+            let error = application
+                .publish_session_page(
+                    DEVICE_A,
+                    Some(cursor),
+                    Some(&catalog_revision),
+                    7,
+                    fixture_session_page(vec![invalid], None, &catalog_revision),
+                )
+                .expect_err("item 51 must remain strictly older than item 50");
+            assert!(
+                error.contains("newest-first"),
+                "unexpected {case} error: {error}"
+            );
+            let published = application
+                .0
+                .publications
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let sessions = published
+                .sessions
+                .get(DEVICE_A)
+                .expect("first page remains visible");
+            assert_eq!(sessions.revision, before_revision, "{case}");
+            assert_eq!(
+                serde_json::to_value(&sessions.value).expect("serialize rejected state"),
+                before_value,
+                "{case}"
+            );
+            assert_eq!(published.global_revision, before_global_revision, "{case}");
+            assert!(!published.session_catalogs.contains_key(DEVICE_A), "{case}");
+            drop(published);
+            assert_eq!(
+                sink.events().len(),
+                1,
+                "{case} rejected page emitted an event"
+            );
+            assert!(application
+                .validate_session_page_request(DEVICE_A, Some(cursor), Some(&catalog_revision),)
+                .is_err());
+            std::fs::remove_dir_all(root).ok();
+        }
+
+        let (root, application) = test_application("newest-first-valid-item-51");
+        let catalog_revision = format!("sha256:{}", "f".repeat(64));
+        application
+            .publish_session_page(
+                DEVICE_A,
+                None,
+                None,
+                7,
+                fixture_session_page(first_fifty(), Some("opaque-item-51"), &catalog_revision),
+            )
+            .expect("publish first 50 sessions");
+        application
+            .publish_session_page(
+                DEVICE_A,
+                Some("opaque-item-51"),
+                Some(&catalog_revision),
+                7,
+                fixture_session_page(
+                    vec![fixture_session_at(
+                        "session-boundary-z",
+                        "2026-08-04T00:00:09Z",
+                    )],
+                    None,
+                    &catalog_revision,
+                ),
+            )
+            .expect("a strictly older item 51 completes the chain");
+        let published = application
+            .0
+            .publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(published.sessions[DEVICE_A].value.len(), 51);
+        drop(published);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn pagination_rejects_catalog_drift_and_repeated_next_cursor() {
+        let (root, application) = test_application("session-page-revision-drift");
+        let cursor = "opaque-next";
+        let revision_a = format!("sha256:{}", "a".repeat(64));
+        let revision_b = format!("sha256:{}", "b".repeat(64));
+        application
+            .publish_session_page(
+                DEVICE_A,
+                None,
+                None,
+                7,
+                fixture_session_page(
+                    vec![fixture_session("session-a")],
+                    Some(cursor),
+                    &revision_a,
+                ),
+            )
+            .expect("publish first page");
+
+        assert!(application
+            .validate_session_page_request(DEVICE_A, Some(cursor), Some(&revision_b))
+            .is_err());
+        assert!(application
+            .publish_session_page(
+                DEVICE_A,
+                Some(cursor),
+                Some(&revision_a),
+                8,
+                fixture_session_page(vec![fixture_session("session-b")], None, &revision_a,),
+            )
+            .is_err());
+        assert!(application
+            .publish_session_page(
+                DEVICE_A,
+                Some(cursor),
+                Some(&revision_a),
+                7,
+                fixture_session_page(
+                    vec![fixture_session("session-b")],
+                    Some(cursor),
+                    &revision_a,
+                ),
+            )
+            .is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn session_detail_is_bound_to_catalog_and_session_revisions() {
+        let (root, application) = test_application("session-detail-revision");
+        let catalog_revision = format!("sha256:{}", "c".repeat(64));
+        application
+            .publish_session_page(
+                DEVICE_A,
+                None,
+                None,
+                7,
+                fixture_session_page(vec![fixture_session("session-a")], None, &catalog_revision),
+            )
+            .expect("publish current catalog");
+
+        assert!(application
+            .validate_session_detail_request(
+                DEVICE_A,
+                "session-a",
+                &format!("sha256:{}", "c".repeat(64)),
+                Some(&catalog_revision),
+            )
+            .is_err());
+        let authorization = application
+            .validate_session_detail_request(
+                DEVICE_A,
+                "session-a",
+                &format!("sha256:{}", "a".repeat(64)),
+                Some(&catalog_revision),
+            )
+            .expect("usable verification authorizes the exact listed revision");
+        assert_eq!(authorization.connection_epoch, 7);
+        assert!(authorization.verification.is_some());
+        assert!(application
+            .validate_session_detail_request(
+                DEVICE_A,
+                "session-a",
+                &format!("sha256:{}", "a".repeat(64)),
+                Some(&format!("sha256:{}", "d".repeat(64))),
+            )
+            .is_err());
+
+        let mut mismatched = fixture_session("session-a");
+        mismatched.session.revision = format!("sha256:{}", "c".repeat(64));
+        mismatched.verification.as_mut().unwrap().manifest_sha256 = "c".repeat(64);
+        assert!(application
+            .publish_session_detail(DEVICE_A, Some(&catalog_revision), 7, mismatched)
+            .is_err());
+
+        let mut detail = fixture_session("session-a");
+        detail.session.files = vec![fixture_file_a()];
+        assert!(application
+            .publish_session_detail(DEVICE_A, Some(&catalog_revision), 8, detail.clone())
+            .is_err());
+        application
+            .publish_session_detail(DEVICE_A, Some(&catalog_revision), 7, detail)
+            .expect("publish matching immutable detail");
+        let published = application
+            .0
+            .publications
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(published.sessions[DEVICE_A].value[0].session.files.len(), 1);
+        drop(published);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn v4_missing_unusable_or_invalid_verification_keeps_rows_but_denies_detail_and_download() {
+        let (root, application) = test_application("session-verification-gating");
+        let cases = ["missing", "unusable", "invalid-digest"];
+        for (index, case) in cases.into_iter().enumerate() {
+            let mut row = fixture_session("session-a");
+            match case {
+                "missing" => {
+                    row.session.revision.clear();
+                    row.verification = None;
+                }
+                "unusable" => {
+                    row.verification.as_mut().unwrap().verdict =
+                        SessionVerificationVerdict::Unusable;
+                    row.verification.as_mut().unwrap().diagnostics =
+                        vec![crate::models::SessionVerificationDiagnosticView::Structured {
+                            code: crate::models::SessionVerificationDiagnosticCode::ManifestInvalid,
+                            summary: "manifest failed verification".to_string(),
+                        }];
+                }
+                "invalid-digest" => {
+                    row.session.revision.clear();
+                    let verification = row.verification.as_mut().unwrap();
+                    verification.manifest_sha256 = "invalid".to_string();
+                    verification.manifest_digest_valid = false;
+                }
+                _ => unreachable!(),
+            }
+            let catalog_revision = format!("sha256:{:064x}", index + 10);
+            application
+                .publish_session_page(
+                    DEVICE_A,
+                    None,
+                    None,
+                    7,
+                    fixture_session_page(vec![row.clone()], None, &catalog_revision),
+                )
+                .expect("unsafe row remains visible in the catalog");
+            assert!(
+                application
+                    .validate_session_detail_request(
+                        DEVICE_A,
+                        "session-a",
+                        &row.session.revision,
+                        Some(&catalog_revision),
+                    )
+                    .is_err(),
+                "{case} verification must deny detail"
+            );
+            assert!(
+                application
+                    .authorize_session_artifact_request(DEVICE_A, "session-a")
+                    .is_err(),
+                "{case} verification must deny downloads"
+            );
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn connection_transition_invalidates_cursor_and_detail_generation() {
+        let (root, application) = test_application("session-connection-generation");
+        let catalog_revision = format!("sha256:{}", "e".repeat(64));
+        application
+            .publish_session_page(
+                DEVICE_A,
+                None,
+                None,
+                7,
+                fixture_session_page(
+                    vec![fixture_session("session-a")],
+                    Some("opaque-next"),
+                    &catalog_revision,
+                ),
+            )
+            .expect("publish connected catalog");
+
+        application.invalidate_session_catalog(DEVICE_A);
+
+        assert!(application
+            .validate_session_page_request(DEVICE_A, Some("opaque-next"), Some(&catalog_revision),)
+            .is_err());
+        assert!(application
+            .validate_session_detail_request(
+                DEVICE_A,
+                "session-a",
+                &format!("sha256:{}", "a".repeat(64)),
+                Some(&catalog_revision),
+            )
+            .is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn revisionless_catalog_allows_first_page_detail_but_never_load_more() {
+        let (root, application) = test_application("session-revisionless-catalog");
+        let sink = Arc::new(RecordingEventSink::default());
+        let _subscription = application.subscribe(sink.clone());
+        let mut page = fixture_session_page(
+            vec![fixture_session("session-a")],
+            None,
+            &format!("sha256:{}", "a".repeat(64)),
+        );
+        page.catalog_revision = None;
+        page.catalog_authority = SessionCatalogAuthority::Unavailable;
+        page.pagination_supported = false;
+        page.pagination_unavailable_reason =
+            Some(SessionPaginationUnavailableReason::CatalogRevisionUnavailable);
+
+        let mut unavailable_with_fabricated_revision = page.clone();
+        unavailable_with_fabricated_revision.catalog_revision =
+            Some("fabricated-revision".to_string());
+        assert!(application
+            .publish_session_page(
+                DEVICE_B,
+                None,
+                None,
+                4,
+                unavailable_with_fabricated_revision,
+            )
+            .is_err());
+
+        let mut snapshot_without_revision = fixture_session_page(
+            vec![fixture_session("session-a")],
+            None,
+            &format!("sha256:{}", "b".repeat(64)),
+        );
+        snapshot_without_revision.catalog_revision = None;
+        assert!(application
+            .publish_session_page(DEVICE_B, None, None, 4, snapshot_without_revision)
+            .is_err());
+
+        let (_publication, response) = application
+            .publish_session_page(DEVICE_A, None, None, 7, page)
+            .expect("publish safe first-page compatibility projection");
+        assert_eq!(response.catalog_revision, None);
+        let list_event = sink.events().pop().expect("revisionless sessions update");
+        assert_eq!(
+            list_event.payload["value"]["catalogRevision"],
+            serde_json::Value::Null
+        );
+        application
+            .validate_session_detail_request(
+                DEVICE_A,
+                "session-a",
+                &format!("sha256:{}", "a".repeat(64)),
+                None,
+            )
+            .expect("detail remains bound to the visible first-page row");
+        assert!(application
+            .validate_session_page_request(DEVICE_A, Some("unsafe-next"), Some("forged-revision"))
+            .is_err());
+
+        let mut detail = fixture_session("session-a");
+        detail.session.files = vec![fixture_file_a()];
+        application
+            .publish_session_detail(DEVICE_A, None, 7, detail)
+            .expect("revisionless detail remains bound by row identity and connection epoch");
+        let detail_event = sink.events().pop().expect("revisionless detail update");
+        assert_eq!(
+            detail_event.payload["value"]["catalogRevision"],
+            serde_json::Value::Null
+        );
+
+        let mut unsafe_page = fixture_session_page(
+            vec![fixture_session("session-a")],
+            Some("unsafe-next"),
+            &format!("sha256:{}", "b".repeat(64)),
+        );
+        unsafe_page.catalog_revision = None;
+        unsafe_page.catalog_authority = SessionCatalogAuthority::Unavailable;
+        unsafe_page.pagination_supported = false;
+        unsafe_page.pagination_unavailable_reason =
+            Some(SessionPaginationUnavailableReason::CatalogRevisionUnavailable);
+        assert!(application
+            .publish_session_page(DEVICE_B, None, None, 4, unsafe_page)
+            .is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn canonical_and_unique_legacy_session_operations_publish_in_gate_order() {
         let (root, application) = test_application("session-operation-alias");
@@ -1570,6 +2899,109 @@ mod tests {
             "无法读取持久化传输投影：injected transfer projection read failure"
         );
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn production_startup_fails_previous_process_download_without_replaying_it() {
+        let root = std::env::temp_dir().join(format!(
+            "ylx-application-interrupted-download-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let app_data_dir = root.join("app-data");
+        std::fs::create_dir_all(&app_data_dir).expect("create app-data directory");
+        let transfer_store_path = app_data_dir.join("transfer_store.sqlite3");
+        let file_id = DomainFileId("left-00000".to_string());
+        let identity = JobIdentity::new(
+            DomainDeviceId("device-startup".to_string()),
+            DomainSessionId("session-startup".to_string()),
+            "revision-startup",
+        )
+        .expect("valid startup fixture identity");
+        let publication = PublicationMaterial::new(
+            "revision-startup",
+            vec![1, 2, 3, 4],
+            vec![7; 64],
+            vec![9; 32],
+        )
+        .expect("valid startup fixture publication");
+        let file = JobFileSpec::new(file_id.clone(), "video/left_00000.mp4", 4, "ab".repeat(32))
+            .expect("valid startup fixture file");
+        let spec = JobSpec::new(
+            identity,
+            publication,
+            vec![file],
+            &[file_id],
+            true,
+            "2026-08-29",
+        )
+        .expect("valid startup fixture spec");
+        {
+            let mut store = TransferStore::open(&transfer_store_path).expect("open transfer store");
+            store
+                .create_job("job-interrupted", &spec, "t0")
+                .expect("seed previous-process non-terminal job");
+        }
+
+        let composition = Composition::new(app_data_dir.clone(), app_data_dir.join("library"))
+            .expect("create inert composition");
+        let app_store =
+            ylx_transfer_core::persistence::AppStore::open(app_data_dir.join("app-state.sqlite3"))
+                .expect("open application store");
+        let state = crate::state::AppState::for_test(
+            composition.clone(),
+            std::sync::Arc::new(app_store),
+            Vec::new(),
+            0,
+        );
+        let application =
+            TransferApplication::new_with_app_data_dir(state.0.clone(), composition, app_data_dir)
+                .expect("startup settles interrupted downloads");
+
+        let job = application
+            .0
+            .composition
+            .stored_job("job-interrupted")
+            .expect("read settled job")
+            .expect("settled job remains durable");
+        assert_eq!(job.state, JobStateTag::Failed);
+        assert_eq!(
+            job.error,
+            Some((INTERRUPTED_DOWNLOAD_FAILURE_CODE.to_string(), true))
+        );
+        let store = TransferStore::open(&transfer_store_path).expect("reopen transfer store");
+        assert!(
+            store
+                .list_recoverable_jobs()
+                .expect("list non-terminal jobs")
+                .is_empty(),
+            "production startup must leave no previous-process download eligible for scheduling"
+        );
+        assert_eq!(
+            store
+                .completion("job-interrupted")
+                .expect("read terminal completion")
+                .expect("interruption is an observable terminal outcome")
+                .outcome,
+            TerminalOutcome::Failed {
+                code: INTERRUPTED_DOWNLOAD_FAILURE_CODE.to_string(),
+                retryable: true,
+            }
+        );
+
+        let source = include_str!("application.rs");
+        let start = source
+            .split("pub fn start(&self, app: AppHandle)")
+            .nth(1)
+            .and_then(|body| body.split("pub fn stop(&self)").next())
+            .expect("locate production start method");
+        assert!(
+            !start.contains("recover_on_startup"),
+            "production start must never call the compatibility recovery dispatcher"
+        );
+
+        drop(store);
+        drop(application);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1813,9 +3245,25 @@ mod tests {
             );
         }
         assert!(
-            command_source.contains(".list_sessions(device_id)"),
+            command_source.contains(".list_sessions(device_id, cursor, catalog_revision)"),
             "list_sessions must remain the sole device-scoped refresh-and-publish read"
         );
+        let lib_source = include_str!("lib.rs");
+        assert!(
+            lib_source.contains("commands::list_sessions,\n            commands::get_session_detail,"),
+            "the lazy session-detail command must remain registered immediately after list_sessions"
+        );
+        for (name, source) in [
+            ("commands", command_source),
+            ("workflows", include_str!("application/workflows.rs")),
+            ("composition", include_str!("composition.rs")),
+            ("registration", lib_source),
+        ] {
+            assert!(
+                !source.contains("download_file"),
+                "the retired selected-file product lane remains in {name}"
+            );
+        }
         for bare_return in [
             "Result<Device, RpcError>",
             "Result<Vec<Device>, RpcError>",
@@ -1860,10 +3308,10 @@ mod tests {
         );
         assert_eq!(
             workflow_source
-                .matches("self.acquire_session_operation(&device_id).await?")
+                .matches("acquire_session_operation(&device_id)")
                 .count(),
-            5,
-            "every session catalog read/mutation must enter the per-device operation gate once"
+            8,
+            "every session catalog read/mutation/complete-session download must enter the per-device operation gate once"
         );
         let refresh_source = composition_source
             .split("fn spawn_sessions_refresh")
@@ -1871,7 +3319,7 @@ mod tests {
             .and_then(|source| source.split("#[derive(Deserialize)]").next())
             .expect("locate the background session refresh helper");
         assert!(
-            refresh_source.contains("application.list_sessions(device_id.clone()).await"),
+            refresh_source.contains(".list_sessions(device_id.clone(), None, None)"),
             "background session refresh must use the gated application path"
         );
         assert!(

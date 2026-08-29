@@ -6,3 +6,7 @@ src-tauri/gen
 src-tauri/Cargo.lock
 src-tauri/crates/Cargo.lock
 fixtures/device-session-v1/central
+# Exact-byte Score contract resources; contracts:check owns their identity.
+contracts/schemas
+contracts/fixtures/corpora
+contracts/openapi/ylx-device-v4.openapi.yaml

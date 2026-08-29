@@ -45,6 +45,22 @@ const catalogSession = {
   files: [],
   downloadStatus: "none",
   backedUp: false,
+  verification: {
+    verdict: "usable",
+    actor: "gateway",
+    validator: { name: "catalog-validator", version: "1", buildSha256: "b".repeat(64) },
+    manifestSha256: "a".repeat(64),
+    verifiedAt: "2026-08-04T01:00:01Z",
+    diagnostics: [],
+  },
+} as const;
+
+const sessionCapabilities = {
+  profile: "legacyPinnedTlsV1",
+  sessionDeletion: { supported: true, source: "profileContract" },
+  sessionDetail: { supported: true, source: "profileContract" },
+  artifactDownload: { supported: true, source: "profileContract" },
+  captureStatus: { supported: false, source: "unavailable" },
 } as const;
 
 const downloadedEntry = {
@@ -223,7 +239,22 @@ test("real app workflow converges through mocked Tauri commands and events", asy
         case "connect_device":
           return "pairing-attempt-1";
         case "list_sessions":
-          return { revision: 4, value: [catalogSession] };
+          return {
+            revision: 4,
+            value: {
+              items: [catalogSession],
+              nextCursor: null,
+              hasMore: false,
+              catalogRevision: "catalog-r1",
+              catalogAuthority: "deviceSnapshot",
+              paginationSupported: true,
+              paginationUnavailableReason: null,
+              capabilities: sessionCapabilities,
+              diagnostics: [],
+            },
+          };
+        case "get_session_detail":
+          return { revision: 4, value: catalogSession };
         case "download_session":
           return "download-job-1";
         case "resume_transfer_job":
@@ -439,6 +470,7 @@ test("real app workflow converges through mocked Tauri commands and events", asy
         [
           "connect_device",
           "list_sessions",
+          "get_session_detail",
           "download_session",
           "resume_transfer_job",
           "retry_transfer",
@@ -449,7 +481,16 @@ test("real app workflow converges through mocked Tauri commands and events", asy
       .map(({ command, payload }) => ({ command, payload }));
     assert.deepEqual(workflowCalls, [
       { command: "connect_device", payload: { deviceId } },
-      { command: "list_sessions", payload: { deviceId } },
+      { command: "list_sessions", payload: { deviceId, cursor: null, catalogRevision: null } },
+      {
+        command: "get_session_detail",
+        payload: {
+          deviceId,
+          sessionId,
+          sessionRevision: "catalog-r1",
+          catalogRevision: "catalog-r1",
+        },
+      },
       { command: "download_session", payload: { deviceId, sessionId } },
       { command: "resume_transfer_job", payload: { jobId: "download-job-1" } },
       { command: "retry_transfer", payload: { jobId: "download-job-1" } },

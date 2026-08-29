@@ -1,0 +1,12 @@
+{
+  "schema": "ylx.api-error.v2",
+  "error": {
+    "code": "catalog_changed",
+    "message": "The session catalog changed; restart pagination without a cursor.",
+    "request_id": "00000000-0000-4000-8000-000000000001",
+    "retryable": true,
+    "details": {
+      "catalog_revision": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  }
+}

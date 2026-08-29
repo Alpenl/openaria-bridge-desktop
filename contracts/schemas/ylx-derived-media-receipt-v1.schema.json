@@ -1,0 +1,330 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ylx:schema:derived-media-receipt:v1",
+  "title": "YLX Derived Media Receipt v1",
+  "description": "A Bridge / Desktop attestation for one verified post-download MP4. Device Session v2 does not declare a manifest signature; any separately authenticated source signature remains source-scoped and never covers this client-derived output.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "receipt_id",
+    "created_at",
+    "origin",
+    "source_manifest",
+    "input_artifacts",
+    "transformer",
+    "output",
+    "timeline_verification",
+    "canonicalization",
+    "provenance"
+  ],
+  "properties": {
+    "schema": {"const": "ylx.derived-media-receipt.v1"},
+    "receipt_id": {"$ref": "#/$defs/uuidV7"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "origin": {
+      "enum": ["new-download", "existing-library-migration"]
+    },
+    "source_manifest": {"$ref": "#/$defs/sourceManifest"},
+    "input_artifacts": {
+      "type": "array",
+      "minItems": 3,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/inputArtifact"},
+      "allOf": [
+        {
+          "contains": {
+            "type": "object",
+            "required": ["role"],
+            "properties": {"role": {"const": "video.left"}}
+          },
+          "minContains": 1
+        },
+        {
+          "contains": {
+            "type": "object",
+            "required": ["role"],
+            "properties": {"role": {"const": "video.right"}}
+          },
+          "minContains": 1
+        },
+        {
+          "contains": {
+            "type": "object",
+            "required": ["role"],
+            "properties": {"role": {"const": "frames.index"}}
+          },
+          "minContains": 1,
+          "maxContains": 1
+        }
+      ]
+    },
+    "transformer": {"$ref": "#/$defs/transformer"},
+    "output": {"$ref": "#/$defs/output"},
+    "timeline_verification": {"$ref": "#/$defs/timelineVerification"},
+    "canonicalization": {"$ref": "#/$defs/canonicalization"},
+    "provenance": {"$ref": "#/$defs/provenance"}
+  },
+  "$defs": {
+    "uuidV7": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "uuidV4": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sourceManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "manifest_id",
+        "session_id",
+        "volume_id",
+        "bytes",
+        "sha256"
+      ],
+      "properties": {
+        "schema": {"const": "ylx.device-session.v2"},
+        "manifest_id": {"$ref": "#/$defs/uuidV7"},
+        "session_id": {"$ref": "#/$defs/uuidV7"},
+        "volume_id": {"$ref": "#/$defs/uuidV4"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "inputArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "role", "bytes", "sha256"],
+      "properties": {
+        "artifact_id": {"$ref": "#/$defs/sha256"},
+        "role": {
+          "enum": ["video.left", "video.right", "audio.wav", "frames.index"]
+        },
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "transformer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "recipe_id", "recipe_version"],
+      "properties": {
+        "name": {"const": "openaria-bridge-desktop"},
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z.-]+)?$"
+        },
+        "recipe_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+        },
+        "recipe_version": {"type": "integer", "minimum": 1}
+      }
+    },
+    "outputAudioPresent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "codec", "sample_rate", "channels"],
+      "properties": {
+        "state": {"const": "present"},
+        "codec": {"const": "aac"},
+        "sample_rate": {"type": "integer", "minimum": 1},
+        "channels": {"type": "integer", "minimum": 1}
+      }
+    },
+    "outputAudioAbsent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "reason"],
+      "properties": {
+        "state": {"const": "absent"},
+        "reason": {"const": "source-not-recorded"}
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "role",
+        "filename",
+        "media_type",
+        "bytes",
+        "sha256",
+        "container",
+        "video_codec",
+        "layout",
+        "width",
+        "eye_width",
+        "height",
+        "audio"
+      ],
+      "properties": {
+        "artifact_id": {"$ref": "#/$defs/sha256"},
+        "role": {"const": "media.derived"},
+        "filename": {
+          "type": "string",
+          "minLength": 5,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*[.]mp4$"
+        },
+        "media_type": {"const": "video/mp4"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "container": {"const": "mp4"},
+        "video_codec": {"const": "h264"},
+        "layout": {"const": "left-right-side-by-side"},
+        "width": {"type": "integer", "minimum": 1},
+        "eye_width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1},
+        "audio": {
+          "oneOf": [
+            {"$ref": "#/$defs/outputAudioPresent"},
+            {"$ref": "#/$defs/outputAudioAbsent"}
+          ]
+        }
+      }
+    },
+    "probeSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "output_sha256",
+        "output_bytes",
+        "video_streams",
+        "audio_streams",
+        "frame_count",
+        "duration_ns",
+        "report_sha256"
+      ],
+      "properties": {
+        "output_sha256": {"$ref": "#/$defs/sha256"},
+        "output_bytes": {"type": "integer", "minimum": 1},
+        "video_streams": {"const": 1},
+        "audio_streams": {"enum": [0, 1]},
+        "frame_count": {"type": "integer", "minimum": 1},
+        "duration_ns": {
+          "description": "max(probed stream ends) - min(probed stream starts), reconstructed from the source timeline plus the positive-or-negative residual fields.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "report_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "timelineVerification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy_id",
+        "verdict",
+        "source_manifest_sha256",
+        "left_right_pairing",
+        "paired_frames",
+        "video_start_residual_ns",
+        "video_end_residual_ns",
+        "audio_start_residual_ns",
+        "audio_end_residual_ns",
+        "source_video_tick_ns",
+        "encoding_audio_frame_ns",
+        "allowed_residual_ns",
+        "preserved_leading_gap_ns",
+        "verified_at",
+        "probe_summary"
+      ],
+      "properties": {
+        "policy_id": {"const": "openaria.manifest-timeline.v1"},
+        "verdict": {"enum": ["pass", "fail"]},
+        "source_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "left_right_pairing": {"enum": ["pass", "fail"]},
+        "paired_frames": {"type": "integer", "minimum": 1},
+        "video_start_residual_ns": {
+          "description": "Probed output video start minus the source-manifest video start, in nanoseconds.",
+          "type": "integer"
+        },
+        "video_end_residual_ns": {
+          "description": "Probed output video end minus the source-manifest video end, in nanoseconds.",
+          "type": "integer"
+        },
+        "audio_start_residual_ns": {
+          "description": "Probed output audio start minus the source-manifest audio start, or null when audio was not recorded.",
+          "oneOf": [{"type": "integer"}, {"type": "null"}]
+        },
+        "audio_end_residual_ns": {
+          "description": "Probed output audio end minus the source-manifest audio end, or null when audio was not recorded.",
+          "oneOf": [{"type": "integer"}, {"type": "null"}]
+        },
+        "source_video_tick_ns": {
+          "description": "ceil(1,000,000,000 / source camera effective_fps).",
+          "type": "integer",
+          "minimum": 1
+        },
+        "encoding_audio_frame_ns": {
+          "description": "ceil(1,024 * 1,000,000,000 / output AAC sample_rate), or null when audio was not recorded.",
+          "oneOf": [
+            {"type": "integer", "minimum": 1},
+            {"type": "null"}
+          ]
+        },
+        "allowed_residual_ns": {
+          "description": "max(source_video_tick_ns, encoding_audio_frame_ns or zero).",
+          "type": "integer",
+          "minimum": 1
+        },
+        "preserved_leading_gap_ns": {
+          "description": "max(0, source audio start - source video start); zero when source audio is absent.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "verified_at": {"type": "string", "format": "date-time"},
+        "probe_summary": {"$ref": "#/$defs/probeSummary"}
+      }
+    },
+    "canonicalization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "committed_at",
+        "local_asset",
+        "required_upload_assets",
+        "source_inputs"
+      ],
+      "properties": {
+        "state": {"const": "committed"},
+        "committed_at": {"type": "string", "format": "date-time"},
+        "local_asset": {"const": "derived-output"},
+        "required_upload_assets": {
+          "const": ["derived-output", "derived-media-receipt"]
+        },
+        "source_inputs": {"const": "temporary-delete-after-commit"}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "derived_authorship",
+        "source_manifest_signature",
+        "device_signature_inheritance",
+        "derived_output_signature"
+      ],
+      "properties": {
+        "derived_authorship": {"const": "openaria-bridge-desktop"},
+        "source_manifest_signature": {
+          "const": "not-declared-by-device-session-v2"
+        },
+        "device_signature_inheritance": {"const": "forbidden"},
+        "derived_output_signature": {"const": "not-device-signed"}
+      }
+    }
+  }
+}

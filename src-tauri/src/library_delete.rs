@@ -8,7 +8,9 @@
 //! committed intents only clean trash.  A marker in every trash operation
 //! directory closes the tiny crash window between rename and intent insert.
 
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -26,6 +28,11 @@ use ylx_transfer_core::persistence::app_store::{
 use ylx_transfer_core::persistence::{AppStore, OperationKind, TransferStore};
 
 use crate::models::LibraryEntry;
+
+#[cfg(test)]
+thread_local! {
+    static INJECT_CLEANUP_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 const TRASH_DIR_NAME: &str = ".ylx-library-trash";
 const MARKER_PREFIX: &str = ".ylx-delete-marker-";
@@ -57,6 +64,75 @@ pub struct DeleteOutcome {
     pub cleanup_complete: bool,
 }
 
+/// A delete can commit its metadata CAS and still be unable to remove the
+/// hidden filesystem payload. This typed result keeps that state visibly
+/// incomplete: callers must report a retryable failure and may only finish it
+/// through an explicit in-process retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteFailure {
+    pub message: String,
+    pub retryable: bool,
+    pub incomplete: bool,
+    pub operation_id: Option<String>,
+    pub committed_revision: Option<u64>,
+}
+
+impl DeleteFailure {
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+            incomplete: false,
+            operation_id: None,
+            committed_revision: None,
+        }
+    }
+
+    fn incomplete(
+        message: impl Into<String>,
+        retryable: bool,
+        operation_id: impl Into<String>,
+        committed_revision: u64,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            retryable,
+            incomplete: true,
+            operation_id: Some(operation_id.into()),
+            committed_revision: Some(committed_revision),
+        }
+    }
+}
+
+impl std::fmt::Display for DeleteFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DeleteFailure {}
+
+impl std::ops::Deref for DeleteFailure {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.message
+    }
+}
+
+impl From<String> for DeleteFailure {
+    fn from(message: String) -> Self {
+        Self::permanent(message)
+    }
+}
+
+impl From<&str> for DeleteFailure {
+    fn from(message: &str) -> Self {
+        Self::permanent(message)
+    }
+}
+
+#[cfg(test)]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RecoveryReport {
     pub rolled_back: usize,
@@ -89,9 +165,9 @@ pub fn delete_entries(
     library_root: &Path,
     expected_revision: u64,
     entries: &[DeleteEntry],
-) -> Result<DeleteOutcome, String> {
+) -> Result<DeleteOutcome, DeleteFailure> {
     if entries.is_empty() {
-        return Err("删除操作缺少本地记录".to_string());
+        return Err(DeleteFailure::permanent("删除操作缺少本地记录"));
     }
     let mut unique_entries: Vec<DeleteEntry> = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -100,10 +176,10 @@ pub fn delete_entries(
             .find(|candidate| candidate.key == entry.key)
         {
             if existing != entry {
-                return Err(format!(
+                return Err(DeleteFailure::permanent(format!(
                     "同一删除批次中的 key 对应多个本地路径：{}",
                     entry.key
-                ));
+                )));
             }
             continue;
         }
@@ -127,7 +203,8 @@ pub fn delete_entries(
         return Err(format!(
             "本地记录正在执行 {} 操作（{}），请稍后重试",
             existing.kind, existing.operation_id
-        ));
+        )
+        .into());
     }
 
     let staged = match stage_entries(library_root, &operation_id, &entries) {
@@ -138,10 +215,10 @@ pub fn delete_entries(
             // restore any entries staged before the failure.
             let recovery = recover_orphan_markers(store, library_root);
             let _ = store.release_operation_leases(&operation_id);
-            return Err(match recovery {
+            return Err(DeleteFailure::permanent(match recovery {
                 Ok(_) => error,
                 Err(recovery) => format!("{error}；部分文件回滚失败：{recovery}"),
-            });
+            }));
         }
     };
     let intents = staged
@@ -159,11 +236,11 @@ pub fn delete_entries(
     if let Err(error) = store.record_library_delete_intents(&intents) {
         let rollback = rollback_staged(library_root, &staged);
         let _ = store.abort_library_delete(&operation_id);
-        return Err(format_delete_failure(
+        return Err(DeleteFailure::permanent(format_delete_failure(
             "无法记录本地删除意图",
             error,
             rollback,
-        ));
+        )));
     }
 
     let committed_revision =
@@ -174,21 +251,34 @@ pub fn delete_entries(
                 if rollback.is_ok() {
                     let _ = store.abort_library_delete(&operation_id);
                 }
-                return Err(format_delete_failure(
+                return Err(DeleteFailure::permanent(format_delete_failure(
                     "无法提交本地资料库删除",
                     error,
                     rollback,
-                ));
+                )));
             }
         };
 
-    // Cleanup is intentionally best effort. The committed intent remains
-    // durable until every payload is gone, so startup recovery retries it.
-    let cleanup_complete = cleanup_committed_delete(store, library_root, &operation_id, &staged);
+    // The metadata CAS is committed, but the operation is not complete until
+    // every hidden payload and marker is gone. Preserve the committed intent
+    // and return a typed retryable failure when cleanup cannot finish.
+    if let Err(error) = cleanup_committed_delete(
+        store,
+        library_root,
+        &operation_id,
+        &staged,
+        cleanup_failure_injected(),
+    ) {
+        return Err(cleanup_delete_failure(
+            error,
+            &operation_id,
+            committed_revision,
+        ));
+    }
     Ok(DeleteOutcome {
         operation_id,
         committed_revision,
-        cleanup_complete,
+        cleanup_complete: true,
     })
 }
 
@@ -346,25 +436,219 @@ fn cleanup_committed_delete(
     library_root: &Path,
     operation_id: &str,
     staged: &[StagedPath],
-) -> bool {
-    if staged.iter().any(|path| {
-        remove_if_exists(&path.marker_path).is_err()
-            || remove_dir_if_exists(&path.trash_path).is_err()
-    }) {
-        return false;
+    inject_failure: bool,
+) -> Result<(), String> {
+    if inject_failure {
+        return Err("injected committed trash cleanup failure".to_string());
+    }
+    // Validate every path and marker before deleting any one of them. A
+    // replacement racing a retry must never turn this cleanup into an
+    // unbound recursive delete; callers can inspect the durable intent and
+    // repair the path explicitly instead.
+    for path in staged {
+        validate_intent_paths(
+            library_root,
+            operation_id,
+            &path.source_path,
+            &path.trash_path,
+        )
+        .map_err(|error| format!("不安全删除 intent 路径：{error}"))?;
+        validate_cleanup_marker(path, operation_id)?;
+        validate_cleanup_payload(&path.trash_path)?;
+    }
+    for path in staged {
+        remove_if_exists(&path.marker_path)?;
+        remove_dir_if_exists(&path.trash_path)?;
     }
     let Some(operation_dir) = staged.first().and_then(|path| path.trash_path.parent()) else {
-        return store.finalize_library_delete(operation_id).is_ok();
+        return store
+            .finalize_library_delete(operation_id)
+            .map_err(|error| format!("无法完成本地删除意图：{error}"));
     };
-    if remove_empty_tree(operation_dir, &library_root.join(TRASH_DIR_NAME)).is_err() {
-        return false;
-    }
-    store.finalize_library_delete(operation_id).is_ok()
+    remove_empty_tree(operation_dir, &library_root.join(TRASH_DIR_NAME))?;
+    store
+        .finalize_library_delete(operation_id)
+        .map_err(|error| format!("无法完成本地删除意图：{error}"))
 }
 
-/// Reconciles all intents and unreferenced marker directories at startup.
-/// Staged work rolls back, committed work finalizes. A malformed or unsafe
-/// intent returns an error rather than silently deleting or moving data.
+fn validate_cleanup_marker(path: &StagedPath, operation_id: &str) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(&path.marker_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "无法检查删除 marker {}：{error}",
+                path.marker_path.display()
+            ))
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "不安全删除 marker 是符号链接：{}",
+            path.marker_path.display()
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "不安全删除 marker 不是文件：{}",
+            path.marker_path.display()
+        ));
+    }
+    let marker = read_marker(&path.marker_path)
+        .map_err(|error| format!("不安全删除 marker 无法验证：{error}"))?;
+    if marker.operation_id != operation_id
+        || marker.entry_key != path.entry_key
+        || Path::new(&marker.source_path) != path.source_path
+        || Path::new(&marker.payload_path) != path.trash_path
+    {
+        return Err(format!(
+            "不安全删除 marker 与已知 intent 不匹配：{}",
+            path.marker_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cleanup_payload(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "拒绝清理符号链接 trash payload：{}",
+            path.display()
+        )),
+        Ok(metadata) if !metadata.is_dir() => {
+            Err(format!("trash payload 不是目录：{}", path.display()))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "无法检查 trash payload {}：{error}",
+            path.display()
+        )),
+    }
+}
+
+fn cleanup_failure_injected() -> bool {
+    #[cfg(test)]
+    {
+        INJECT_CLEANUP_FAILURE.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+fn cleanup_delete_failure(
+    error: String,
+    operation_id: &str,
+    committed_revision: u64,
+) -> DeleteFailure {
+    let unsafe_path = error.contains("符号链接")
+        || error.contains("不是目录")
+        || error.contains("不安全")
+        || error.contains("越出资料库");
+    let prefix = if unsafe_path {
+        "本地删除已提交但 cleanup 遇到未绑定或不安全路径；保留删除意图，拒绝盲目重试"
+    } else {
+        "本地删除已提交但 cleanup 未完成；请在当前进程显式重试删除操作"
+    };
+    DeleteFailure::incomplete(
+        format!("{prefix}：{error}"),
+        !unsafe_path,
+        operation_id,
+        committed_revision,
+    )
+}
+
+/// Explicit, same-process completion for a metadata-committed delete whose
+/// hidden trash cleanup previously failed. Startup deliberately never calls
+/// this path: the caller must retain the operation id from the typed
+/// `DeleteFailure` and ask for a retry while its ownership context is known.
+#[allow(dead_code)]
+pub fn retry_committed_delete(
+    store: &AppStore,
+    library_root: &Path,
+    operation_id: &str,
+) -> Result<DeleteOutcome, DeleteFailure> {
+    validate_library_root(library_root).map_err(DeleteFailure::from)?;
+    if operation_id.trim().is_empty()
+        || Path::new(operation_id).components().count() != 1
+        || !matches!(
+            Path::new(operation_id).components().next(),
+            Some(Component::Normal(_))
+        )
+    {
+        return Err(DeleteFailure::permanent("删除操作 id 不安全"));
+    }
+    let intents = store
+        .list_library_delete_intents()
+        .map_err(|error| DeleteFailure::permanent(format!("无法读取本地删除意图：{error}")))?
+        .into_iter()
+        .filter(|intent| intent.operation_id == operation_id)
+        .collect::<Vec<_>>();
+    if intents.is_empty() {
+        return Err(DeleteFailure::permanent(
+            "没有可由当前进程显式重试的已提交删除意图",
+        ));
+    }
+    if intents
+        .iter()
+        .any(|intent| intent.state != LibraryDeleteIntentState::Committed)
+    {
+        return Err(DeleteFailure::permanent(
+            "删除意图尚未完成 metadata commit，拒绝显式清理",
+        ));
+    }
+    let revision = store
+        .load()
+        .map_err(|error| DeleteFailure::permanent(format!("无法读取本地资料库 revision：{error}")))?
+        .revision;
+    let staged = intents
+        .iter()
+        .map(|intent| {
+            validate_intent_paths(
+                library_root,
+                &intent.operation_id,
+                &intent.source_path,
+                &intent.trash_path,
+            )
+            .map_err(|error| format!("不安全删除 intent 路径：{error}"))?;
+            let payload_name = intent
+                .trash_path
+                .file_name()
+                .ok_or_else(|| "不安全删除 intent trash payload 名称缺失".to_string())?;
+            let marker_suffix = payload_name
+                .to_str()
+                .and_then(|name| name.strip_prefix(PAYLOAD_PREFIX))
+                .ok_or_else(|| "不安全删除 intent trash payload 名称无效".to_string())?;
+            Ok(StagedPath {
+                entry_key: intent.entry_key.clone(),
+                source_path: intent.source_path.clone(),
+                trash_path: intent.trash_path.clone(),
+                marker_path: intent
+                    .trash_path
+                    .with_file_name(format!("{MARKER_PREFIX}{marker_suffix}")),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(|error| cleanup_delete_failure(error, operation_id, revision))?;
+    if let Err(error) = cleanup_committed_delete(store, library_root, operation_id, &staged, false)
+    {
+        return Err(cleanup_delete_failure(error, operation_id, revision));
+    }
+    Ok(DeleteOutcome {
+        operation_id: operation_id.to_string(),
+        committed_revision: revision,
+        cleanup_complete: true,
+    })
+}
+
+/// Legacy/test-only recovery helper. Production startup deliberately does not
+/// call this function: a delete left incomplete by another process remains
+/// visible as an unresolved durable intent until the owning process performs
+/// an explicit retry. Keeping the helper under `cfg(test)` preserves crash
+/// simulation coverage without making boot an implicit mutator.
+#[cfg(test)]
 pub fn recover_pending_deletes(
     store: &AppStore,
     library_root: &Path,
@@ -704,6 +988,7 @@ fn validate_marker(
     Ok(())
 }
 
+#[cfg(test)]
 fn restore_intent(library_root: &Path, intent: &LibraryDeleteIntent) -> Result<(), String> {
     validate_intent_paths(
         library_root,
@@ -907,6 +1192,7 @@ fn read_marker(path: &Path) -> Result<TrashMarker, String> {
     serde_json::from_slice(&raw).map_err(|error| format!("删除 marker 损坏：{error}"))
 }
 
+#[cfg(test)]
 fn marker_name_for(payload: &Path) -> String {
     payload
         .file_name()
@@ -917,6 +1203,11 @@ fn marker_name_for(payload: &Path) -> String {
 }
 
 fn remove_if_exists(path: &Path) -> Result<(), String> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(format!("拒绝删除符号链接：{}", path.display()));
+        }
+    }
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1019,6 +1310,10 @@ mod tests {
         (dir, store, root)
     }
 
+    fn set_cleanup_failure(injected: bool) {
+        INJECT_CLEANUP_FAILURE.with(|flag| flag.set(injected));
+    }
+
     #[test]
     fn interrupted_upload_cancellation_releases_its_lease_for_delete_and_new_upload() {
         let (_dir, store, _root) = store_and_root();
@@ -1102,6 +1397,186 @@ mod tests {
         assert_eq!(retry.committed_revision, outcome.committed_revision);
         assert_eq!(store.load().unwrap().revision, outcome.committed_revision);
         assert!(store.list_library_delete_intents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn committed_cleanup_failure_is_retryable_incomplete_until_explicit_retry() {
+        let (_dir, store, root) = store_and_root();
+        let source = root.join("device").join("session");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("video.mp4"), b"bytes").unwrap();
+        store
+            .save(
+                &[AppLibraryPayload {
+                    entry_key: "device|session".to_string(),
+                    payload: b"entry".to_vec(),
+                }],
+                b"storage",
+            )
+            .unwrap();
+        let entry = DeleteEntry {
+            key: "device|session".to_string(),
+            device_id: "device".to_string(),
+            session_id: "session".to_string(),
+        };
+
+        set_cleanup_failure(true);
+        let failure = delete_entries(&store, &root, 1, std::slice::from_ref(&entry))
+            .expect_err("committed cleanup failure must not report delete success");
+        set_cleanup_failure(false);
+
+        assert!(failure.retryable);
+        assert!(failure.incomplete);
+        let operation_id = failure
+            .operation_id
+            .clone()
+            .expect("incomplete failure carries operation id");
+        assert!(operation_id.starts_with("delete-"));
+        assert_eq!(failure.committed_revision, Some(2));
+        assert!(
+            !source.exists(),
+            "metadata commit keeps the source staged in trash"
+        );
+        assert_eq!(store.list_library_delete_intents().unwrap().len(), 1);
+        assert_eq!(store.list_operation_leases().unwrap().len(), 1);
+
+        let outcome = retry_committed_delete(&store, &root, &operation_id)
+            .expect("explicit retry completes the committed delete");
+        assert_eq!(outcome.committed_revision, 2);
+        assert!(outcome.cleanup_complete);
+        assert!(store.list_library_delete_intents().unwrap().is_empty());
+        assert!(store.list_operation_leases().unwrap().is_empty());
+        assert!(!root.join(TRASH_DIR_NAME).join(&operation_id).exists());
+    }
+
+    #[test]
+    fn explicit_retry_refuses_replaced_payload_without_releasing_intent() {
+        let (_dir, store, root) = store_and_root();
+        let source = root.join("device").join("session");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("video.mp4"), b"bytes").unwrap();
+        store
+            .save(
+                &[AppLibraryPayload {
+                    entry_key: "device|session".to_string(),
+                    payload: b"entry".to_vec(),
+                }],
+                b"storage",
+            )
+            .unwrap();
+        let operation_id = "delete-replaced-payload";
+        let entry = DeleteEntry {
+            key: "device|session".to_string(),
+            device_id: "device".to_string(),
+            session_id: "session".to_string(),
+        };
+        store
+            .acquire_operation_leases(
+                operation_id,
+                std::slice::from_ref(&entry.key),
+                "delete",
+                "now",
+            )
+            .unwrap();
+        let staged = stage_entries(&root, operation_id, std::slice::from_ref(&entry)).unwrap();
+        store
+            .record_library_delete_intents(&[LibraryDeleteIntent {
+                operation_id: operation_id.to_string(),
+                entry_key: entry.key.clone(),
+                source_path: staged[0].source_path.clone(),
+                trash_path: staged[0].trash_path.clone(),
+                expected_revision: 1,
+                state: LibraryDeleteIntentState::Staged,
+                created_at: "now".to_string(),
+            }])
+            .unwrap();
+        store
+            .commit_library_delete_if_revision(1, operation_id, &[entry.key])
+            .unwrap();
+
+        fs::remove_dir_all(&staged[0].trash_path).unwrap();
+        fs::write(&staged[0].trash_path, b"foreign replacement").unwrap();
+        let failure = retry_committed_delete(&store, &root, operation_id)
+            .expect_err("replacement payload must never be blindly deleted");
+        assert!(failure.incomplete);
+        assert!(!failure.retryable);
+        assert_eq!(failure.operation_id.as_deref(), Some(operation_id));
+        assert_eq!(failure.committed_revision, Some(2));
+        assert_eq!(
+            fs::read(&staged[0].trash_path).unwrap(),
+            b"foreign replacement"
+        );
+        assert!(staged[0].marker_path.exists());
+        assert_eq!(store.list_library_delete_intents().unwrap().len(), 1);
+        assert_eq!(store.list_operation_leases().unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_retry_refuses_symlink_payload_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, store, root) = store_and_root();
+        let source = root.join("device").join("session");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("video.mp4"), b"bytes").unwrap();
+        store
+            .save(
+                &[AppLibraryPayload {
+                    entry_key: "device|session".to_string(),
+                    payload: b"entry".to_vec(),
+                }],
+                b"storage",
+            )
+            .unwrap();
+        let operation_id = "delete-symlink-payload";
+        let entry = DeleteEntry {
+            key: "device|session".to_string(),
+            device_id: "device".to_string(),
+            session_id: "session".to_string(),
+        };
+        store
+            .acquire_operation_leases(
+                operation_id,
+                std::slice::from_ref(&entry.key),
+                "delete",
+                "now",
+            )
+            .unwrap();
+        let staged = stage_entries(&root, operation_id, std::slice::from_ref(&entry)).unwrap();
+        store
+            .record_library_delete_intents(&[LibraryDeleteIntent {
+                operation_id: operation_id.to_string(),
+                entry_key: entry.key.clone(),
+                source_path: staged[0].source_path.clone(),
+                trash_path: staged[0].trash_path.clone(),
+                expected_revision: 1,
+                state: LibraryDeleteIntentState::Staged,
+                created_at: "now".to_string(),
+            }])
+            .unwrap();
+        store
+            .commit_library_delete_if_revision(1, operation_id, &[entry.key])
+            .unwrap();
+
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), b"keep").unwrap();
+        fs::remove_dir_all(&staged[0].trash_path).unwrap();
+        symlink(&outside, &staged[0].trash_path).unwrap();
+        let failure = retry_committed_delete(&store, &root, operation_id)
+            .expect_err("symlink payload must never be followed or deleted");
+        assert!(failure.incomplete);
+        assert!(!failure.retryable);
+        assert_eq!(failure.operation_id.as_deref(), Some(operation_id));
+        assert!(fs::symlink_metadata(&staged[0].trash_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(outside.join("keep.txt").exists());
+        assert!(staged[0].marker_path.exists());
+        assert_eq!(store.list_library_delete_intents().unwrap().len(), 1);
+        assert_eq!(store.list_operation_leases().unwrap().len(), 1);
     }
 
     #[test]

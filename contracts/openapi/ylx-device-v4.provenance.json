@@ -1,0 +1,8 @@
+{
+  "schema": "openaria.bridge.desktop.vendored-device-api-contract.v1",
+  "source_repository": "https://github.com/mirrorbloom/openaria-score",
+  "source_commit": "91a92d676bfeb96aa60b48d46f194c083d7aa32d",
+  "source_path": "contracts/openapi/ylx-device-v4.openapi.yaml",
+  "sha256": "b6f3c677c038e55c03581c587973811b0aa2dc91cfb8b602a95128fbac225827",
+  "bytes": 124739
+}

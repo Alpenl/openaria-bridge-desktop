@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use crate::device::{CaptureActivityState, ConnectionState};
 use crate::domain::{DeviceId, SessionId};
 
+use super::commit::DownloadCommitOutcome;
 use super::progress::JobProgress;
 use super::queue::InterruptReason;
 use super::{FailureCode, JobId, TransferJobState};
@@ -100,6 +101,7 @@ pub fn is_legal_transition(from: &TransferJobState, to: &TransferJobState) -> bo
             | (S::Committing, S::Succeeded)
             | (S::Committing, S::RetryWait)
             | (S::Committing, S::Failed { .. })
+            | (S::Committing, S::Cancelling)
             | (S::RetryWait, S::Queued)
             | (S::RetryWait, S::Preparing)
             | (S::RetryWait, S::Cancelling)
@@ -283,7 +285,7 @@ pub enum WorkerReport {
     /// Verification finished.
     Verified,
     /// The atomic session commit finished.
-    CommitComplete,
+    CommitComplete(DownloadCommitOutcome),
     CommitFailed {
         code: FailureCode,
         retryable: bool,
@@ -303,7 +305,7 @@ impl WorkerReport {
             | WorkerReport::Interrupted(_) => Some(TransferJobState::Transferring),
             WorkerReport::WorkerPanicked { .. } => None,
             WorkerReport::Verified => Some(TransferJobState::Verifying),
-            WorkerReport::CommitComplete | WorkerReport::CommitFailed { .. } => {
+            WorkerReport::CommitComplete(_) | WorkerReport::CommitFailed { .. } => {
                 Some(TransferJobState::Committing)
             }
         }
@@ -319,7 +321,7 @@ impl WorkerReport {
             WorkerReport::WorkerPanicked { .. } => "worker_panicked",
             WorkerReport::Interrupted(_) => "interrupted",
             WorkerReport::Verified => "verified",
-            WorkerReport::CommitComplete => "commit_complete",
+            WorkerReport::CommitComplete(_) => "commit_complete",
             WorkerReport::CommitFailed { .. } => "commit_failed",
         }
     }
@@ -687,7 +689,7 @@ impl JobAggregate {
             WorkerReport::Prepared => TransferJobState::Transferring,
             WorkerReport::TransferComplete => TransferJobState::Verifying,
             WorkerReport::Verified => TransferJobState::Committing,
-            WorkerReport::CommitComplete => TransferJobState::Succeeded,
+            WorkerReport::CommitComplete(_) => TransferJobState::Succeeded,
             WorkerReport::PreparationFailed { code, retryable }
             | WorkerReport::TransferFailed { code, retryable }
             | WorkerReport::CommitFailed { code, retryable } => TransferJobState::Failed {
@@ -697,7 +699,10 @@ impl JobAggregate {
             WorkerReport::WorkerPanicked { .. } => unreachable!("handled above"),
             WorkerReport::Interrupted(_) => unreachable!("handled above"),
         };
-        Decision::accepted(vec![self.commit(to)])
+        Decision::accepted(vec![Effect::Commit {
+            expected_version: self.version,
+            to,
+        }])
     }
 
     /// Convert a caught worker panic into a terminal failed row through the
@@ -750,7 +755,9 @@ impl JobAggregate {
         let valid_state = match reason {
             InterruptReason::Cancel => matches!(
                 self.state,
-                TransferJobState::Transferring | TransferJobState::Cancelling
+                TransferJobState::Transferring
+                    | TransferJobState::Committing
+                    | TransferJobState::Cancelling
             ),
             InterruptReason::Shutdown
             | InterruptReason::UserPause
@@ -768,16 +775,22 @@ impl JobAggregate {
             // owner is exactly whoever is reporting this.
             InterruptReason::Cancel => self.decide_finalize_cancel(),
             // A shutdown leaves the state alone: startup reconciliation
-            // owns moving an interrupted `transferring` row to `retry_wait`.
+            // owns failing an interrupted `transferring` row on the next
+            // production startup without scheduling it.
             InterruptReason::Shutdown => Decision::no_op(),
-            InterruptReason::UserPause
-            | InterruptReason::CapturePause
-            | InterruptReason::DeviceLost => {
+            InterruptReason::DeviceLost => Decision::accepted(vec![
+                Effect::ClearInterrupt,
+                self.commit(TransferJobState::Failed {
+                    code: FailureCode::Network,
+                    retryable: true,
+                }),
+            ]),
+            InterruptReason::UserPause | InterruptReason::CapturePause => {
                 let target = match reason {
                     InterruptReason::CapturePause => TransferJobState::PausedCaptureActive,
-                    // `retry_wait` is this graph's resting state; the next
-                    // device observation moves it to the parked state that
-                    // actually describes why it is not running.
+                    // `retry_wait` is reserved for a user-paused attempt that
+                    // may be resumed explicitly in this process. A device or
+                    // network interruption is terminal instead.
                     _ => TransferJobState::RetryWait,
                 };
                 let Some(commits) = self.commits_towards(&target) else {
@@ -1159,6 +1172,7 @@ mod tests {
             "verifying->failed",
             "committing->retry_wait",
             "committing->succeeded",
+            "committing->cancelling",
             "committing->failed",
             "retry_wait->queued",
             "retry_wait->preparing",
@@ -1176,7 +1190,7 @@ mod tests {
             .collect();
         expected_sorted.sort();
         assert_eq!(legal_sorted, expected_sorted);
-        assert_eq!(expected_sorted.len(), 36);
+        assert_eq!(expected_sorted.len(), 37);
     }
 
     #[test]
@@ -1297,12 +1311,13 @@ mod tests {
             "verifying+finalize_cancel => accepted -> cancelled",
             "verifying+retry => rejected:not_failed -> verifying",
             "verifying+dismiss => rejected:not_terminal -> verifying",
-            // committing — no cancel edge exists out of committing
+            // committing remains cancellable until the committer claims its
+            // atomic canonical publication point.
             "committing+transition => rejected:illegal -> committing",
             "committing+pause => accepted -> committing",
             "committing+resume => accepted -> committing",
-            "committing+cancel => rejected:illegal -> committing",
-            "committing+finalize_cancel => rejected:illegal -> committing",
+            "committing+cancel => accepted -> cancelling",
+            "committing+finalize_cancel => accepted -> cancelled",
             "committing+retry => rejected:not_failed -> committing",
             "committing+dismiss => rejected:not_terminal -> committing",
             // retry_wait
@@ -1460,7 +1475,7 @@ mod tests {
             commits[0],
             &Effect::Commit {
                 expected_version: 1,
-                to: TransferJobState::Cancelled
+                to: TransferJobState::Cancelled,
             }
         );
     }
@@ -1659,6 +1674,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn device_loss_interruption_fails_the_attempt_instead_of_parking_for_auto_resume() {
+        let decision = JobAggregate::new(TransferJobState::Transferring).decide(
+            JobCommand::Worker(WorkerReport::Interrupted(InterruptReason::DeviceLost)),
+        );
+
+        assert_eq!(decision.outcome, CommandOutcome::Accepted);
+        assert_eq!(
+            decision.effects,
+            vec![
+                Effect::ClearInterrupt,
+                Effect::Commit {
+                    expected_version: 1,
+                    to: TransferJobState::Failed {
+                        code: FailureCode::Network,
+                        retryable: true,
+                    },
+                },
+            ]
+        );
+    }
+
     // -----------------------------------------------------------------
     // Commit 42: worker-reported stages
     // -----------------------------------------------------------------
@@ -1684,7 +1721,7 @@ mod tests {
             WorkerReport::Interrupted(InterruptReason::Cancel),
             WorkerReport::Interrupted(InterruptReason::Shutdown),
             WorkerReport::Verified,
-            WorkerReport::CommitComplete,
+            WorkerReport::CommitComplete(DownloadCommitOutcome::clean()),
             WorkerReport::CommitFailed {
                 code: FailureCode::DiskFull,
                 retryable: false,
@@ -1712,7 +1749,7 @@ mod tests {
             ),
             (
                 TransferJobState::Committing,
-                WorkerReport::CommitComplete,
+                WorkerReport::CommitComplete(DownloadCommitOutcome::clean()),
                 TransferJobState::Succeeded,
             ),
             (
@@ -1728,7 +1765,10 @@ mod tests {
             (
                 TransferJobState::Transferring,
                 WorkerReport::Interrupted(InterruptReason::DeviceLost),
-                TransferJobState::RetryWait,
+                TransferJobState::Failed {
+                    code: FailureCode::Network,
+                    retryable: true,
+                },
             ),
             (
                 TransferJobState::Transferring,
@@ -1780,6 +1820,7 @@ mod tests {
                 let Effect::Commit {
                     expected_version: actual_version,
                     to,
+                    ..
                 } = effect
                 else {
                     continue;
@@ -1804,7 +1845,9 @@ mod tests {
                     matches!(report, WorkerReport::Interrupted(InterruptReason::Cancel))
                         && matches!(
                             &state,
-                            TransferJobState::Transferring | TransferJobState::Cancelling
+                            TransferJobState::Transferring
+                                | TransferJobState::Committing
+                                | TransferJobState::Cancelling
                         );
                 let panic_report = matches!(report, WorkerReport::WorkerPanicked { .. });
                 if !matches_stage
@@ -1888,6 +1931,7 @@ mod tests {
                     let Effect::Commit {
                         expected_version: v,
                         to,
+                        ..
                     } = effect
                     else {
                         continue;

@@ -37,11 +37,17 @@ import type {
 } from "../ui/media/types";
 import { visibleSnapshotsEqual } from "../ui/visibleSnapshot";
 import type { BackendEvent, BackendSnapshot } from "./backend";
+import { sessionHasUsableVerification } from "../types";
 import type {
   Device,
   LibraryEntry,
   PairingResolutionPayload,
   RpcError,
+  SessionCatalogAuthority,
+  SessionCatalogDiagnostic,
+  SessionCapabilities,
+  SessionPaginationUnavailableReason,
+  SessionPageView,
   SessionView,
   StorageConfig,
   Transfer,
@@ -94,11 +100,63 @@ export const PLACEHOLDER_STORAGE: StorageConfig = {
   activeDownloadRoot: "",
 };
 
+const UNAVAILABLE_CAPABILITY = { supported: false, source: "unavailable" } as const;
+
+/** Missing/legacy capability metadata is deliberately non-authoritative. */
+export const UNAVAILABLE_SESSION_CAPABILITIES: SessionCapabilities = {
+  profile: "unknown",
+  sessionDeletion: UNAVAILABLE_CAPABILITY,
+  sessionDetail: UNAVAILABLE_CAPABILITY,
+  artifactDownload: UNAVAILABLE_CAPABILITY,
+  captureStatus: UNAVAILABLE_CAPABILITY,
+};
+
+export interface SessionDetailState {
+  readonly loading: boolean;
+  readonly error: string | null;
+  readonly sessionRevision: string;
+  readonly catalogRevision: string | null;
+  readonly manifestSha256: string;
+}
+
+export interface SessionCatalogState {
+  readonly catalogRevision: string | null;
+  readonly nextCursor: string | null;
+  readonly hasMore: boolean;
+  readonly catalogAuthority: SessionCatalogAuthority;
+  readonly paginationSupported: boolean;
+  readonly paginationUnavailableReason: SessionPaginationUnavailableReason | null;
+  readonly capabilities: SessionCapabilities;
+  readonly diagnostics: readonly SessionCatalogDiagnostic[];
+  readonly loadingMore: boolean;
+  readonly loadMoreError: string | null;
+  readonly details: ReadonlyMap<string, SessionDetailState>;
+}
+
+function idleSessionCatalog(): SessionCatalogState {
+  return {
+    catalogRevision: null,
+    nextCursor: null,
+    hasMore: false,
+    catalogAuthority: "unavailable",
+    paginationSupported: false,
+    paginationUnavailableReason: "catalogRevisionUnavailable",
+    capabilities: UNAVAILABLE_SESSION_CAPABILITIES,
+    diagnostics: [],
+    loadingMore: false,
+    loadMoreError: null,
+    details: new Map(),
+  };
+}
+
 export interface AppState {
   devices: Resource<Device[]>;
   /** Keyed by device ids that arrive from the LAN, so a `Map` rather than a
    * plain object (see `UiState.openRows` for the same reason). */
   sessions: Map<string, Resource<SessionView[]>>;
+  /** Pagination/capability/detail state is separate so existing list
+   * selectors keep returning plain session rows. */
+  sessionCatalogs: Map<string, SessionCatalogState>;
   library: Resource<LibraryEntry[]>;
   transfers: Resource<Transfer[]>;
   transferJobs: Resource<TransferJobEvent[]>;
@@ -110,6 +168,7 @@ export function createAppState(): AppState {
   return {
     devices: idleResource(),
     sessions: new Map(),
+    sessionCatalogs: new Map(),
     library: idleResource(),
     transfers: idleResource(),
     transferJobs: idleResource(),
@@ -134,6 +193,57 @@ export type Action =
     }
   | { type: "devices/loaded"; revision: number; devices: Device[] }
   | { type: "sessions/loaded"; revision: number; deviceId: string; sessions: SessionView[] }
+  | {
+      type: "sessions/catalogLoaded";
+      revision: number;
+      deviceId: string;
+      sessions: SessionView[];
+      catalogRevision: string | null;
+      nextCursor: string | null;
+      hasMore: boolean;
+      catalogAuthority: SessionCatalogAuthority;
+      paginationSupported: boolean;
+      paginationUnavailableReason: SessionPaginationUnavailableReason | null;
+      capabilities: SessionCapabilities;
+      diagnostics: SessionCatalogDiagnostic[];
+    }
+  | {
+      type: "sessions/pageLoaded";
+      revision: number;
+      deviceId: string;
+      page: SessionPageView;
+      mode: "replace" | "append";
+      expectedCatalogRevision?: string;
+    }
+  | { type: "sessions/loadMoreStarted"; deviceId: string; catalogRevision: string; cursor: string }
+  | { type: "sessions/loadMoreFailed"; deviceId: string; catalogRevision: string; cursor: string; error: string }
+  | { type: "sessions/catalogInvalidated"; deviceId: string; catalogRevision: string; cursor: string }
+  | {
+      type: "sessions/detailStarted";
+      deviceId: string;
+      sessionId: string;
+      sessionRevision: string;
+      catalogRevision: string | null;
+      manifestSha256: string;
+    }
+  | {
+      type: "sessions/detailFailed";
+      deviceId: string;
+      sessionId: string;
+      sessionRevision: string;
+      catalogRevision: string | null;
+      manifestSha256: string;
+      error: string;
+    }
+  | {
+      type: "sessions/detailLoaded";
+      revision: number;
+      deviceId: string;
+      detail: SessionView;
+      sessionRevision: string;
+      catalogRevision: string | null;
+      manifestSha256: string;
+    }
   | { type: "library/loaded"; revision: number; library: LibraryEntry[] }
   | { type: "transfers/loaded"; revision: number; transfers: Transfer[] }
   | { type: "transferJobs/loaded"; revision: number; jobs: TransferJobEvent[] }
@@ -239,6 +349,167 @@ function resourceField(resource: ResourceKey): Exclude<ResourceKey, "storageConf
   return resource === "storageConfig" ? "storage" : resource;
 }
 
+function usableManifestSha256(session: SessionView): string | null {
+  return sessionHasUsableVerification(session) ? session.verification!.manifestSha256 : null;
+}
+
+function canRetainFetchedDetail(current: SessionView, candidate: SessionView): boolean {
+  const currentManifest = usableManifestSha256(current);
+  const candidateManifest = usableManifestSha256(candidate);
+  return (
+    current.revision === candidate.revision &&
+    candidate.files.length === 0 &&
+    current.files.length > 0 &&
+    currentManifest !== null &&
+    currentManifest === candidateManifest
+  );
+}
+
+function mergeCatalogDiagnostics(
+  existing: readonly SessionCatalogDiagnostic[],
+  incoming: readonly SessionCatalogDiagnostic[],
+): SessionCatalogDiagnostic[] | null {
+  const merged = [...existing];
+  const positions = new Map(merged.map((diagnostic, index) => [diagnostic.quarantineId, index]));
+  for (const diagnostic of incoming) {
+    const position = positions.get(diagnostic.quarantineId);
+    if (position === undefined) {
+      positions.set(diagnostic.quarantineId, merged.length);
+      merged.push(diagnostic);
+    } else {
+      return null;
+    }
+  }
+  return merged;
+}
+
+function hasDuplicateSessionIdentity(sessions: readonly SessionView[]): boolean {
+  const seen = new Set<string>();
+  for (const session of sessions) {
+    if (seen.has(session.id)) return true;
+    seen.add(session.id);
+  }
+  return false;
+}
+
+function hasDuplicateDiagnosticIdentity(diagnostics: readonly SessionCatalogDiagnostic[]): boolean {
+  const seen = new Set<string>();
+  for (const diagnostic of diagnostics) {
+    if (seen.has(diagnostic.quarantineId)) return true;
+    seen.add(diagnostic.quarantineId);
+  }
+  return false;
+}
+
+function sameCatalogMetadata(current: SessionCatalogState, page: SessionPageView): boolean {
+  return (
+    current.catalogRevision === page.catalogRevision &&
+    current.nextCursor === page.nextCursor &&
+    current.hasMore === page.hasMore &&
+    current.catalogAuthority === page.catalogAuthority &&
+    current.paginationSupported === page.paginationSupported &&
+    current.paginationUnavailableReason === page.paginationUnavailableReason &&
+    visibleSnapshotsEqual(current.capabilities, page.capabilities)
+  );
+}
+
+function sameCatalogEventSnapshot(
+  current: Resource<SessionView[]>,
+  catalog: SessionCatalogState,
+  action: Extract<Action, { type: "sessions/catalogLoaded" }>,
+): boolean {
+  return (
+    visibleSnapshotsEqual(current.value ?? [], action.sessions) &&
+    catalog.catalogRevision === action.catalogRevision &&
+    catalog.nextCursor === action.nextCursor &&
+    catalog.hasMore === action.hasMore &&
+    catalog.catalogAuthority === action.catalogAuthority &&
+    catalog.paginationSupported === action.paginationSupported &&
+    catalog.paginationUnavailableReason === action.paginationUnavailableReason &&
+    visibleSnapshotsEqual(catalog.capabilities, action.capabilities) &&
+    visibleSnapshotsEqual(catalog.diagnostics, action.diagnostics)
+  );
+}
+
+function pageIsCurrentSnapshotSuffix<T>(current: readonly T[], incoming: readonly T[]): boolean {
+  if (incoming.length > current.length) return false;
+  const offset = current.length - incoming.length;
+  return visibleSnapshotsEqual(current.slice(offset), incoming);
+}
+
+function mergeSessionViews(existing: readonly SessionView[], incoming: readonly SessionView[]): SessionView[] {
+  const merged = [...existing];
+  const positions = new Map(merged.map((session, index) => [session.id, index]));
+  for (const candidate of incoming) {
+    const position = positions.get(candidate.id);
+    if (position === undefined) {
+      positions.set(candidate.id, merged.length);
+      merged.push(candidate);
+      continue;
+    }
+    const current = merged[position];
+    merged[position] = canRetainFetchedDetail(current, candidate) ? { ...candidate, files: current.files } : candidate;
+  }
+  return merged;
+}
+
+function repeatsSessionIdentity(existing: readonly SessionView[], incoming: readonly SessionView[]): boolean {
+  const seen = new Set(existing.map((session) => session.id));
+  for (const session of incoming) {
+    if (seen.has(session.id)) return true;
+    seen.add(session.id);
+  }
+  return false;
+}
+
+function preservesAppendNewestFirstBoundary(
+  existing: readonly SessionView[],
+  incoming: readonly SessionView[],
+): boolean {
+  const previous = existing[existing.length - 1];
+  const next = incoming[0];
+  if (previous === undefined || next === undefined) return true;
+  const previousStartedAt = Date.parse(previous.dateLabel);
+  const nextStartedAt = Date.parse(next.dateLabel);
+  if (!Number.isFinite(previousStartedAt) || !Number.isFinite(nextStartedAt)) return false;
+  return previousStartedAt > nextStartedAt || (previousStartedAt === nextStartedAt && previous.id > next.id);
+}
+
+/** Replace with the authoritative complete snapshot while retaining an
+ * already-fetched detail only for the exact same session revision. */
+function replaceSessionViews(existing: readonly SessionView[], incoming: readonly SessionView[]): SessionView[] {
+  const previous = new Map(existing.map((session) => [session.id, session]));
+  return incoming.map((candidate) => {
+    const current = previous.get(candidate.id);
+    return current !== undefined && canRetainFetchedDetail(current, candidate)
+      ? { ...candidate, files: current.files }
+      : candidate;
+  });
+}
+
+function retainMatchingDetailStates(
+  details: ReadonlyMap<string, SessionDetailState>,
+  sessions: readonly SessionView[],
+  catalogRevision: string | null,
+): ReadonlyMap<string, SessionDetailState> {
+  if (catalogRevision === null) return new Map();
+  const retained = new Map<string, SessionDetailState>();
+  for (const session of sessions) {
+    const detail = details.get(session.id);
+    const manifestSha256 = usableManifestSha256(session);
+    if (
+      detail !== undefined &&
+      manifestSha256 !== null &&
+      detail.catalogRevision === catalogRevision &&
+      detail.sessionRevision === session.revision &&
+      detail.manifestSha256 === manifestSha256
+    ) {
+      retained.set(session.id, detail);
+    }
+  }
+  return retained;
+}
+
 export function createAppStore(initial: AppState = createAppState()): AppStore {
   const state = initial;
 
@@ -248,6 +519,176 @@ export function createAppStore(initial: AppState = createAppState()): AppStore {
 
   function commitSessions(deviceId: string, next: Resource<SessionView[]>): void {
     state.sessions.set(deviceId, next);
+  }
+
+  function sessionCatalog(deviceId: string): SessionCatalogState {
+    return state.sessionCatalogs.get(deviceId) ?? idleSessionCatalog();
+  }
+
+  function commitSessionCatalog(deviceId: string, next: SessionCatalogState): void {
+    state.sessionCatalogs.set(deviceId, next);
+  }
+
+  function commitCatalogSnapshot(action: Extract<Action, { type: "sessions/catalogLoaded" }>): CommitResult {
+    const current = sessionsResource(action.deviceId);
+    if (action.revision < current.revision) return STALE;
+    const currentCatalog = sessionCatalog(action.deviceId);
+    if (hasDuplicateSessionIdentity(action.sessions) || hasDuplicateDiagnosticIdentity(action.diagnostics)) {
+      return STALE;
+    }
+    if (action.revision === current.revision) {
+      return sameCatalogEventSnapshot(current, currentCatalog, action) ? UNCHANGED : STALE;
+    }
+    const sessions =
+      action.catalogRevision === null
+        ? [...action.sessions]
+        : replaceSessionViews(current.value ?? [], action.sessions);
+    const details = retainMatchingDetailStates(currentCatalog.details, sessions, action.catalogRevision);
+    commitSessions(action.deviceId, {
+      loading: false,
+      value: sessions,
+      error: null,
+      rpcError: null,
+      revision: action.revision,
+      lastGood: sessions,
+    });
+    commitSessionCatalog(action.deviceId, {
+      catalogRevision: action.catalogRevision,
+      nextCursor: action.nextCursor,
+      hasMore: action.hasMore,
+      catalogAuthority: action.catalogAuthority,
+      paginationSupported: action.paginationSupported,
+      paginationUnavailableReason: action.paginationUnavailableReason,
+      capabilities: action.capabilities,
+      diagnostics: action.diagnostics,
+      loadingMore: false,
+      loadMoreError: null,
+      details,
+    });
+    return CHANGED;
+  }
+
+  function commitSessionPage(action: Extract<Action, { type: "sessions/pageLoaded" }>): CommitResult {
+    const current = sessionsResource(action.deviceId);
+    if (action.revision < current.revision) return STALE;
+    const catalog = sessionCatalog(action.deviceId);
+    if (
+      action.mode === "append" &&
+      (action.expectedCatalogRevision === undefined || catalog.catalogRevision !== action.expectedCatalogRevision)
+    ) {
+      return STALE;
+    }
+    if (action.mode === "append" && action.page.catalogRevision !== action.expectedCatalogRevision) return STALE;
+    if (hasDuplicateSessionIdentity(action.page.items) || hasDuplicateDiagnosticIdentity(action.page.diagnostics)) {
+      return STALE;
+    }
+
+    // The backend publishes the accumulated event before resolving the RPC.
+    // A same-revision reply must merge with that event rather than shrinking
+    // it back to the page carried by the command response.
+    const sameResourcePublication = action.revision === current.revision;
+    if (sameResourcePublication) {
+      if (!sameCatalogMetadata(catalog, action.page)) return STALE;
+      const currentSessions = current.value ?? [];
+      const exactSnapshot = visibleSnapshotsEqual(currentSessions, action.page.items);
+      const suffixSnapshot = pageIsCurrentSnapshotSuffix(currentSessions, action.page.items);
+      const diagnosticsSuffix = pageIsCurrentSnapshotSuffix(catalog.diagnostics, action.page.diagnostics);
+      if ((exactSnapshot || suffixSnapshot) && diagnosticsSuffix) return UNCHANGED;
+      return STALE;
+    }
+    if (action.mode === "append" && repeatsSessionIdentity(current.value ?? [], action.page.items)) return STALE;
+    if (action.mode === "append" && !preservesAppendNewestFirstBoundary(current.value ?? [], action.page.items)) {
+      return STALE;
+    }
+    const sessions =
+      action.mode === "append" ? mergeSessionViews(current.value ?? [], action.page.items) : action.page.items;
+    const diagnostics =
+      action.mode === "append"
+        ? mergeCatalogDiagnostics(catalog.diagnostics, action.page.diagnostics)
+        : action.page.diagnostics;
+    if (diagnostics === null) return STALE;
+    const details = retainMatchingDetailStates(catalog.details, sessions, action.page.catalogRevision);
+    commitSessions(action.deviceId, {
+      loading: false,
+      value: sessions,
+      error: null,
+      rpcError: null,
+      revision: action.revision,
+      lastGood: sessions,
+    });
+    commitSessionCatalog(action.deviceId, {
+      catalogRevision: action.page.catalogRevision,
+      nextCursor: action.page.nextCursor,
+      hasMore: action.page.hasMore,
+      catalogAuthority: action.page.catalogAuthority,
+      paginationSupported: action.page.paginationSupported,
+      paginationUnavailableReason: action.page.paginationUnavailableReason,
+      capabilities: action.page.capabilities,
+      diagnostics,
+      loadingMore: false,
+      loadMoreError: null,
+      details,
+    });
+    return CHANGED;
+  }
+
+  function sessionMatches(
+    deviceId: string,
+    sessionId: string,
+    sessionRevision: string,
+    catalogRevision: string | null,
+    manifestSha256: string,
+  ): boolean {
+    return (
+      sessionCatalog(deviceId).catalogRevision === catalogRevision &&
+      (sessionsResource(deviceId).value ?? []).some(
+        (session) =>
+          session.id === sessionId &&
+          session.revision === sessionRevision &&
+          usableManifestSha256(session) === manifestSha256,
+      )
+    );
+  }
+
+  function commitDetailLoaded(action: Extract<Action, { type: "sessions/detailLoaded" }>): CommitResult {
+    const current = sessionsResource(action.deviceId);
+    if (
+      action.revision < current.revision ||
+      action.detail.id === "" ||
+      action.detail.revision !== action.sessionRevision ||
+      usableManifestSha256(action.detail) !== action.manifestSha256 ||
+      !sessionMatches(
+        action.deviceId,
+        action.detail.id,
+        action.sessionRevision,
+        action.catalogRevision,
+        action.manifestSha256,
+      )
+    ) {
+      return STALE;
+    }
+    const sessions = (current.value ?? []).map((session) =>
+      session.id === action.detail.id ? action.detail : session,
+    );
+    const catalog = sessionCatalog(action.deviceId);
+    const details = new Map(catalog.details);
+    details.set(action.detail.id, {
+      loading: false,
+      error: null,
+      sessionRevision: action.sessionRevision,
+      catalogRevision: action.catalogRevision,
+      manifestSha256: action.manifestSha256,
+    });
+    commitSessions(action.deviceId, {
+      loading: false,
+      value: sessions,
+      error: current.error,
+      rpcError: current.rpcError,
+      revision: Math.max(current.revision, action.revision),
+      lastGood: sessions,
+    });
+    commitSessionCatalog(action.deviceId, { ...catalog, details });
+    return CHANGED;
   }
 
   function commitLoaded(action: Action): CommitResult {
@@ -262,6 +703,12 @@ export function createAppStore(initial: AppState = createAppState()): AppStore {
         commitSessions(action.deviceId, next);
         return result;
       }
+      case "sessions/catalogLoaded":
+        return commitCatalogSnapshot(action);
+      case "sessions/pageLoaded":
+        return commitSessionPage(action);
+      case "sessions/detailLoaded":
+        return commitDetailLoaded(action);
       case "library/loaded": {
         const { next, result } = loadResource(state.library, action.revision, action.library);
         state.library = next;
@@ -293,13 +740,28 @@ export function createAppStore(initial: AppState = createAppState()): AppStore {
     switch (event.kind) {
       case "devices":
         return { type: "devices/loaded", revision: event.revision, devices: event.devices };
-      case "sessions":
+      case "sessions": {
+        const hasExplicitPagination =
+          event.catalogAuthority !== undefined &&
+          event.paginationSupported !== undefined &&
+          event.paginationUnavailableReason !== undefined;
         return {
-          type: "sessions/loaded",
+          type: "sessions/catalogLoaded",
           revision: event.revision,
           deviceId: event.deviceId,
           sessions: event.sessions,
+          catalogRevision: event.catalogRevision ?? null,
+          nextCursor: hasExplicitPagination ? (event.nextCursor ?? null) : null,
+          hasMore: hasExplicitPagination ? (event.hasMore ?? false) : false,
+          catalogAuthority: hasExplicitPagination ? event.catalogAuthority! : "unavailable",
+          paginationSupported: hasExplicitPagination ? event.paginationSupported! : false,
+          paginationUnavailableReason: hasExplicitPagination
+            ? event.paginationUnavailableReason!
+            : "catalogRevisionUnavailable",
+          capabilities: event.capabilities ?? UNAVAILABLE_SESSION_CAPABILITIES,
+          diagnostics: event.diagnostics ?? [],
         };
+      }
       case "library":
         return { type: "library/loaded", revision: event.revision, library: event.library };
       case "transfers":
@@ -538,6 +1000,13 @@ export function createAppStore(initial: AppState = createAppState()): AppStore {
           const deviceId = action.deviceId ?? "";
           const { next, result } = markLoading(sessionsResource(deviceId));
           commitSessions(deviceId, next);
+          const catalog = sessionCatalog(deviceId);
+          commitSessionCatalog(deviceId, {
+            ...catalog,
+            loadingMore: false,
+            loadMoreError: null,
+            details: new Map(),
+          });
           return result;
         }
         // Every non-session resource is a plain field on the state object;
@@ -569,8 +1038,85 @@ export function createAppStore(initial: AppState = createAppState()): AppStore {
         Object.assign(state, { [field]: next });
         return result;
       }
+      case "sessions/loadMoreStarted": {
+        const catalog = sessionCatalog(action.deviceId);
+        if (
+          catalog.catalogRevision !== action.catalogRevision ||
+          catalog.nextCursor !== action.cursor ||
+          !catalog.hasMore ||
+          !catalog.paginationSupported
+        ) {
+          return STALE;
+        }
+        if (catalog.loadingMore && catalog.loadMoreError === null) return UNCHANGED;
+        commitSessionCatalog(action.deviceId, { ...catalog, loadingMore: true, loadMoreError: null });
+        return CHANGED;
+      }
+      case "sessions/loadMoreFailed": {
+        const catalog = sessionCatalog(action.deviceId);
+        if (catalog.catalogRevision !== action.catalogRevision || catalog.nextCursor !== action.cursor) return STALE;
+        commitSessionCatalog(action.deviceId, { ...catalog, loadingMore: false, loadMoreError: action.error });
+        return CHANGED;
+      }
+      case "sessions/catalogInvalidated": {
+        const catalog = sessionCatalog(action.deviceId);
+        if (catalog.catalogRevision !== action.catalogRevision || catalog.nextCursor !== action.cursor) return STALE;
+        commitSessionCatalog(action.deviceId, idleSessionCatalog());
+        return CHANGED;
+      }
+      case "sessions/detailStarted": {
+        if (
+          !sessionMatches(
+            action.deviceId,
+            action.sessionId,
+            action.sessionRevision,
+            action.catalogRevision,
+            action.manifestSha256,
+          )
+        ) {
+          return STALE;
+        }
+        const catalog = sessionCatalog(action.deviceId);
+        const details = new Map(catalog.details);
+        details.set(action.sessionId, {
+          loading: true,
+          error: null,
+          sessionRevision: action.sessionRevision,
+          catalogRevision: action.catalogRevision,
+          manifestSha256: action.manifestSha256,
+        });
+        commitSessionCatalog(action.deviceId, { ...catalog, details });
+        return CHANGED;
+      }
+      case "sessions/detailFailed": {
+        if (
+          !sessionMatches(
+            action.deviceId,
+            action.sessionId,
+            action.sessionRevision,
+            action.catalogRevision,
+            action.manifestSha256,
+          )
+        ) {
+          return STALE;
+        }
+        const catalog = sessionCatalog(action.deviceId);
+        const details = new Map(catalog.details);
+        details.set(action.sessionId, {
+          loading: false,
+          error: action.error,
+          sessionRevision: action.sessionRevision,
+          catalogRevision: action.catalogRevision,
+          manifestSha256: action.manifestSha256,
+        });
+        commitSessionCatalog(action.deviceId, { ...catalog, details });
+        return CHANGED;
+      }
       case "devices/loaded":
       case "sessions/loaded":
+      case "sessions/catalogLoaded":
+      case "sessions/pageLoaded":
+      case "sessions/detailLoaded":
       case "library/loaded":
       case "transfers/loaded":
       case "transferJobs/loaded":
@@ -609,6 +1155,34 @@ export function deviceDisplayIdOf(state: AppState, deviceId: string | null): str
 
 export function sessionsResourceOf(state: AppState, deviceId: string): Resource<SessionView[]> {
   return state.sessions.get(deviceId) ?? idleResource<SessionView[]>();
+}
+
+export function sessionCatalogOf(state: AppState, deviceId: string | null): SessionCatalogState {
+  if (deviceId === null) return idleSessionCatalog();
+  return state.sessionCatalogs.get(deviceId) ?? idleSessionCatalog();
+}
+
+export function sessionDetailStateOf(
+  state: AppState,
+  deviceId: string | null,
+  sessionId: string,
+): SessionDetailState | undefined {
+  return sessionCatalogOf(state, deviceId).details.get(sessionId);
+}
+
+export function deviceSupportsSessionDeletion(state: AppState, deviceId: string | null): boolean {
+  const capabilities = sessionCatalogOf(state, deviceId).capabilities;
+  return capabilities.profile === "legacyPinnedTlsV1" && capabilities.sessionDeletion.supported;
+}
+
+export function deviceSupportsSessionDetail(state: AppState, deviceId: string | null): boolean {
+  const capabilities = sessionCatalogOf(state, deviceId).capabilities;
+  return capabilities.profile !== "unknown" && capabilities.sessionDetail.supported;
+}
+
+export function deviceSupportsSessionDownload(state: AppState, deviceId: string | null): boolean {
+  const capabilities = sessionCatalogOf(state, deviceId).capabilities;
+  return capabilities.profile !== "unknown" && capabilities.artifactDownload.supported;
 }
 
 /** `undefined` means the device never reported sessions — a real distinction

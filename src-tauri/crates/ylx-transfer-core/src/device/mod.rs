@@ -46,12 +46,16 @@ pub use identity::{
 
 pub use actor::{
     AuthenticatedCatalogPort, AuthenticatedDevicePort, AuthenticatedPiSession,
-    AuthenticatedPiSessionError, ByteRangeRequest, DeleteSessionReceiptView, DeviceActor,
-    DeviceInfoView, DownloadTransportPort, FileDownloadView, FileHeadView, FileStreamView,
-    HeartbeatApplyOutcome, HeartbeatOutcomeView, PairingAttemptInfo, PairingCreatedView,
-    PairingPort, PairingStatusView, PiClientError, PiClientErrorKind, PollPairingOutcome,
-    SessionCatalogPort, SessionDetailView, SessionFileEntryView, SessionSummaryView,
-    SessionsPageView,
+    AuthenticatedPiSessionError, ByteRangeRequest, CapabilitySourceView, CaptureDeviceStateView,
+    CaptureStatusView, CatalogRevisionAuthorityView, DeleteSessionReceiptView, DeviceActor,
+    DeviceApiProfileView, DeviceCapabilitiesView, DeviceInfoView, DownloadTransportPort,
+    FileDownloadView, FileHeadView, FileStreamView, GatewayVerificationDiagnosticView,
+    GatewayVerificationVerdictView, GatewayVerificationView, HeartbeatApplyOutcome,
+    HeartbeatOutcomeView, NegotiatedCapabilityView, PaginationUnavailableReasonView,
+    PairingAttemptInfo, PairingCreatedView, PairingPort, PairingStatusView, PiClientError,
+    PiClientErrorKind, PollPairingOutcome, PublicationEnvelopeOriginView, SessionCatalogPort,
+    SessionDetailView, SessionDiscoveryDiagnosticCodeView, SessionDiscoveryDiagnosticView,
+    SessionFileEntryView, SessionSummaryView, SessionsPageView,
 };
 
 /// Whether a device is currently visible on the network, per plan 5.4:

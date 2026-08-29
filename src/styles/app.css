@@ -1052,6 +1052,14 @@ button {
 .chip-idle::before {
   background: var(--text-tertiary);
 }
+.library-status-chips {
+  display: flex;
+  min-height: 24px;
+  align-items: center;
+  align-content: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
 
 .row-actions {
   display: flex;

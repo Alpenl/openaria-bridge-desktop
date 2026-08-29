@@ -27,7 +27,6 @@ pub(crate) enum DemoTransferContext {
         device_id: String,
         session_id: String,
     },
-    DownloadFile,
 }
 
 /// Process-local state for demo transfers. The entire type and its owning
@@ -281,7 +280,6 @@ pub fn start_transfer(app: &AppHandle, args: StartTransferArgs) -> String {
 fn emit_for_context(app: &AppHandle, context: &DemoTransferContext) {
     match context {
         DemoTransferContext::DownloadSession { device_id, .. } => emit_sessions(app, device_id),
-        DemoTransferContext::DownloadFile => {}
     }
 }
 
@@ -474,8 +472,10 @@ async fn finish_transfer(app: &AppHandle, key: &str, sent_bytes: u64, error: Opt
                                         date_label: session.date_label.clone(),
                                         downloaded_at: "刚刚".to_string(),
                                         bytes: session.video_bytes,
+                                        processed_files: Vec::new(),
                                         files: session.files.clone(),
                                         complete: true,
+                                        download_projection_sequence: 0,
                                         publication: None,
                                         library_root: None,
                                         object_receipts: Vec::new(),
@@ -499,7 +499,6 @@ async fn finish_transfer(app: &AppHandle, key: &str, sent_bytes: u64, error: Opt
                         }
                     }
                 }
-                DemoTransferContext::DownloadFile => {}
             }
         }
         if touched_library {
@@ -610,18 +609,12 @@ mod tests {
                 session_id: "demo-session".to_string(),
             },
         );
-        state.insert("file-job".to_string(), DemoTransferContext::DownloadFile);
-
         assert!(state.contains("session-job"));
         assert!(matches!(
             state.get("session-job"),
             Some(DemoTransferContext::DownloadSession { device_id, session_id })
                 if device_id == "demo-device" && session_id == "demo-session"
         ));
-        assert_eq!(
-            state.get("file-job"),
-            Some(&DemoTransferContext::DownloadFile)
-        );
         assert_eq!(
             state.remove("session-job"),
             Some(DemoTransferContext::DownloadSession {

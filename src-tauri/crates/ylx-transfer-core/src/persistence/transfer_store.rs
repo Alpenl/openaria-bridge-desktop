@@ -35,7 +35,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::domain::{
     DeviceId, FileId, JobFileSpec, JobIdentity, JobSpec, PublicationMaterial, RequestDigest,
@@ -168,6 +168,14 @@ pub enum RetryJobError {
 
     #[error(transparent)]
     Persistence(#[from] PersistenceError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetrySpawnPolicy {
+    StandardDownload,
+    FreshDownload,
+    DismissedDownloadEnqueue,
+    Upload,
 }
 
 /// Errors returned when a terminal job is dismissed from user-facing
@@ -540,6 +548,29 @@ impl CompletionRecord {
     }
 }
 
+/// Whether a job's terminal outcome still needs to be projected by the
+/// completion consumer. `Missing` is intentionally distinct from `Pending`:
+/// a succeeded job without an outbox row is inconsistent durable state, while
+/// a pending row is a normal, replayable delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompletionDeliveryState {
+    Missing,
+    Pending,
+    Acknowledged,
+}
+
+/// One download job in the session-status snapshot used by list views.
+///
+/// Keeping the job and its completion delivery state in the same row lets a
+/// caller build all visible session states from one SQLite statement instead
+/// of repeatedly loading the full job and completion tables for every
+/// session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadSessionJobState {
+    pub job: StoredJob,
+    pub completion: CompletionDeliveryState,
+}
+
 /// What [`TransferStore::complete_job`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompleteJobOutcome {
@@ -631,6 +662,24 @@ pub struct TransferStore {
     pub(super) conn: Connection,
     path: PathBuf,
 }
+
+const DOWNLOAD_SESSION_JOB_STATES_SQL: &str = "WITH requested_devices(device_id) AS ( \
+         SELECT value FROM json_each(?1) \
+     ), requested_sessions(session_id) AS ( \
+         SELECT value FROM json_each(?2) \
+     ) \
+     SELECT j.job_id, j.operation_kind, j.device_id, j.session_id, j.revision, \
+            j.request_digest, j.state, j.state_version, j.desired_run_state, \
+            j.error_code, j.error_retryable, j.created_at, j.updated_at, j.dismissed_at, \
+            c.job_id, c.operation_kind, c.acknowledged_at \
+     FROM requested_devices AS d \
+     CROSS JOIN requested_sessions AS s \
+     CROSS JOIN transfer_jobs AS j INDEXED BY transfer_jobs_download_device_session_idx \
+     LEFT JOIN transfer_completion_outbox AS c ON c.job_id = j.job_id \
+     WHERE j.device_id = d.device_id \
+       AND j.session_id = s.session_id \
+       AND j.operation_kind = 'download' \
+     ORDER BY j.device_id, j.session_id, j.created_at, j.job_id";
 
 impl TransferStore {
     /// Opens (creating if needed) the transfer store at `path`.
@@ -1040,6 +1089,42 @@ impl TransferStore {
             .map(|row| {
                 row.map_err(|detail| PersistenceError::Corrupt {
                     path: PathBuf::from("transfer_jobs"),
+                    detail,
+                })
+            })
+            .collect()
+    }
+
+    /// Download jobs for the requested device/session sets and their
+    /// completion delivery state in one durable snapshot.
+    ///
+    /// Both input sets are de-duplicated before being serialized as JSON. The
+    /// query therefore always binds exactly two values regardless of page
+    /// size, avoiding SQLite's positional-parameter limit while still letting
+    /// the partial `(device_id, session_id, created_at, job_id)` index drive
+    /// each requested pair. Upload jobs are excluded at the SQL boundary.
+    pub fn list_download_session_job_states_for_sessions(
+        &self,
+        device_ids: &[String],
+        session_ids: &[String],
+    ) -> Result<Vec<DownloadSessionJobState>, PersistenceError> {
+        let device_ids = device_ids.iter().collect::<std::collections::BTreeSet<_>>();
+        let session_ids = session_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let device_ids_json = serde_json::to_string(&device_ids)?;
+        let session_ids_json = serde_json::to_string(&session_ids)?;
+        let mut stmt = self.conn.prepare(DOWNLOAD_SESSION_JOB_STATES_SQL)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![device_ids_json, session_ids_json],
+                |row| Ok(read_download_session_job_state_row(row)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|row| {
+                row.map_err(|detail| PersistenceError::Corrupt {
+                    path: PathBuf::from("transfer_jobs/transfer_completion_outbox"),
                     detail,
                 })
             })
@@ -1495,7 +1580,63 @@ impl TransferStore {
         child_job_id: &str,
         now: &str,
     ) -> Result<RetryJobOutcome, RetryJobError> {
-        self.spawn_retry_job_inner(parent_job_id, child_job_id, now, false)
+        self.spawn_retry_job_inner(
+            parent_job_id,
+            child_job_id,
+            now,
+            RetrySpawnPolicy::StandardDownload,
+            || Ok(()),
+        )
+    }
+
+    /// Creates a download retry whose durable file evidence starts from
+    /// scratch. This is reserved for an interrupted attempt that policy says
+    /// must not resume (startup interruption or device/network loss). Its old
+    /// staging bytes are discarded only when no active download owns the same
+    /// publication identity, so copying a `partial` or `verified` ledger into
+    /// the new attempt can never claim evidence that no longer exists.
+    pub(crate) fn spawn_fresh_download_retry_job<F>(
+        &mut self,
+        parent_job_id: &str,
+        child_job_id: &str,
+        now: &str,
+        discard_staging: F,
+    ) -> Result<RetryJobOutcome, RetryJobError>
+    where
+        F: FnOnce() -> Result<(), PersistenceError>,
+    {
+        self.spawn_retry_job_inner(
+            parent_job_id,
+            child_job_id,
+            now,
+            RetrySpawnPolicy::FreshDownload,
+            discard_staging,
+        )
+    }
+
+    /// Enqueue-only repeat for an acknowledged, dismissed failed download.
+    /// Unlike tray retry, this deliberately accepts the tombstoned parent so
+    /// a user can start the same signed session again without erasing audit
+    /// history. It still uses the fresh-ledger/staging guard and refuses a
+    /// non-dismissed parent, so callers cannot use it to bypass ordinary retry
+    /// policy.
+    pub(crate) fn spawn_fresh_download_enqueue_repeat<F>(
+        &mut self,
+        parent_job_id: &str,
+        child_job_id: &str,
+        now: &str,
+        discard_staging: F,
+    ) -> Result<RetryJobOutcome, RetryJobError>
+    where
+        F: FnOnce() -> Result<(), PersistenceError>,
+    {
+        self.spawn_retry_job_inner(
+            parent_job_id,
+            child_job_id,
+            now,
+            RetrySpawnPolicy::DismissedDownloadEnqueue,
+            discard_staging,
+        )
     }
 
     /// Upload-specific retry entry point. A cancelled upload is a valid fresh
@@ -1508,20 +1649,53 @@ impl TransferStore {
         child_job_id: &str,
         now: &str,
     ) -> Result<RetryJobOutcome, RetryJobError> {
-        self.spawn_retry_job_inner(parent_job_id, child_job_id, now, true)
+        self.spawn_retry_job_inner(
+            parent_job_id,
+            child_job_id,
+            now,
+            RetrySpawnPolicy::Upload,
+            || Ok(()),
+        )
     }
 
-    fn spawn_retry_job_inner(
+    fn spawn_retry_job_inner<F>(
         &mut self,
         parent_job_id: &str,
         child_job_id: &str,
         now: &str,
-        allow_cancelled_upload: bool,
-    ) -> Result<RetryJobOutcome, RetryJobError> {
-        let tx = self.conn.transaction().map_err(PersistenceError::from)?;
+        policy: RetrySpawnPolicy,
+        discard_staging: F,
+    ) -> Result<RetryJobOutcome, RetryJobError>
+    where
+        F: FnOnce() -> Result<(), PersistenceError>,
+    {
+        // Fresh download retry owns both the durable active-attempt decision
+        // and destructive staging cleanup. IMMEDIATE prevents another store
+        // connection from creating or advancing a same-revision attempt in
+        // the gap between the query and cleanup.
+        let fresh_download_ledger = matches!(
+            policy,
+            RetrySpawnPolicy::FreshDownload | RetrySpawnPolicy::DismissedDownloadEnqueue
+        );
+        let behavior = if fresh_download_ledger {
+            TransactionBehavior::Immediate
+        } else {
+            TransactionBehavior::Deferred
+        };
+        let tx = self
+            .conn
+            .transaction_with_behavior(behavior)
+            .map_err(PersistenceError::from)?;
         let parent = read_job(&tx, "job_id", parent_job_id)?
             .ok_or_else(|| RetryJobError::UnknownJob(parent_job_id.to_string()))?;
-        if parent.dismissed_at.is_some() {
+        if policy == RetrySpawnPolicy::DismissedDownloadEnqueue
+            && (parent.operation_kind != OperationKind::Download || parent.dismissed_at.is_none())
+        {
+            return Err(RetryJobError::NotRetryable {
+                job_id: parent_job_id.to_string(),
+            });
+        }
+        if parent.dismissed_at.is_some() && policy != RetrySpawnPolicy::DismissedDownloadEnqueue {
             return Err(RetryJobError::DismissedParent {
                 job_id: parent_job_id.to_string(),
             });
@@ -1531,7 +1705,7 @@ impl TransferStore {
                 .error
                 .as_ref()
                 .is_some_and(|(_, retryable)| *retryable);
-        let acknowledged_cancelled_upload = allow_cancelled_upload
+        let acknowledged_cancelled_upload = policy == RetrySpawnPolicy::Upload
             && parent.operation_kind == OperationKind::Upload
             && parent.state == JobStateTag::Cancelled;
         if !retryable_failed && !acknowledged_cancelled_upload {
@@ -1594,13 +1768,57 @@ impl TransferStore {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if let Some((existing_id, _)) = previous_child.as_ref() {
-            if let Some(existing) = read_job(&tx, "job_id", existing_id)? {
-                if !existing.state.is_terminal() {
+        if policy != RetrySpawnPolicy::DismissedDownloadEnqueue {
+            if let Some((existing_id, _)) = previous_child.as_ref() {
+                if let Some(existing) = read_job(&tx, "job_id", existing_id)? {
+                    if !existing.state.is_terminal() {
+                        return Ok(RetryJobOutcome::Existing(Box::new(existing)));
+                    }
+                }
+            }
+        }
+
+        if fresh_download_ledger && parent.operation_kind == OperationKind::Download {
+            let active_job_id: Option<String> = tx
+                .query_row(
+                    "SELECT job_id FROM transfer_jobs \
+                     WHERE operation_kind = 'download' \
+                       AND device_id = ?1 AND session_id = ?2 AND revision = ?3 \
+                       AND state NOT IN ('succeeded', 'failed', 'cancelled') \
+                     ORDER BY created_at DESC, job_id DESC LIMIT 1",
+                    rusqlite::params![
+                        parent.identity.device_id().as_str(),
+                        parent.identity.session_id().as_str(),
+                        parent.identity.revision(),
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(active_job_id) = active_job_id {
+                let active = read_job(&tx, "job_id", &active_job_id)?.ok_or_else(|| {
+                    RetryJobError::Persistence(PersistenceError::NotFound {
+                        detail: format!(
+                            "active same-revision retry {active_job_id} vanished during selection"
+                        ),
+                    })
+                })?;
+                return Ok(RetryJobOutcome::Existing(Box::new(active)));
+            }
+        }
+
+        // An enqueue replay of a dismissed root is permanently idempotent
+        // once it has produced a direct child, even after that child becomes
+        // terminal. The active identity guard above must run first, however:
+        // an explicit retry descendant owns the shared staging and is the
+        // current attempt the stale root enqueue must resolve to.
+        if policy == RetrySpawnPolicy::DismissedDownloadEnqueue {
+            if let Some((existing_id, _)) = previous_child.as_ref() {
+                if let Some(existing) = read_job(&tx, "job_id", existing_id)? {
                     return Ok(RetryJobOutcome::Existing(Box::new(existing)));
                 }
             }
         }
+
         let attempt = match previous_child {
             Some((_, attempt)) => attempt.checked_add(1).ok_or_else(|| {
                 RetryJobError::Persistence(PersistenceError::Conflict {
@@ -1697,6 +1915,9 @@ impl TransferStore {
             tx.commit().map_err(PersistenceError::from)?;
             return Ok(RetryJobOutcome::Created(Box::new(child)));
         }
+        if fresh_download_ledger {
+            discard_staging()?;
+        }
         let natural_key = format!("{}#retry:{child_job_id}", parent.identity.natural_key());
         tx.execute(
             "INSERT INTO transfer_jobs (
@@ -1729,13 +1950,23 @@ impl TransferStore {
              FROM transfer_job_files WHERE job_id = ?1",
             rusqlite::params![parent_job_id, child_job_id],
         )?;
-        tx.execute(
-            "INSERT INTO transfer_file_ledger (
-                 job_id, file_id, status, bytes_confirmed, verified_sha256, updated_at
-             ) SELECT ?2, file_id, status, bytes_confirmed, verified_sha256, ?3
-             FROM transfer_file_ledger WHERE job_id = ?1",
-            rusqlite::params![parent_job_id, child_job_id, now],
-        )?;
+        if fresh_download_ledger {
+            tx.execute(
+                "INSERT INTO transfer_file_ledger (
+                     job_id, file_id, status, bytes_confirmed, verified_sha256, updated_at
+                 ) SELECT ?2, file_id, 'missing', 0, NULL, ?3
+                 FROM transfer_file_ledger WHERE job_id = ?1",
+                rusqlite::params![parent_job_id, child_job_id, now],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO transfer_file_ledger (
+                     job_id, file_id, status, bytes_confirmed, verified_sha256, updated_at
+                 ) SELECT ?2, file_id, status, bytes_confirmed, verified_sha256, ?3
+                 FROM transfer_file_ledger WHERE job_id = ?1",
+                rusqlite::params![parent_job_id, child_job_id, now],
+            )?;
+        }
         tx.execute(
             "INSERT INTO transfer_job_lineage (child_job_id, parent_job_id, attempt, created_at)
              VALUES (?1, ?2, ?3, ?4)",
@@ -2120,7 +2351,8 @@ fn insert_outbox_row(
     )?;
     tx.execute(
         "INSERT INTO transfer_completion_outbox (
-             job_id, operation_kind, outcome, error_code, error_retryable, state_version, recorded_at
+             job_id, operation_kind, outcome, error_code, error_retryable,
+             state_version, recorded_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         rusqlite::params![
             job_id,
@@ -2152,7 +2384,8 @@ fn abort_completion_if(
 }
 
 const COMPLETION_COLUMNS: &str = "sequence, job_id, operation_kind, outcome, error_code, \
-                                  error_retryable, state_version, recorded_at, acknowledged_at";
+                                  error_retryable, state_version, recorded_at, \
+                                  acknowledged_at";
 
 fn read_completion(
     conn: &Connection,
@@ -2401,6 +2634,56 @@ fn read_job_row(row: &rusqlite::Row<'_>) -> Result<StoredJob, String> {
     })
 }
 
+fn read_download_session_job_state_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<DownloadSessionJobState, String> {
+    let job = read_job_row(row)?;
+    let completion_job_id: Option<String> = row
+        .get(14)
+        .map_err(|error| format!("job {} completion job_id: {error}", job.job_id))?;
+    let completion_operation_kind: Option<String> = row
+        .get(15)
+        .map_err(|error| format!("job {} completion operation_kind: {error}", job.job_id))?;
+    let acknowledged_at: Option<String> = row
+        .get(16)
+        .map_err(|error| format!("job {} completion acknowledged_at: {error}", job.job_id))?;
+
+    let completion = match completion_job_id {
+        None => {
+            if completion_operation_kind.is_some() || acknowledged_at.is_some() {
+                return Err(format!(
+                    "job {} has partial completion columns without an outbox identity",
+                    job.job_id
+                ));
+            }
+            CompletionDeliveryState::Missing
+        }
+        Some(completion_job_id) => {
+            if completion_job_id != job.job_id {
+                return Err(format!(
+                    "job {} joined completion for {completion_job_id}",
+                    job.job_id
+                ));
+            }
+            let operation_kind = completion_operation_kind
+                .ok_or_else(|| format!("job {} completion has no operation_kind", job.job_id))?;
+            if OperationKind::from_db_str(&operation_kind) != Some(OperationKind::Download) {
+                return Err(format!(
+                    "download job {} has completion operation_kind {operation_kind:?}",
+                    job.job_id
+                ));
+            }
+            if acknowledged_at.is_some() {
+                CompletionDeliveryState::Acknowledged
+            } else {
+                CompletionDeliveryState::Pending
+            }
+        }
+    };
+
+    Ok(DownloadSessionJobState { job, completion })
+}
+
 /// Builds the `Blocked` record for a `transfer_jobs` row whose own columns
 /// could not be parsed.
 fn blocked_row(conn: &Connection, job_id: &str) -> Result<RecoveryBlocked, PersistenceError> {
@@ -2635,4 +2918,86 @@ fn read_ledger(conn: &Connection, job_id: &str) -> Result<Vec<FileLedgerEntry>, 
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::{c_char, c_void};
+    use std::ptr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{TransferStore, DOWNLOAD_SESSION_JOB_STATES_SQL};
+
+    unsafe extern "C" fn count_statement(context: *mut c_void, _sql: *const c_char) {
+        // SQLite invokes the callback synchronously while `context` is alive.
+        let counter = unsafe { &*context.cast::<AtomicUsize>() };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn download_session_job_snapshot_executes_one_statement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TransferStore::open(dir.path().join("transfer.sqlite3")).expect("open");
+        store
+            .raw_execute(
+                "INSERT INTO transfer_jobs (
+                    job_id, natural_key, device_id, session_id, revision,
+                    request_digest, state, created_at, updated_at
+                 ) VALUES
+                    ('job-a', 'natural-a', 'pi-a', 'session-a', 'rev-a',
+                     '0000000000000000000000000000000000000000000000000000000000000000',
+                     'queued', 't0', 't0'),
+                    ('job-b', 'natural-b', 'pi-a', 'session-b', 'rev-b',
+                     '1111111111111111111111111111111111111111111111111111111111111111',
+                     'queued', 't0', 't0'),
+                    ('job-c', 'natural-c', 'pi-a', 'session-c', 'rev-c',
+                     '2222222222222222222222222222222222222222222222222222222222222222',
+                     'queued', 't0', 't0')",
+            )
+            .expect("seed jobs");
+        let statement_count = AtomicUsize::new(0);
+
+        unsafe {
+            rusqlite::ffi::sqlite3_trace(
+                store.conn.handle(),
+                Some(count_statement),
+                (&statement_count as *const AtomicUsize).cast_mut().cast(),
+            );
+        }
+        let result = store.list_download_session_job_states_for_sessions(
+            &["pi-a".to_string()],
+            &["session-a".to_string(), "session-b".to_string()],
+        );
+        unsafe {
+            rusqlite::ffi::sqlite3_trace(store.conn.handle(), None, ptr::null_mut());
+        }
+
+        assert_eq!(result.expect("snapshot").len(), 2);
+        assert_eq!(statement_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn download_session_job_snapshot_uses_the_partial_lookup_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TransferStore::open(dir.path().join("transfer.sqlite3")).expect("open");
+        let explain = format!("EXPLAIN QUERY PLAN {DOWNLOAD_SESSION_JOB_STATES_SQL}");
+        let mut statement = store.conn.prepare(&explain).expect("prepare explain");
+        let details = statement
+            .query_map(
+                rusqlite::params![r#"["pi-a"]"#, r#"["session-a"]"#],
+                |row| row.get::<_, String>(3),
+            )
+            .expect("explain query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect query plan");
+
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains("transfer_jobs_download_device_session_idx")
+                    && detail.contains("device_id=?")
+                    && detail.contains("session_id=?")
+            }),
+            "scoped lookup did not search the partial index: {details:?}"
+        );
+    }
 }

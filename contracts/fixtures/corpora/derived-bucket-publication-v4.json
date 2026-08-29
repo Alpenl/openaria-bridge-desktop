@@ -1,0 +1,447 @@
+{
+  "schema": "ylx.bucket-publication-v4-admission-corpus.v1",
+  "publication_fixture": "../valid/ylx-bucket-publication-v4.json",
+  "source_fixture": "../valid/ylx-device-session-v2.audio-recorded-multi-segment.json",
+  "receipt_fixture": "../valid/ylx-derived-media-receipt-v1.json",
+  "admitted_admission_fixture": "../valid/ylx-bucket-publication-admission-v1.admitted.json",
+  "rejected_admission_fixture": "../valid/ylx-bucket-publication-admission-v1.rejected.json",
+  "observed_objects": {
+    "marker": {
+      "object_key": "synthetic/qualification/ylx-transfer/550e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0020-0000-7a1b-8c2d-3e4f50617283/__ylx_evidence__/publication.json",
+      "bytes": 2503,
+      "sha256": "2702a8dad62ee497bc183f83b5414776e045b6bec1d0590a38ce733ed864234f"
+    },
+    "source_manifest": {
+      "object_key": "synthetic/qualification/ylx-transfer/550e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0020-0000-7a1b-8c2d-3e4f50617283/f-3d9773099e8e77c41052f064a5b4d5e4a7ddb8d726151dca807ca41e37e9a42a",
+      "bytes": 5443,
+      "sha256": "3d9773099e8e77c41052f064a5b4d5e4a7ddb8d726151dca807ca41e37e9a42a"
+    },
+    "derived_media_receipt": {
+      "object_key": "synthetic/qualification/ylx-transfer/550e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0020-0000-7a1b-8c2d-3e4f50617283/f-8442c0c8afeaf8fe1cf2231663f97ffb0ff91d2543a0ba388dec9a86ac6a9f6e",
+      "bytes": 3943,
+      "sha256": "8442c0c8afeaf8fe1cf2231663f97ffb0ff91d2543a0ba388dec9a86ac6a9f6e"
+    },
+    "output": {
+      "object_key": "synthetic/qualification/ylx-transfer/550e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0020-0000-7a1b-8c2d-3e4f50617283/f-9090909090909090909090909090909090909090909090909090909090909090",
+      "bytes": 65000000,
+      "sha256": "9090909090909090909090909090909090909090909090909090909090909090"
+    }
+  },
+  "observed_admissions": {
+    "admitted": {
+      "object_key": "synthetic/qualification/ylx-transfer/550e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0020-0000-7a1b-8c2d-3e4f50617283/__ylx_evidence__/admission-019a0030-0000-7a1b-8c2d-3e4f50617283.json",
+      "bytes": 1129,
+      "sha256": "e2f670c5eb2d91ef9697351acbe016743cfad6b91f46348c01b036a45f1a1317"
+    },
+    "rejected": {
+      "object_key": "synthetic/qualification/ylx-transfer/550e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0020-0000-7a1b-8c2d-3e4f50617283/__ylx_evidence__/admission-019a0031-0000-7a1b-8c2d-3e4f50617283.json",
+      "bytes": 1259,
+      "sha256": "6835e6db75c01d3aed5b4fa468388a4e9dcf1eed5aeb02c4a39f62cd43767b89"
+    }
+  },
+  "cases": [
+    {
+      "name": "receipt-missing",
+      "operation": "remove-asset",
+      "role": "media.derived-receipt",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["assets", "minItems", "contains"]
+    },
+    {
+      "name": "receipt-duplicated",
+      "operation": "duplicate-asset",
+      "role": "media.derived-receipt",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["assets", "maxItems"]
+    },
+    {
+      "name": "source-manifest-missing",
+      "operation": "remove-asset",
+      "role": "source.manifest",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["assets", "minItems", "contains"]
+    },
+    {
+      "name": "source-manifest-duplicated",
+      "operation": "duplicate-asset",
+      "role": "source.manifest",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["assets", "maxItems"]
+    },
+    {
+      "name": "derived-output-missing",
+      "operation": "remove-asset",
+      "role": "media.derived",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["assets", "minItems", "contains"]
+    },
+    {
+      "name": "derived-output-duplicated",
+      "operation": "duplicate-asset",
+      "role": "media.derived",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["assets", "maxItems"]
+    },
+    {
+      "name": "output-digest-mismatch",
+      "operation": "replace-publication",
+      "path": ["assets", 2, "sha256"],
+      "value": "0000000000000000000000000000000000000000000000000000000000000000",
+      "validation_stage": "cross-field",
+      "expected_error_keywords": ["derived output", "artifact_id", "sha256"]
+    },
+    {
+      "name": "output-bytes-mismatch",
+      "operation": "replace-publication",
+      "path": ["assets", 2, "bytes"],
+      "value": 65000001,
+      "validation_stage": "cross-field",
+      "expected_error_keywords": ["derived output", "bytes", "receipt"]
+    },
+    {
+      "name": "source-manifest-identity-mismatch",
+      "operation": "replace-publication",
+      "path": ["assets", 0, "manifest_id"],
+      "value": "019a0099-0000-7a1b-8c2d-3e4f50617283",
+      "validation_stage": "cross-field",
+      "expected_error_keywords": ["source manifest", "manifest_id", "golden"]
+    },
+    {
+      "name": "receipt-unknown-schema",
+      "operation": "replace-publication",
+      "path": ["assets", 1, "schema"],
+      "value": "ylx.derived-media-receipt.v2",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["schema", "ylx.derived-media-receipt.v1"]
+    },
+    {
+      "name": "extra-raw-staging-asset",
+      "operation": "append-asset",
+      "asset": {
+        "role": "video.left",
+        "artifact_id": "abababababababababababababababababababababababababababababababab",
+        "object_key": "synthetic/qualification/ylx-transfer/550e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0020-0000-7a1b-8c2d-3e4f50617283/f-abababababababababababababababababababababababababababababababab",
+        "media_type": "video/mp4",
+        "bytes": 30123456,
+        "sha256": "abababababababababababababababababababababababababababababababab"
+      },
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["assets", "maxItems"]
+    },
+    {
+      "name": "output-wrong-role",
+      "operation": "replace-publication",
+      "path": ["assets", 2, "role"],
+      "value": "video.left",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["role", "media.derived"]
+    },
+    {
+      "name": "timeline-failed-with-byte-consistent-receipt",
+      "operation": "mutate-receipt-rebind",
+      "path": ["timeline_verification", "verdict"],
+      "value": "fail",
+      "validation_stage": "cross-field",
+      "expected_error_keywords": ["committed", "verdict=pass"]
+    },
+    {
+      "name": "receipt-input-identity-drift",
+      "operation": "mutate-receipt-rebind",
+      "path": ["input_artifacts", 0, "bytes"],
+      "value": 30123457,
+      "validation_stage": "cross-field",
+      "expected_error_keywords": ["input artifact descriptor", "source manifest"]
+    },
+    {
+      "name": "receipt-output-layout-drift",
+      "operation": "mutate-receipt-rebind",
+      "path": ["output", "layout"],
+      "value": "mono-left",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["output", "layout", "left-right-side-by-side"]
+    },
+    {
+      "name": "receipt-output-eye-width-drift",
+      "operation": "mutate-receipt-rebind",
+      "path": ["output", "eye_width"],
+      "value": 1919,
+      "validation_stage": "cross-field",
+      "expected_error_keywords": ["output.eye_width", "source camera.eye_width"]
+    },
+    {
+      "name": "receipt-output-width-drift",
+      "operation": "mutate-receipt-rebind",
+      "path": ["output", "width"],
+      "value": 3839,
+      "validation_stage": "cross-field",
+      "expected_error_keywords": ["output.width", "source camera.width"]
+    },
+    {
+      "name": "receipt-transformer-impersonation",
+      "operation": "mutate-receipt-rebind",
+      "path": ["transformer", "name"],
+      "value": "device-conductor",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["transformer", "name", "openaria-bridge-desktop"]
+    },
+    {
+      "name": "forged-device-signature-inheritance",
+      "operation": "mutate-receipt-rebind",
+      "path": ["provenance", "device_signature_inheritance"],
+      "value": "allowed",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["device_signature_inheritance", "forbidden"]
+    },
+    {
+      "name": "publication-device-signature-field",
+      "operation": "add-publication-field",
+      "field": "device_signature",
+      "value": "forged",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["additionalProperties", "device_signature"]
+    },
+    {
+      "name": "marker-readback-digest-mismatch",
+      "operation": "replace-observed",
+      "object": "marker",
+      "field": "sha256",
+      "value": "0000000000000000000000000000000000000000000000000000000000000000",
+      "validation_stage": "admission-envelope",
+      "expected_error_keywords": ["marker", "readback", "sha256"]
+    },
+    {
+      "name": "receipt-readback-bytes-mismatch",
+      "operation": "replace-observed",
+      "object": "derived_media_receipt",
+      "field": "bytes",
+      "value": 3944,
+      "validation_stage": "admission-envelope",
+      "expected_error_keywords": ["derived_media_receipt", "readback", "bytes"]
+    },
+    {
+      "name": "source-readback-digest-mismatch",
+      "operation": "replace-observed",
+      "object": "source_manifest",
+      "field": "sha256",
+      "value": "0000000000000000000000000000000000000000000000000000000000000000",
+      "validation_stage": "admission-envelope",
+      "expected_error_keywords": ["source_manifest", "readback", "sha256"]
+    },
+    {
+      "name": "output-readback-bytes-mismatch",
+      "operation": "replace-observed",
+      "object": "output",
+      "field": "bytes",
+      "value": 65000001,
+      "validation_stage": "admission-envelope",
+      "expected_error_keywords": ["output", "readback", "bytes"]
+    }
+  ],
+  "admission_cases": [
+    {
+      "name": "publication-id-drift",
+      "fixture": "admitted",
+      "operation": "replace-admission",
+      "path": ["publication_id"],
+      "value": "019a0099-0000-7a1b-8c2d-3e4f50617283",
+      "validation_stage": "cross-field",
+      "expected_error_keywords": ["publication_id", "publication"]
+    },
+    {
+      "name": "publication-schema-unknown-major",
+      "fixture": "admitted",
+      "operation": "replace-admission",
+      "path": ["publication_schema"],
+      "value": "ylx.bucket-publication.v5",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["publication_schema", "ylx.bucket-publication.v4"]
+    },
+    {
+      "name": "marker-object-key-drift",
+      "fixture": "admitted",
+      "operation": "replace-admission",
+      "path": ["marker", "object_key"],
+      "value": "synthetic/qualification/ylx-transfer/550e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0099-0000-7a1b-8c2d-3e4f50617283/__ylx_evidence__/publication.json",
+      "validation_stage": "cross-field",
+      "expected_error_keywords": ["marker", "object_key", "publication"]
+    },
+    {
+      "name": "marker-bytes-drift",
+      "fixture": "admitted",
+      "operation": "replace-admission",
+      "path": ["marker", "bytes"],
+      "value": 2504,
+      "validation_stage": "cross-field",
+      "expected_error_keywords": ["marker", "bytes", "exact"]
+    },
+    {
+      "name": "marker-digest-drift",
+      "fixture": "admitted",
+      "operation": "replace-admission",
+      "path": ["marker", "sha256"],
+      "value": "0000000000000000000000000000000000000000000000000000000000000000",
+      "validation_stage": "cross-field",
+      "expected_error_keywords": ["marker", "sha256", "exact"]
+    },
+    {
+      "name": "consumer-name-impersonation",
+      "fixture": "admitted",
+      "operation": "replace-admission",
+      "path": ["consumer", "name"],
+      "value": "openaria-bridge-desktop",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["consumer", "name", "egoview-console"]
+    },
+    {
+      "name": "consumer-build-unknown-field",
+      "fixture": "admitted",
+      "operation": "add-admission-field",
+      "path": ["consumer", "build"],
+      "field": "branch",
+      "value": "rewrite",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["additionalProperties", "branch"]
+    },
+    {
+      "name": "admission-id-object-key-drift",
+      "fixture": "admitted",
+      "operation": "replace-admission",
+      "path": ["admission_object_key"],
+      "value": "synthetic/qualification/ylx-transfer/550e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0020-0000-7a1b-8c2d-3e4f50617283/__ylx_evidence__/admission-019a0039-0000-7a1b-8c2d-3e4f50617283.json",
+      "validation_stage": "cross-field",
+      "expected_error_keywords": ["admission_id", "object_key"]
+    },
+    {
+      "name": "admission-authority-drift",
+      "fixture": "admitted",
+      "operation": "replace-admission",
+      "path": ["admission_object_key"],
+      "value": "synthetic/qualification/ylx-transfer/650e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0020-0000-7a1b-8c2d-3e4f50617283/__ylx_evidence__/admission-019a0030-0000-7a1b-8c2d-3e4f50617283.json",
+      "validation_stage": "cross-field",
+      "expected_error_keywords": ["admission", "authority", "marker"]
+    },
+    {
+      "name": "admission-time-precedes-publication",
+      "fixture": "admitted",
+      "operation": "replace-admission",
+      "path": ["admitted_at"],
+      "value": "2026-08-28T10:10:59Z",
+      "validation_stage": "cross-field",
+      "expected_error_keywords": ["admitted_at", "published_at"]
+    },
+    {
+      "name": "admitted-diagnostics-not-empty",
+      "fixture": "admitted",
+      "operation": "replace-admission",
+      "path": ["diagnostics"],
+      "value": [{"code": "publication_invalid", "summary": "Unexpected diagnostic."}],
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["diagnostics", "maxItems"]
+    },
+    {
+      "name": "rejected-diagnostics-empty",
+      "fixture": "rejected",
+      "operation": "replace-admission",
+      "path": ["diagnostics"],
+      "value": [],
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["diagnostics", "minItems"]
+    },
+    {
+      "name": "diagnostic-code-unknown",
+      "fixture": "rejected",
+      "operation": "replace-admission",
+      "path": ["diagnostics", 0, "code"],
+      "value": "other",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["diagnostics", "code", "other"]
+    },
+    {
+      "name": "device-signature-impersonation",
+      "fixture": "admitted",
+      "operation": "add-admission-field",
+      "path": [],
+      "field": "device_signature",
+      "value": "forged",
+      "validation_stage": "json-schema",
+      "expected_error_keywords": ["additionalProperties", "device_signature"]
+    },
+    {
+      "name": "ack-readback-digest-mismatch",
+      "fixture": "admitted",
+      "operation": "replace-admission-observed",
+      "field": "sha256",
+      "value": "0000000000000000000000000000000000000000000000000000000000000000",
+      "validation_stage": "readback",
+      "expected_error_keywords": ["admission", "readback", "sha256"]
+    },
+    {
+      "name": "ack-readback-bytes-mismatch",
+      "fixture": "admitted",
+      "operation": "replace-admission-observed",
+      "field": "bytes",
+      "value": 1130,
+      "validation_stage": "readback",
+      "expected_error_keywords": ["admission", "readback", "bytes"]
+    },
+    {
+      "name": "ack-readback-object-key-mismatch",
+      "fixture": "admitted",
+      "operation": "replace-admission-observed",
+      "field": "object_key",
+      "value": "synthetic/qualification/ylx-transfer/550e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0020-0000-7a1b-8c2d-3e4f50617283/__ylx_evidence__/admission-019a0039-0000-7a1b-8c2d-3e4f50617283.json",
+      "validation_stage": "readback",
+      "expected_error_keywords": ["admission", "readback", "object_key"]
+    }
+  ],
+  "completion_cases": [
+    {
+      "name": "data-and-marker-without-ack",
+      "acknowledgements": [],
+      "expected_complete": false,
+      "expected_error_keywords": []
+    },
+    {
+      "name": "exact-rejected-ack",
+      "acknowledgements": ["rejected"],
+      "expected_complete": false,
+      "expected_error_keywords": []
+    },
+    {
+      "name": "exact-index-write-failed-rejected-ack",
+      "acknowledgements": ["rejected-index-write-failed"],
+      "expected_complete": false,
+      "expected_error_keywords": []
+    },
+    {
+      "name": "admitted-ack-without-readback",
+      "acknowledgements": ["admitted-unobserved"],
+      "expected_complete": false,
+      "expected_error_keywords": []
+    },
+    {
+      "name": "exact-admitted-ack",
+      "acknowledgements": ["admitted"],
+      "expected_complete": true,
+      "expected_error_keywords": []
+    },
+    {
+      "name": "admitted-ack-schema-drift-with-consistent-readback",
+      "acknowledgements": ["admitted-schema-drift"],
+      "expected_complete": false,
+      "expected_error_keywords": ["JSON Schema", "additionalProperties", "completion_schema_drift"]
+    },
+    {
+      "name": "duplicate-admitted-acks",
+      "acknowledgements": ["admitted", "admitted"],
+      "expected_complete": false,
+      "expected_error_keywords": ["exactly one", "acknowledgement"]
+    },
+    {
+      "name": "conflicting-ack-verdicts",
+      "acknowledgements": ["admitted", "rejected"],
+      "expected_complete": false,
+      "expected_error_keywords": ["exactly one", "acknowledgement"]
+    }
+  ]
+}

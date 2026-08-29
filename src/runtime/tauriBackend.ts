@@ -95,13 +95,36 @@ export function createTauriBackend(): TransferBackend {
             sink({ kind: "devices", revision: eventRevisionNumber, devices }),
           ),
         () =>
-          onSessionsUpdate(({ deviceId, sessions }, eventRevisionNumber) =>
-            sink({
-              kind: "sessions",
-              revision: eventRevisionNumber,
-              deviceId,
-              sessions,
-            }),
+          onSessionsUpdate(
+            (
+              {
+                deviceId,
+                sessions,
+                catalogRevision,
+                nextCursor,
+                hasMore,
+                catalogAuthority,
+                paginationSupported,
+                paginationUnavailableReason,
+                capabilities,
+                diagnostics,
+              },
+              eventRevisionNumber,
+            ) =>
+              sink({
+                kind: "sessions",
+                revision: eventRevisionNumber,
+                deviceId,
+                sessions,
+                catalogRevision,
+                nextCursor,
+                hasMore,
+                catalogAuthority,
+                paginationSupported,
+                paginationUnavailableReason,
+                capabilities,
+                diagnostics,
+              }),
           ),
         () =>
           onLibraryUpdate((library, eventRevisionNumber) =>
@@ -162,7 +185,12 @@ export function createTauriBackend(): TransferBackend {
     },
 
     listDevices: () => call("list_devices", () => revisionedApi.listDevices()),
-    listSessions: (deviceId) => call("list_sessions", () => revisionedApi.listSessions(deviceId)),
+    listSessions: (deviceId, cursor = null, catalogRevision = null) =>
+      call("list_sessions", () => revisionedApi.listSessions(deviceId, cursor, catalogRevision)),
+    getSessionDetail: (deviceId, sessionId, sessionRevision, catalogRevision) =>
+      call("get_session_detail", () =>
+        revisionedApi.getSessionDetail(deviceId, sessionId, sessionRevision, catalogRevision),
+      ),
     listLibrary: () => call("list_library", () => revisionedApi.listLibrary()),
     listTransfers: () => call("list_transfers", () => revisionedApi.listTransfers()),
     getStorageConfig: () => call("get_storage_config", () => revisionedApi.getStorageConfig()),
@@ -200,8 +228,6 @@ export function createTauriBackend(): TransferBackend {
       call("download_sessions", () =>
         api.downloadSessions(deviceId, [...sessionIds]).then((raw) => downloadDispatch(raw, sessionIds)),
       ),
-    downloadFile: (deviceId, sessionId, fileId) =>
-      call("download_file", () => api.downloadFile(deviceId, sessionId, fileId)).then(asDownloadJobId),
     uploadEntry: (key) => call("upload_entry", () => api.uploadEntry(key)).then(asUploadJobId),
     uploadEntries: (keys) =>
       call("upload_entries", () => api.uploadEntries([...keys]).then((raw) => uploadDispatch(raw, keys))),

@@ -25,6 +25,7 @@ export type UiAction =
   | { readonly kind: "device/reconnect"; readonly deviceId: DeviceId }
   | { readonly kind: "device/disconnect"; readonly deviceId: DeviceId }
   | { readonly kind: "device/refreshSessions"; readonly deviceId: DeviceId }
+  | { readonly kind: "device/loadMoreSessions"; readonly deviceId: DeviceId }
   | { readonly kind: "library/open" }
   | { readonly kind: "library/reconcile"; readonly force: boolean }
   | { readonly kind: "media/open" }
@@ -59,12 +60,7 @@ export type UiAction =
 
   /* per-row commands */
   | { readonly kind: "session/download"; readonly deviceId: DeviceId; readonly sessionId: SessionId }
-  | {
-      readonly kind: "session/downloadFile";
-      readonly deviceId: DeviceId;
-      readonly sessionId: SessionId;
-      readonly fileId: FileId;
-    }
+  | { readonly kind: "session/loadDetail"; readonly deviceId: DeviceId; readonly sessionId: SessionId }
   | { readonly kind: "session/remove"; readonly deviceId: DeviceId; readonly sessionId: SessionId }
   | { readonly kind: "entry/upload"; readonly key: LibraryKey }
   | { readonly kind: "entry/revealFile"; readonly key: LibraryKey; readonly fileId: FileId }

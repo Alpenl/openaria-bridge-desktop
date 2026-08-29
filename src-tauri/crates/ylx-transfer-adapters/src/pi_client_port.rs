@@ -1,10 +1,12 @@
 //! Core capability-port implementations for the real [`PiHttpClient`].
 //!
-//! Pairing is deliberately unauthenticated. Every other capability accepts
-//! an `AuthenticatedPiSession`, verifies that its TLS pin belongs to this
-//! transport, and borrows its bearer token for exactly one wire call. The
-//! catalog mapping also verifies signed publication data against the
-//! session-bound publication identity.
+//! Retained legacy v1 pairing is deliberately unauthenticated. Every other
+//! capability accepts an `AuthenticatedPiSession`, verifies that its identity
+//! pin belongs to this transport, and borrows its bearer token for exactly one
+//! wire call. Current lab/internal Device API v4 uses a local compatibility
+//! session and no bearer authentication; catalog mapping accepts the v4 manifest
+//! bytes as the source of authority and emits a local compatibility publication
+//! envelope for the existing download/library pipeline.
 
 /// Session-bound convenience façades live next to the direct capability
 /// implementations so existing callers retain one adapter entry point.
@@ -18,17 +20,25 @@ pub mod session;
 pub use session::{AuthenticatedPiClient, PiPairingClient};
 
 use ylx_transfer_core::device::{
-    AuthenticatedDevicePort, AuthenticatedPiSession, ByteRangeRequest, DeleteSessionReceiptView,
-    DeviceInfoView, DownloadTransportPort, FileDownloadView, FileHeadView, FileStreamView,
-    HeartbeatOutcomeView, PairingCreatedView, PairingPort, PairingStatusView, PiClientError,
-    PiClientErrorKind, SessionCatalogPort, SessionDetailView, SessionFileEntryView,
+    AuthenticatedDevicePort, AuthenticatedPiSession, ByteRangeRequest, CapabilitySourceView,
+    CaptureDeviceStateView, CaptureStatusView, CatalogRevisionAuthorityView,
+    DeleteSessionReceiptView, DeviceApiProfileView, DeviceCapabilitiesView, DeviceInfoView,
+    DownloadTransportPort, FileDownloadView, FileHeadView, FileStreamView,
+    GatewayVerificationDiagnosticView, GatewayVerificationVerdictView, GatewayVerificationView,
+    HeartbeatOutcomeView, NegotiatedCapabilityView, PaginationUnavailableReasonView,
+    PairingCreatedView, PairingPort, PairingStatusView, PiClientError, PiClientErrorKind,
+    PublicationEnvelopeOriginView, SessionCatalogPort, SessionDetailView,
+    SessionDiscoveryDiagnosticCodeView, SessionDiscoveryDiagnosticView, SessionFileEntryView,
     SessionSummaryView, SessionsPageView,
 };
 use ylx_transfer_core::domain::{FileId, SessionId};
 
 use crate::pi_http::{
-    ApiError, PiApiErrorCode, PiHttpClient, PiHttpError, RangeRequest, SessionDetail,
-    SessionFileEntry, SessionSummary,
+    ApiError, CapabilitySource, CaptureStatusInfo, CatalogRevisionAuthority, DeviceApiProfile,
+    DeviceCapabilities, DeviceInfo, NegotiatedCapability, PiApiErrorCode, PiHttpClient,
+    PiHttpError, PublicationEnvelopeOrigin, RangeRequest, SessionDetail, SessionFileEntry,
+    SessionSummary, V4CaptureDeviceState, V4GatewayDiagnostic, V4GatewayVerification,
+    V4SessionDiagnosticCode, V4SessionDiscoveryDiagnostic, V4VerificationVerdict,
 };
 use crate::publication_verifier::validate_session_detail_publication;
 
@@ -44,6 +54,11 @@ fn map_error(err: PiHttpError) -> PiClientError {
         {
             PiClientErrorKind::Timeout
         }
+        PiHttpError::CatalogChanged {
+            catalog_revision, ..
+        } => PiClientErrorKind::CatalogChanged {
+            catalog_revision: catalog_revision.clone(),
+        },
         _ => PiClientErrorKind::Other,
     };
     PiClientError {
@@ -60,6 +75,176 @@ fn to_range_request(range: ByteRangeRequest) -> RangeRequest {
     }
 }
 
+fn to_capability_source(source: CapabilitySource) -> CapabilitySourceView {
+    match source {
+        CapabilitySource::DeviceDescriptor => CapabilitySourceView::DeviceDescriptor,
+        CapabilitySource::ProfileContract => CapabilitySourceView::ProfileContract,
+        CapabilitySource::Unavailable => CapabilitySourceView::Unavailable,
+    }
+}
+
+fn to_capability_view(capability: NegotiatedCapability) -> NegotiatedCapabilityView {
+    NegotiatedCapabilityView {
+        supported: capability.supported,
+        source: to_capability_source(capability.source),
+    }
+}
+
+fn to_capabilities_view(capabilities: DeviceCapabilities) -> DeviceCapabilitiesView {
+    DeviceCapabilitiesView {
+        capture: to_capability_view(capabilities.capture),
+        preview: to_capability_view(capabilities.preview),
+        range_download: to_capability_view(capabilities.range_download),
+        network_mutation: to_capability_view(capabilities.network_mutation),
+        calibration_capture: to_capability_view(capabilities.calibration_capture),
+        session_list: to_capability_view(capabilities.session_list),
+        session_detail: to_capability_view(capabilities.session_detail),
+        artifact_download: to_capability_view(capabilities.artifact_download),
+        capture_status: to_capability_view(capabilities.capture_status),
+        session_deletion: to_capability_view(capabilities.session_deletion),
+    }
+}
+
+fn to_capture_status_view(status: CaptureStatusInfo) -> CaptureStatusView {
+    let device_state = match status.device_state {
+        V4CaptureDeviceState::Idle => CaptureDeviceStateView::Idle,
+        V4CaptureDeviceState::Recording => CaptureDeviceStateView::Recording,
+        V4CaptureDeviceState::Finalizing => CaptureDeviceStateView::Finalizing,
+        V4CaptureDeviceState::Encoding => CaptureDeviceStateView::Encoding,
+        V4CaptureDeviceState::Verifying => CaptureDeviceStateView::Verifying,
+        V4CaptureDeviceState::Blocked => CaptureDeviceStateView::Blocked,
+        V4CaptureDeviceState::Unknown(value) => CaptureDeviceStateView::Unknown(value),
+    };
+    CaptureStatusView {
+        authority_epoch: status.authority_epoch,
+        source_revision: status.source_revision,
+        device_state,
+        active_recording: status.active_recording,
+    }
+}
+
+fn to_device_info_view(
+    session: &AuthenticatedPiSession,
+    device: DeviceInfo,
+) -> Result<DeviceInfoView, PiClientError> {
+    session
+        .ensure_publication_key(&device.publication_key_fingerprint)
+        .map_err(verification_error)?;
+    let profile = match device.profile {
+        DeviceApiProfile::LegacyPinnedHttpsV1 => DeviceApiProfileView::LegacyPinnedHttpsV1,
+        DeviceApiProfile::LabHttpV4 => DeviceApiProfileView::LabHttpV4,
+    };
+    let publication_origin = match device.publication_origin {
+        PublicationEnvelopeOrigin::DeviceSigned => PublicationEnvelopeOriginView::DeviceSigned,
+        PublicationEnvelopeOrigin::ClientDerivedLabCompatibility => {
+            PublicationEnvelopeOriginView::ClientDerivedLabCompatibility
+        }
+    };
+    Ok(DeviceInfoView {
+        capture_activity: device.capture_activity,
+        media_admission: device.media_admission,
+        publication_key_fingerprint: device.publication_key_fingerprint,
+        profile,
+        capabilities: to_capabilities_view(device.capabilities),
+        capture_status: device.capture_status.map(to_capture_status_view),
+        publication_origin,
+    })
+}
+
+fn to_catalog_authority_view(authority: CatalogRevisionAuthority) -> CatalogRevisionAuthorityView {
+    match authority {
+        CatalogRevisionAuthority::LegacyDevice => CatalogRevisionAuthorityView::LegacyDevice,
+        CatalogRevisionAuthority::DeviceStable => CatalogRevisionAuthorityView::DeviceStable,
+        CatalogRevisionAuthority::LocalFirstPageCompatibility => {
+            CatalogRevisionAuthorityView::LocalFirstPageCompatibility
+        }
+    }
+}
+
+fn to_gateway_verification_view(verification: V4GatewayVerification) -> GatewayVerificationView {
+    GatewayVerificationView {
+        actor: verification.actor,
+        validator_name: verification.validator_name,
+        validator_version: verification.validator_version,
+        validator_build_sha256: verification.validator_build_sha256,
+        manifest_sha256: verification.manifest_sha256,
+        manifest_digest_valid: verification.manifest_digest_valid,
+        verified_at: verification.verified_at,
+        verdict: match verification.verdict {
+            V4VerificationVerdict::Usable => GatewayVerificationVerdictView::Usable,
+            V4VerificationVerdict::Unusable => GatewayVerificationVerdictView::Unusable,
+        },
+        diagnostics: verification
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| match diagnostic {
+                V4GatewayDiagnostic::LegacyMessage(message) => {
+                    GatewayVerificationDiagnosticView::LegacyMessage(message)
+                }
+                V4GatewayDiagnostic::Structured { code, summary } => {
+                    GatewayVerificationDiagnosticView::Structured { code, summary }
+                }
+            })
+            .collect(),
+    }
+}
+
+fn from_gateway_verification_view(verification: &GatewayVerificationView) -> V4GatewayVerification {
+    V4GatewayVerification {
+        actor: verification.actor.clone(),
+        validator_name: verification.validator_name.clone(),
+        validator_version: verification.validator_version.clone(),
+        validator_build_sha256: verification.validator_build_sha256.clone(),
+        manifest_sha256: verification.manifest_sha256.clone(),
+        manifest_digest_valid: verification.manifest_digest_valid,
+        verified_at: verification.verified_at.clone(),
+        verdict: match verification.verdict {
+            GatewayVerificationVerdictView::Usable => V4VerificationVerdict::Usable,
+            GatewayVerificationVerdictView::Unusable => V4VerificationVerdict::Unusable,
+        },
+        diagnostics: verification
+            .diagnostics
+            .iter()
+            .map(|diagnostic| match diagnostic {
+                GatewayVerificationDiagnosticView::LegacyMessage(message) => {
+                    V4GatewayDiagnostic::LegacyMessage(message.clone())
+                }
+                GatewayVerificationDiagnosticView::Structured { code, summary } => {
+                    V4GatewayDiagnostic::Structured {
+                        code: code.clone(),
+                        summary: summary.clone(),
+                    }
+                }
+            })
+            .collect(),
+    }
+}
+
+fn to_discovery_diagnostic_view(
+    diagnostic: V4SessionDiscoveryDiagnostic,
+) -> SessionDiscoveryDiagnosticView {
+    let code = match diagnostic.code {
+        V4SessionDiagnosticCode::ManifestUnreadable => {
+            SessionDiscoveryDiagnosticCodeView::ManifestUnreadable
+        }
+        V4SessionDiagnosticCode::UnsupportedSchema => {
+            SessionDiscoveryDiagnosticCodeView::UnsupportedSchema
+        }
+        V4SessionDiagnosticCode::ManifestInvalid => {
+            SessionDiscoveryDiagnosticCodeView::ManifestInvalid
+        }
+        V4SessionDiagnosticCode::ManifestNotSealed => {
+            SessionDiscoveryDiagnosticCodeView::ManifestNotSealed
+        }
+    };
+    SessionDiscoveryDiagnosticView {
+        quarantine_id: diagnostic.quarantine_id,
+        code,
+        observed_at: diagnostic.observed_at,
+        message: diagnostic.message,
+    }
+}
+
 fn to_session_summary_view(s: SessionSummary) -> SessionSummaryView {
     SessionSummaryView {
         session_id: s.session_id.as_str().to_string(),
@@ -70,6 +255,7 @@ fn to_session_summary_view(s: SessionSummary) -> SessionSummaryView {
         total_bytes: s.total_bytes,
         video_bytes: s.video_bytes,
         file_count: s.file_count,
+        gateway_verification: s.gateway_verification.map(to_gateway_verification_view),
     }
 }
 
@@ -143,7 +329,82 @@ fn to_session_detail_view(
         publication_signature: publication.signature,
         publication_public_key: publication.public_key,
         publication_key_fingerprint: publication.key_fingerprint,
+        gateway_verification: d.gateway_verification.map(to_gateway_verification_view),
+        publication_origin: match d.publication_origin {
+            PublicationEnvelopeOrigin::DeviceSigned => PublicationEnvelopeOriginView::DeviceSigned,
+            PublicationEnvelopeOrigin::ClientDerivedLabCompatibility => {
+                PublicationEnvelopeOriginView::ClientDerivedLabCompatibility
+            }
+        },
     })
+}
+
+fn to_lab_v4_session_detail_view(
+    d: SessionDetail,
+    requested_session_id: &str,
+) -> Result<SessionDetailView, PiClientError> {
+    if d.session_id.as_str() != requested_session_id {
+        return Err(PiClientError {
+            kind: PiClientErrorKind::Other,
+            message: "Device API v4 session detail response does not match the requested session"
+                .to_string(),
+        });
+    }
+    Ok(SessionDetailView {
+        session_id: d.session_id.as_str().to_string(),
+        revision: d.revision,
+        captured_at: d.captured_at,
+        published_at: d.published_at,
+        duration_seconds: d.duration_seconds,
+        total_bytes: d.total_bytes,
+        video_bytes: d.video_bytes,
+        file_count: d.file_count,
+        files: d
+            .files
+            .into_iter()
+            .map(to_session_file_entry_view)
+            .collect(),
+        publication_payload: d.publication_payload.into_bytes(),
+        publication_signature: decode_lower_hex_for_lab_v4(
+            "publication_signature",
+            &d.publication_signature,
+        )?,
+        publication_public_key: decode_lower_hex_for_lab_v4(
+            "publication_public_key",
+            &d.publication_public_key,
+        )?,
+        publication_key_fingerprint: d.publication_key_fingerprint,
+        gateway_verification: d.gateway_verification.map(to_gateway_verification_view),
+        publication_origin: match d.publication_origin {
+            PublicationEnvelopeOrigin::DeviceSigned => PublicationEnvelopeOriginView::DeviceSigned,
+            PublicationEnvelopeOrigin::ClientDerivedLabCompatibility => {
+                PublicationEnvelopeOriginView::ClientDerivedLabCompatibility
+            }
+        },
+    })
+}
+
+fn decode_lower_hex_for_lab_v4(field: &str, value: &str) -> Result<Vec<u8>, PiClientError> {
+    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(PiClientError {
+            kind: PiClientErrorKind::Other,
+            message: format!("Device API v4 compatibility {field} is not hex"),
+        });
+    }
+    let mut out = Vec::with_capacity(value.len() / 2);
+    let bytes = value.as_bytes();
+    for chunk in bytes.as_chunks::<2>().0 {
+        let text = std::str::from_utf8(chunk).map_err(|_| PiClientError {
+            kind: PiClientErrorKind::Other,
+            message: format!("Device API v4 compatibility {field} is not UTF-8 hex"),
+        })?;
+        let byte = u8::from_str_radix(text, 16).map_err(|_| PiClientError {
+            kind: PiClientErrorKind::Other,
+            message: format!("Device API v4 compatibility {field} is not hex"),
+        })?;
+        out.push(byte);
+    }
+    Ok(out)
 }
 
 impl PairingPort for PiHttpClient {
@@ -201,6 +462,7 @@ impl AuthenticatedDevicePort for PiHttpClient {
             .map(|h| HeartbeatOutcomeView {
                 idle_timeout_ms: h.idle_timeout_ms,
                 absolute_expires_at: h.absolute_expires_at,
+                capture_activity: h.capture_activity,
             })
             .map_err(map_error)
     }
@@ -220,16 +482,18 @@ impl AuthenticatedDevicePort for PiHttpClient {
         session
             .with_authenticated_token(|token| PiHttpClient::get_device(self, token))
             .map_err(map_error)
-            .and_then(|d| {
-                session
-                    .ensure_publication_key(&d.publication_key_fingerprint)
-                    .map_err(verification_error)?;
-                Ok(DeviceInfoView {
-                    capture_activity: d.capture_activity,
-                    media_admission: d.media_admission,
-                    publication_key_fingerprint: d.publication_key_fingerprint,
-                })
-            })
+            .and_then(|device| to_device_info_view(session, device))
+    }
+
+    fn negotiate_device(
+        &self,
+        session: &AuthenticatedPiSession,
+    ) -> Result<DeviceInfoView, PiClientError> {
+        validate_session_transport(self, session)?;
+        session
+            .with_authenticated_token(|token| PiHttpClient::negotiate_device(self, token))
+            .map_err(map_error)
+            .and_then(|device| to_device_info_view(session, device))
     }
 }
 
@@ -253,6 +517,16 @@ impl SessionCatalogPort for PiHttpClient {
                     .map(to_session_summary_view)
                     .collect(),
                 next_cursor: p.next_cursor,
+                catalog_authority: to_catalog_authority_view(p.catalog_authority),
+                pagination_supported: p.pagination_supported,
+                pagination_unavailable_reason: p
+                    .pagination_unavailable_reason
+                    .map(|_| PaginationUnavailableReasonView::FirmwareUpgradeRequired),
+                diagnostics: p
+                    .diagnostics
+                    .into_iter()
+                    .map(to_discovery_diagnostic_view)
+                    .collect(),
             })
             .map_err(map_error)
     }
@@ -263,6 +537,13 @@ impl SessionCatalogPort for PiHttpClient {
         session_id: &str,
     ) -> Result<SessionDetailView, PiClientError> {
         validate_session_transport(self, session)?;
+        if self.is_lab_v4_http() {
+            return Err(PiClientError {
+                kind: PiClientErrorKind::Other,
+                message: "Device API v4 detail requires a fresh usable list verification; use get_verified_session"
+                    .to_string(),
+            });
+        }
         let expected_publication_key_fingerprint = required_publication_key(session)?;
         session
             .with_authenticated_token(|token| {
@@ -272,6 +553,33 @@ impl SessionCatalogPort for PiHttpClient {
             .and_then(|detail| {
                 to_session_detail_view(detail, session_id, expected_publication_key_fingerprint)
             })
+    }
+
+    fn get_verified_session(
+        &self,
+        session: &AuthenticatedPiSession,
+        session_id: &str,
+        verification: &GatewayVerificationView,
+    ) -> Result<SessionDetailView, PiClientError> {
+        validate_session_transport(self, session)?;
+        if !self.is_lab_v4_http() {
+            return Err(PiClientError {
+                kind: PiClientErrorKind::Other,
+                message: "gateway-verified detail is only defined by Device API v4".to_string(),
+            });
+        }
+        let verification = from_gateway_verification_view(verification);
+        session
+            .with_authenticated_token(|token| {
+                PiHttpClient::get_v4_verified_session(
+                    self,
+                    token,
+                    &SessionId(session_id.to_string()),
+                    Some(&verification),
+                )
+            })
+            .map_err(map_error)
+            .and_then(|detail| to_lab_v4_session_detail_view(detail, session_id))
     }
 
     fn delete_session(
@@ -399,14 +707,105 @@ impl DownloadTransportPort for PiHttpClient {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
     use std::time::Duration;
 
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use sha2::{Digest, Sha256};
     use tiny_http::{Response as TinyResponse, Server};
+    use ylx_transfer_core::device::CaptureActivityState;
     use ylx_transfer_core::publication::canonicalize_rp_manifest;
 
     use super::*;
+
+    #[test]
+    fn catalog_changed_keeps_the_current_revision_across_the_core_port() {
+        let catalog_revision = format!("sha256:{}", "d".repeat(64));
+        let error = map_error(PiHttpError::CatalogChanged {
+            status: 409,
+            request_id: "f47ac10b-58cc-4372-a567-0e02b2c3d479".to_string(),
+            catalog_revision: catalog_revision.clone(),
+            detail: "catalog changed".to_string(),
+        });
+
+        assert_eq!(
+            error.kind,
+            PiClientErrorKind::CatalogChanged { catalog_revision }
+        );
+    }
+
+    #[test]
+    fn lab_v4_periodic_poll_maps_one_capture_status_response_through_the_core_port() {
+        let server = Server::http("127.0.0.1:0").expect("bind loopback poll server");
+        let port = server
+            .server_addr()
+            .to_ip()
+            .expect("loopback poll server address")
+            .port();
+        let (request_tx, request_rx) = mpsc::channel();
+        let server_handle = std::thread::spawn(move || {
+            let request = server.recv().expect("receive periodic poll");
+            request_tx
+                .send(request.url().to_string())
+                .expect("record periodic poll path");
+            let body = serde_json::json!({
+                "schema": "ylx.capture-status.v4",
+                "authority_epoch": "4fa85f64-5717-4562-b3fc-2c963f66afa6",
+                "source_revision": 7,
+                "snapshot": {
+                    "schema": "ylx.capture-snapshot-event.v4",
+                    "device_state": "recording",
+                    "active_recording": {
+                        "generation_id": "550e8400-e29b-41d4-a716-446655440001"
+                    },
+                    "retained_unsuccessful": null,
+                    "runtime": {
+                        "observed_at": "2026-08-21T10:24:15+08:00",
+                        "connection_method": "ethernet_lan",
+                        "temperature_celsius": 53.5,
+                        "network": {},
+                        "live_imu": null,
+                        "camera": {
+                            "schema": "ylx.camera-connection.v1",
+                            "state": "connected"
+                        },
+                        "camera_focus": null
+                    }
+                }
+            })
+            .to_string();
+            request
+                .respond(TinyResponse::from_string(body).with_status_code(200))
+                .expect("respond to periodic poll");
+        });
+        let device_id = "550e8400-e29b-41d4-a716-446655440000";
+        let tls_pin = crate::pi_http::lab_v4_device_identity_pin(device_id);
+        let client = PiHttpClient::new_lab_v4_http(
+            "127.0.0.1".to_string(),
+            port,
+            tls_pin.clone(),
+            Duration::from_secs(5),
+        )
+        .expect("Lab v4 client");
+        let session =
+            AuthenticatedPiSession::new("local-token", tls_pin.0, None, 1).expect("Lab v4 session");
+
+        let outcome = AuthenticatedDevicePort::heartbeat(&client, &session)
+            .expect("periodic poll maps through the core port");
+
+        assert_eq!(
+            outcome.capture_activity,
+            Some(CaptureActivityState::Recording)
+        );
+        assert_eq!(
+            request_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("periodic poll path"),
+            "/api/v4/capture/status"
+        );
+        assert!(request_rx.try_recv().is_err(), "one port call, one request");
+        server_handle.join().expect("periodic poll server exits");
+    }
 
     fn authenticated_session(
         publication_key_fingerprint: Option<String>,

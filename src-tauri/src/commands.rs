@@ -6,7 +6,7 @@
 
 use std::net::IpAddr;
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Runtime};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::application::{
@@ -16,10 +16,11 @@ use crate::application::{
 };
 use crate::media::MediaApplication;
 use crate::models::{
-    Device, LibraryView, SaveStorageConfigInput, SessionView, StorageConfigView, Transfer,
+    Device, LibraryView, SaveStorageConfigInput, SessionPageView, SessionView, StorageConfigView,
+    Transfer,
 };
 
-fn application(app: &AppHandle) -> Result<TransferApplication, RpcError> {
+fn application<R: Runtime>(app: &AppHandle<R>) -> Result<TransferApplication, RpcError> {
     TransferApplication::from_app(app)
 }
 
@@ -117,12 +118,39 @@ pub async fn disconnect_device(app: AppHandle, device_id: String) -> Result<(), 
 pub async fn list_sessions(
     app: AppHandle,
     device_id: String,
-) -> Result<Revisioned<Vec<SessionView>>, RpcError> {
+    cursor: Option<String>,
+    catalog_revision: Option<String>,
+) -> Result<Revisioned<SessionPageView>, RpcError> {
     validate_command_string("deviceId", &device_id)?;
+    if let Some(cursor) = cursor.as_deref() {
+        validate_command_string("cursor", cursor)?;
+    }
+    if let Some(catalog_revision) = catalog_revision.as_deref() {
+        validate_command_string("catalogRevision", catalog_revision)?;
+    }
     application(&app)?
-        .list_sessions(device_id)
+        .list_sessions(device_id, cursor, catalog_revision)
         .await
-        .map_err(|message| command_failure("session_list_failed", message, true))
+}
+
+#[tauri::command]
+pub async fn get_session_detail(
+    app: AppHandle,
+    device_id: String,
+    session_id: String,
+    session_revision: String,
+    catalog_revision: Option<String>,
+) -> Result<Revisioned<SessionView>, RpcError> {
+    validate_command_string("deviceId", &device_id)?;
+    validate_command_string("sessionId", &session_id)?;
+    validate_command_string("sessionRevision", &session_revision)?;
+    if let Some(catalog_revision) = catalog_revision.as_deref() {
+        validate_command_string("catalogRevision", catalog_revision)?;
+    }
+    application(&app)?
+        .get_session_detail(device_id, session_id, session_revision, catalog_revision)
+        .await
+        .map_err(|message| command_failure("session_detail_failed", message, true))
 }
 
 #[tauri::command]
@@ -221,22 +249,6 @@ pub async fn download_sessions(
     validate_command_batch("sessionIds", &session_ids)?;
     application(&app)?
         .download_sessions(app, device_id, session_ids)
-        .await
-        .map_err(|message| command_failure("download_enqueue_failed", message, false))
-}
-
-#[tauri::command]
-pub async fn download_file(
-    app: AppHandle,
-    device_id: String,
-    session_id: String,
-    file_id: String,
-) -> Result<String, RpcError> {
-    validate_command_string("deviceId", &device_id)?;
-    validate_command_string("sessionId", &session_id)?;
-    validate_command_string("fileId", &file_id)?;
-    application(&app)?
-        .download_file(app, device_id, session_id, file_id)
         .await
         .map_err(|message| command_failure("download_enqueue_failed", message, false))
 }

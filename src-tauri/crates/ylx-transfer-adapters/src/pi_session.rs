@@ -10,8 +10,8 @@ use std::sync::Arc;
 use ylx_transfer_core::device::actor::{
     AuthenticatedDevicePort, AuthenticatedPiSession, ByteRangeRequest, DeleteSessionReceiptView,
     DeviceInfoView, DownloadTransportPort, FileDownloadView, FileHeadView, FileStreamView,
-    HeartbeatOutcomeView, PairingCreatedView, PairingPort, PairingStatusView, PiClientError,
-    SessionCatalogPort, SessionDetailView, SessionsPageView,
+    GatewayVerificationView, HeartbeatOutcomeView, PairingCreatedView, PairingPort,
+    PairingStatusView, PiClientError, SessionCatalogPort, SessionDetailView, SessionsPageView,
 };
 
 use crate::pi_http::{PiHttpClient, PiHttpError, RangeRequest};
@@ -174,6 +174,10 @@ impl AuthenticatedPiClient {
         <Self as AuthenticatedDevicePort>::get_device(self, &self.session)
     }
 
+    pub fn negotiate_device(&self) -> Result<DeviceInfoView, PiClientError> {
+        <Self as AuthenticatedDevicePort>::negotiate_device(self, &self.session)
+    }
+
     pub fn list_sessions(
         &self,
         cursor: Option<&str>,
@@ -184,6 +188,19 @@ impl AuthenticatedPiClient {
 
     pub fn get_session(&self, session_id: &str) -> Result<SessionDetailView, PiClientError> {
         <Self as SessionCatalogPort>::get_session(self, &self.session, session_id)
+    }
+
+    pub fn get_verified_session(
+        &self,
+        session_id: &str,
+        verification: &GatewayVerificationView,
+    ) -> Result<SessionDetailView, PiClientError> {
+        <Self as SessionCatalogPort>::get_verified_session(
+            self,
+            &self.session,
+            session_id,
+            verification,
+        )
     }
 
     pub fn delete_session(
@@ -255,6 +272,14 @@ impl AuthenticatedDevicePort for AuthenticatedPiClient {
         self.check_session(session)?;
         AuthenticatedDevicePort::get_device(self.client.as_ref(), session)
     }
+
+    fn negotiate_device(
+        &self,
+        session: &AuthenticatedPiSession,
+    ) -> Result<DeviceInfoView, PiClientError> {
+        self.check_session(session)?;
+        AuthenticatedDevicePort::negotiate_device(self.client.as_ref(), session)
+    }
 }
 
 impl SessionCatalogPort for AuthenticatedPiClient {
@@ -275,6 +300,21 @@ impl SessionCatalogPort for AuthenticatedPiClient {
     ) -> Result<SessionDetailView, PiClientError> {
         self.check_session(session)?;
         SessionCatalogPort::get_session(self.client.as_ref(), session, session_id)
+    }
+
+    fn get_verified_session(
+        &self,
+        session: &AuthenticatedPiSession,
+        session_id: &str,
+        verification: &GatewayVerificationView,
+    ) -> Result<SessionDetailView, PiClientError> {
+        self.check_session(session)?;
+        SessionCatalogPort::get_verified_session(
+            self.client.as_ref(),
+            session,
+            session_id,
+            verification,
+        )
     }
 
     fn delete_session(

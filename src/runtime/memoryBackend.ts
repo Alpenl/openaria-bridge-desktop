@@ -38,6 +38,8 @@ import type {
   LibraryEntry,
   RpcError,
   SaveStorageConfigInput,
+  SessionCapabilities,
+  SessionPageView,
   SessionView,
   StorageConfig,
   Transfer,
@@ -53,6 +55,16 @@ export const EMPTY_STORAGE: StorageConfig = {
   downloadRoot: "",
   activeDownloadRoot: "/downloads",
 };
+
+export const MEMORY_LEGACY_SESSION_CAPABILITIES: SessionCapabilities = {
+  profile: "legacyPinnedTlsV1",
+  sessionDeletion: { supported: true, source: "profileContract" },
+  sessionDetail: { supported: true, source: "profileContract" },
+  artifactDownload: { supported: true, source: "profileContract" },
+  captureStatus: { supported: false, source: "unavailable" },
+};
+
+const MEMORY_SESSION_PAGE_SIZE = 50;
 
 export interface MemoryBackendOptions {
   /** Starting backend-owned world; missing parts default to empty. */
@@ -106,6 +118,7 @@ export interface MemoryBackend extends TransferBackend {
 
   setDevices(devices: Device[]): void;
   setSessions(deviceId: string, sessions: SessionView[]): void;
+  setSessionCapabilities(deviceId: string, capabilities: SessionCapabilities): void;
   /** Makes the next dispatch of `name` reject the listed items instead of
    * queueing them — the partial-failure case. */
   rejectBatchItems(name: "downloadSessions" | "uploadEntries", items: Record<string, string>): void;
@@ -152,6 +165,8 @@ export function createMemoryBackend(options: MemoryBackendOptions = {}): MemoryB
   let transfers: Transfer[] = options.snapshot?.transfers ?? [];
   let storage: StorageConfig = options.snapshot?.storage ?? EMPTY_STORAGE;
   const sessionsByDevice = new Map<string, SessionView[]>();
+  const sessionCapabilitiesByDevice = new Map<string, SessionCapabilities>();
+  const sessionCatalogVersionByDevice = new Map<string, number>();
   let devicesRevision = options.snapshot?.revisions?.devices ?? 0;
   let libraryRevision = options.snapshot?.revisions?.library ?? 0;
   let transfersRevision = options.snapshot?.revisions?.transfers ?? 0;
@@ -234,14 +249,90 @@ export function createMemoryBackend(options: MemoryBackendOptions = {}): MemoryB
     );
   }
 
-  function readSessionsAt<T>(name: string, deviceId: string, produce: () => T): Promise<Revisioned<T>> {
+  function readSessionsAt<T>(
+    name: string,
+    deviceId: string,
+    args: readonly unknown[],
+    produce: () => T,
+  ): Promise<Revisioned<T>> {
     const at = sessionsRevisionByDevice.get(deviceId) ?? 0;
     return respond(
       name,
-      [deviceId],
+      args,
       () => revisioned(sessionsRevisionByDevice.get(deviceId) ?? 0, produce()),
       (value) => revisioned(at, value as T),
     );
+  }
+
+  function sessionCapabilities(deviceId: string): SessionCapabilities {
+    return sessionCapabilitiesByDevice.get(deviceId) ?? MEMORY_LEGACY_SESSION_CAPABILITIES;
+  }
+
+  function sessionCatalogRevision(deviceId: string): string {
+    return `memory-catalog:${deviceId}:${sessionCatalogVersionByDevice.get(deviceId) ?? 0}`;
+  }
+
+  function advanceSessionCatalog(deviceId: string): string {
+    sessionCatalogVersionByDevice.set(deviceId, (sessionCatalogVersionByDevice.get(deviceId) ?? 0) + 1);
+    return sessionCatalogRevision(deviceId);
+  }
+
+  function cursorFor(catalogRevision: string, offset: number): string {
+    return `opaque(${catalogRevision})::${offset}`;
+  }
+
+  function cursorOffset(cursor: string, catalogRevision: string): number {
+    const prefix = `opaque(${catalogRevision})::`;
+    const offset = cursor.startsWith(prefix) ? Number(cursor.slice(prefix.length)) : Number.NaN;
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new BackendError("listSessions", "stale opaque cursor");
+    return offset;
+  }
+
+  function sessionPage(
+    deviceId: string,
+    cursor: string | null,
+    expectedCatalogRevision: string | null,
+  ): SessionPageView {
+    const catalogRevision = sessionCatalogRevision(deviceId);
+    if (expectedCatalogRevision !== null && expectedCatalogRevision !== catalogRevision) {
+      throw new BackendError("listSessions", "session catalog changed");
+    }
+    if ((cursor === null) !== (expectedCatalogRevision === null)) {
+      throw new BackendError("listSessions", "cursor and catalog revision must be supplied together");
+    }
+    const sessions = sessionsByDevice.get(deviceId) ?? [];
+    const offset = cursor === null ? 0 : cursorOffset(cursor, catalogRevision);
+    const end = Math.min(offset + MEMORY_SESSION_PAGE_SIZE, sessions.length);
+    const nextCursor = end < sessions.length ? cursorFor(catalogRevision, end) : null;
+    return {
+      items: sessions.slice(offset, end),
+      nextCursor,
+      hasMore: nextCursor !== null,
+      catalogRevision,
+      catalogAuthority: "deviceSnapshot",
+      paginationSupported: true,
+      paginationUnavailableReason: null,
+      capabilities: sessionCapabilities(deviceId),
+      diagnostics: [],
+    };
+  }
+
+  function sessionEvent(deviceId: string, sessions: SessionView[], eventRevision: number): BackendEvent {
+    const catalogRevision = advanceSessionCatalog(deviceId);
+    return {
+      kind: "sessions",
+      revision: eventRevision,
+      deviceId,
+      sessions,
+      catalogRevision,
+      nextCursor: null,
+      hasMore: false,
+      catalogAuthority: "deviceSnapshot",
+      paginationSupported: true,
+      paginationUnavailableReason: null,
+      capabilities: sessionCapabilities(deviceId),
+      diagnostics: [],
+    };
   }
 
   function mutate<T>(
@@ -331,13 +422,25 @@ export function createMemoryBackend(options: MemoryBackendOptions = {}): MemoryB
                 : "sessions",
         event.kind === "sessions" ? event.deviceId : undefined,
       );
-      const stamped = { ...event, revision: eventRevision } as BackendEvent;
+      let stamped = { ...event, revision: eventRevision } as BackendEvent;
       switch (stamped.kind) {
         case "devices":
           devices = stamped.devices;
           break;
         case "sessions":
           sessionsByDevice.set(stamped.deviceId, stamped.sessions);
+          if (
+            stamped.catalogRevision === undefined ||
+            stamped.nextCursor === undefined ||
+            stamped.hasMore === undefined ||
+            stamped.catalogAuthority === undefined ||
+            stamped.paginationSupported === undefined ||
+            stamped.paginationUnavailableReason === undefined ||
+            stamped.capabilities === undefined ||
+            stamped.diagnostics === undefined
+          ) {
+            stamped = sessionEvent(stamped.deviceId, stamped.sessions, eventRevision);
+          }
           break;
         case "library":
           library = stamped.library;
@@ -373,8 +476,21 @@ export function createMemoryBackend(options: MemoryBackendOptions = {}): MemoryB
     },
 
     listDevices: () => readAt("listDevices", [], "devices", () => devices),
-    listSessions: (deviceId: DeviceId) =>
-      readSessionsAt("listSessions", deviceId, () => sessionsByDevice.get(deviceId) ?? []),
+    listSessions: (deviceId: DeviceId, cursor = null, catalogRevision = null) =>
+      readSessionsAt("listSessions", deviceId, [deviceId, cursor, catalogRevision], () =>
+        sessionPage(deviceId, cursor, catalogRevision),
+      ),
+    getSessionDetail: (deviceId, sessionId, sessionRevision, catalogRevision) =>
+      readSessionsAt("getSessionDetail", deviceId, [deviceId, sessionId, sessionRevision, catalogRevision], () => {
+        if (catalogRevision !== sessionCatalogRevision(deviceId)) {
+          throw new BackendError("getSessionDetail", "session catalog changed");
+        }
+        const detail = (sessionsByDevice.get(deviceId) ?? []).find((session) => session.id === sessionId);
+        if (detail === undefined || detail.revision !== sessionRevision) {
+          throw new BackendError("getSessionDetail", "session revision changed");
+        }
+        return detail;
+      }),
     listLibrary: () => readAt("listLibrary", [], "library", () => library),
     listTransfers: () => readAt("listTransfers", [], "transfers", () => transfers),
     getStorageConfig: () => readAt("getStorageConfig", [], "storage", () => storage),
@@ -419,12 +535,7 @@ export function createMemoryBackend(options: MemoryBackendOptions = {}): MemoryB
             operationError: null,
           };
         },
-        (eventRevision, value) => ({
-          kind: "sessions",
-          revision: eventRevision,
-          deviceId,
-          sessions: value.sessions ?? [],
-        }),
+        (eventRevision, value) => sessionEvent(deviceId, value.sessions ?? [], eventRevision),
       ),
     cleanupBackedUp: (deviceId) =>
       mutate(
@@ -437,12 +548,7 @@ export function createMemoryBackend(options: MemoryBackendOptions = {}): MemoryB
           sessions: sessionsByDevice.get(deviceId) ?? [],
           operationError: null,
         }),
-        (eventRevision, value) => ({
-          kind: "sessions",
-          revision: eventRevision,
-          deviceId,
-          sessions: value.sessions ?? [],
-        }),
+        (eventRevision, value) => sessionEvent(deviceId, value.sessions ?? [], eventRevision),
       ),
     previewDownloadedCleanup: (deviceId) =>
       respond("previewDownloadedCleanup", [deviceId], (): DownloadedCleanupPreview => ({
@@ -463,7 +569,7 @@ export function createMemoryBackend(options: MemoryBackendOptions = {}): MemoryB
           skipped: [],
           sessions: sessionsByDevice.get(deviceId) ?? [],
         }),
-        (eventRevision, value) => ({ kind: "sessions", revision: eventRevision, deviceId, sessions: value.sessions }),
+        (eventRevision, value) => sessionEvent(deviceId, value.sessions, eventRevision),
       ),
 
     removeLibraryEntries: (keys) =>
@@ -487,8 +593,6 @@ export function createMemoryBackend(options: MemoryBackendOptions = {}): MemoryB
       respond("downloadSessions", [deviceId, sessionIds], () =>
         dispatch<SessionId, DownloadJobId>("downloadSessions", sessionIds, asDownloadJobId, (id) => `job-${id}`),
       ),
-    downloadFile: (deviceId, sessionId, fileId) =>
-      respond("downloadFile", [deviceId, sessionId, fileId], () => asDownloadJobId(`job-${fileId}`)),
     uploadEntry: (key) => respond("uploadEntry", [key], () => asUploadJobId(`upload-${key}`)),
     uploadEntries: (keys) =>
       respond("uploadEntries", [keys], () =>
@@ -569,6 +673,13 @@ export function createMemoryBackend(options: MemoryBackendOptions = {}): MemoryB
     },
     setSessions(deviceId: string, next: SessionView[]): void {
       sessionsByDevice.set(deviceId, next);
+      advanceSessionCatalog(deviceId);
+      if (!sessionCapabilitiesByDevice.has(deviceId)) {
+        sessionCapabilitiesByDevice.set(deviceId, MEMORY_LEGACY_SESSION_CAPABILITIES);
+      }
+    },
+    setSessionCapabilities(deviceId: string, capabilities: SessionCapabilities): void {
+      sessionCapabilitiesByDevice.set(deviceId, capabilities);
     },
     setLibrary(next: LibraryEntry[]): void {
       library = next;

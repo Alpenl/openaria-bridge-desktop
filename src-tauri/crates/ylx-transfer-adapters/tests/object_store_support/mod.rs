@@ -41,8 +41,9 @@ use ylx_transfer_core::library::object_store_contract::{
     ContractFault, ContractFaultInjector, ContractOp, ObjectStoreContractHarness,
 };
 use ylx_transfer_core::library::object_store_port::{
-    CompletedUpload, ExpectedObject, InitiateUploadRequest, MultipartUploadHandle, ObjectKey,
-    ObjectStoreError, ObjectStorePort, PartETag, PartNumber, VerifiedObjectReceipt,
+    CompletedUpload, ExpectedObject, ImmutableObjectRequest, InitiateUploadRequest,
+    MultipartUploadHandle, ObjectKey, ObjectListPage, ObjectReadback, ObjectStoreError,
+    ObjectStorePort, PartETag, PartNumber, VerifiedObjectReceipt,
 };
 
 pub const BUCKET: &str = "ylx-contract-bucket";
@@ -806,6 +807,29 @@ impl TrackingStore {
 }
 
 impl ObjectStorePort for TrackingStore {
+    fn put_object_if_absent(
+        &self,
+        request: &ImmutableObjectRequest,
+    ) -> Result<bool, ObjectStoreError> {
+        self.inner.put_object_if_absent(request)
+    }
+
+    fn read_object_bounded(
+        &self,
+        key: &ObjectKey,
+        maximum_bytes: u64,
+    ) -> Result<ObjectReadback, ObjectStoreError> {
+        self.inner.read_object_bounded(key, maximum_bytes)
+    }
+
+    fn list_objects_bounded(
+        &self,
+        prefix: &str,
+        maximum_keys: u16,
+    ) -> Result<ObjectListPage, ObjectStoreError> {
+        self.inner.list_objects_bounded(prefix, maximum_keys)
+    }
+
     fn initiate_multipart_upload(
         &self,
         request: InitiateUploadRequest,

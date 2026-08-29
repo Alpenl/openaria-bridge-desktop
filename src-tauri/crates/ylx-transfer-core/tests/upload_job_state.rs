@@ -1208,7 +1208,6 @@ fn unacknowledged_successful_upload_stays_visible_until_acknowledged() {
             "t2",
         )
         .unwrap();
-
     assert_eq!(
         store
             .list_upload_activities()

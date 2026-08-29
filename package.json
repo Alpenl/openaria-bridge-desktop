@@ -1,7 +1,7 @@
 {
   "name": "ylx-transfer",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.6",
   "type": "module",
   "engines": {
     "node": ">=22"
@@ -13,7 +13,9 @@
     "tauri": "tauri",
     "typecheck": "tsc --noEmit",
     "test": "node ./src/test-support/run-tests.mjs",
-    "contracts:check": "node ./scripts/generate-device-session-contract-identity.mjs --check",
+    "release:check": "node --test scripts/desktop-release-contract.test.mjs scripts/dispatch-desktop-release.test.mjs scripts/windows-updater-acceptance.test.mjs && node scripts/desktop-release-contract.mjs validate-versions",
+    "contracts:test": "node --test scripts/device-api-contract.test.mjs",
+    "contracts:check": "node ./scripts/validate-device-api-contract.mjs && node ./scripts/generate-device-session-contract-identity.mjs --check",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
@@ -27,6 +29,7 @@
     "@tauri-apps/cli": "^2",
     "eslint": "^9.39.5",
     "eslint-config-prettier": "^9.1.2",
+    "js-yaml": "5.3.0",
     "prettier": "^3.9.6",
     "typescript": "~5.6.2",
     "typescript-eslint": "^8.65.0",

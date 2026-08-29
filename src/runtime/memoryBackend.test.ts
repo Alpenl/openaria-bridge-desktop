@@ -18,6 +18,14 @@ function session(id: string): SessionView {
     files: [],
     downloadStatus: "none",
     backedUp: false,
+    verification: {
+      verdict: "usable",
+      actor: "gateway",
+      validator: { name: "catalog-validator", version: "1", buildSha256: "b".repeat(64) },
+      manifestSha256: "a".repeat(64),
+      verifiedAt: "2026-08-04T00:00:01Z",
+      diagnostics: [],
+    },
   };
 }
 
@@ -69,6 +77,35 @@ test("session revisions are independent per device", async () => {
   const untouchedB = await backend.listSessions(asDeviceId("device-b"));
   assert.ok(afterA.revision > first.revision);
   assert.equal(untouchedB.revision, second.revision);
+});
+
+test("memory session catalog exposes all 200 rows through opaque bounded pages", async () => {
+  const backend = createMemoryBackend();
+  const deviceId = asDeviceId("device-a");
+  backend.setSessions(
+    deviceId,
+    Array.from({ length: 200 }, (_unused, index) => session(`session-${index}`)),
+  );
+
+  const seen: string[] = [];
+  let cursor: string | null = null;
+  let catalogRevision: string | null = null;
+  do {
+    const result = await backend.listSessions(deviceId, cursor, catalogRevision);
+    seen.push(...result.value.items.map((item) => item.id));
+    cursor = result.value.nextCursor;
+    catalogRevision = result.value.catalogRevision;
+  } while (cursor !== null);
+
+  assert.equal(seen.length, 200);
+  assert.equal(new Set(seen).size, 200);
+  assert.equal(backend.calls.filter((call) => call.name === "listSessions").length, 4);
+  assert.ok(
+    backend.calls
+      .filter((call) => call.name === "listSessions")
+      .slice(1)
+      .every((call) => String(call.args[1]).startsWith("opaque(")),
+  );
 });
 
 test("held reads stamp the value and resource revision from the same state", async () => {

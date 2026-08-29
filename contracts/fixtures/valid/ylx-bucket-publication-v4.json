@@ -1,0 +1,48 @@
+{
+  "schema": "ylx.bucket-publication.v4",
+  "publication_id": "019a0020-0000-7a1b-8c2d-3e4f50617283",
+  "publication_kind": "client-derived",
+  "sealed": true,
+  "published_at": "2026-08-28T10:11:00Z",
+  "source_device": {
+    "device_id": "550e8400-e29b-41d4-a716-446655440000",
+    "device_label": "YLX-30D5872D"
+  },
+  "publication_object_key": "synthetic/qualification/ylx-transfer/550e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0020-0000-7a1b-8c2d-3e4f50617283/__ylx_evidence__/publication.json",
+  "assets": [
+    {
+      "role": "source.manifest",
+      "schema": "ylx.device-session.v2",
+      "manifest_id": "01989f6d-2c01-7b2c-9d3e-4f5061728394",
+      "session_id": "01989f6d-2c00-7a1b-8c2d-3e4f50617283",
+      "volume_id": "6ba7b813-9dad-41d1-80b4-00c04fd430c8",
+      "object_key": "synthetic/qualification/ylx-transfer/550e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0020-0000-7a1b-8c2d-3e4f50617283/f-3d9773099e8e77c41052f064a5b4d5e4a7ddb8d726151dca807ca41e37e9a42a",
+      "media_type": "application/json",
+      "bytes": 5443,
+      "sha256": "3d9773099e8e77c41052f064a5b4d5e4a7ddb8d726151dca807ca41e37e9a42a"
+    },
+    {
+      "role": "media.derived-receipt",
+      "schema": "ylx.derived-media-receipt.v1",
+      "receipt_id": "019a0010-0000-7a1b-8c2d-3e4f50617283",
+      "object_key": "synthetic/qualification/ylx-transfer/550e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0020-0000-7a1b-8c2d-3e4f50617283/f-8442c0c8afeaf8fe1cf2231663f97ffb0ff91d2543a0ba388dec9a86ac6a9f6e",
+      "media_type": "application/json",
+      "bytes": 3943,
+      "sha256": "8442c0c8afeaf8fe1cf2231663f97ffb0ff91d2543a0ba388dec9a86ac6a9f6e"
+    },
+    {
+      "role": "media.derived",
+      "artifact_id": "9090909090909090909090909090909090909090909090909090909090909090",
+      "object_key": "synthetic/qualification/ylx-transfer/550e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0020-0000-7a1b-8c2d-3e4f50617283/f-9090909090909090909090909090909090909090909090909090909090909090",
+      "media_type": "video/mp4",
+      "bytes": 65000000,
+      "sha256": "9090909090909090909090909090909090909090909090909090909090909090"
+    }
+  ],
+  "provenance": {
+    "derived_authorship": "openaria-bridge-desktop",
+    "source_manifest_signature": "not-declared-by-device-session-v2",
+    "device_signature_inheritance": "forbidden",
+    "derived_output_signature": "not-device-signed"
+  }
+}

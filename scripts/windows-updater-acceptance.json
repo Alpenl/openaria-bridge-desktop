@@ -1,0 +1,94 @@
+{
+  "schema_version": 4,
+  "repository": "Alpenl/openaria-bridge-desktop",
+  "updater_endpoint": "https://github.com/Alpenl/openaria-bridge-desktop/releases/latest/download/latest.json",
+  "hardened_baseline_version": "0.1.6",
+  "formal_acceptance_target": "0.1.7",
+  "legacy_bootstrap": {
+    "target_version": "0.1.6",
+    "baseline_version": "0.1.5",
+    "release_id": 378428394,
+    "commit": "c27d6b30824efdf2db0606e76e4faae71ba27695",
+    "canonical_closure_sha256": "f8e432c016f570421caee8e3f253df8c94f323e45a0cf7296c98b8a956a00007",
+    "canonical_closure": {
+      "assets": [
+        {
+          "browser_download_url": "https://github.com/Alpenl/openaria-bridge-desktop/releases/download/0.1.5/latest.json",
+          "digest": "sha256:1e49f4c357df2f9832672955b26737c3695710707737c182cd14ef7722678753",
+          "name": "latest.json",
+          "size": 742
+        },
+        {
+          "browser_download_url": "https://github.com/Alpenl/openaria-bridge-desktop/releases/download/0.1.5/OpenAriaBridge_0.1.5_windows_x86_64-setup.exe",
+          "digest": "sha256:ab77680b9d29bbbbd0682d3d2b8a9c807b3cbc34fc63f95ef2af2063469f66ca",
+          "name": "OpenAriaBridge_0.1.5_windows_x86_64-setup.exe",
+          "size": 35078814
+        },
+        {
+          "browser_download_url": "https://github.com/Alpenl/openaria-bridge-desktop/releases/download/0.1.5/OpenAriaBridge_0.1.5_windows_x86_64-setup.exe.sig",
+          "digest": "sha256:89c0109f68b833899cfec183c963fd2df6132cfa7da46650659f33a8558f5f4c",
+          "name": "OpenAriaBridge_0.1.5_windows_x86_64-setup.exe.sig",
+          "size": 428
+        },
+        {
+          "browser_download_url": "https://github.com/Alpenl/openaria-bridge-desktop/releases/download/0.1.5/OpenAriaBridge_0.1.5_windows_x86_64.msi",
+          "digest": "sha256:75e2842acf46af8943fcf417f968a3a4365b0ae5cb98955186105b2cc5643969",
+          "name": "OpenAriaBridge_0.1.5_windows_x86_64.msi",
+          "size": 48672768
+        },
+        {
+          "browser_download_url": "https://github.com/Alpenl/openaria-bridge-desktop/releases/download/0.1.5/OpenAriaBridge_0.1.5_windows_x86_64.msi.sig",
+          "digest": "sha256:9904c3483bc4e78ed972dc436d0923c58087fdb8347891d1ce3b5c2479c52cff",
+          "name": "OpenAriaBridge_0.1.5_windows_x86_64.msi.sig",
+          "size": 428
+        }
+      ],
+      "draft": false,
+      "id": 378428394,
+      "immutable": false,
+      "prerelease": false,
+      "published_at": "2026-08-28T11:03:12Z",
+      "tag_name": "0.1.5"
+    },
+    "latest_json_sha256": "1e49f4c357df2f9832672955b26737c3695710707737c182cd14ef7722678753",
+    "assets": [
+      {
+        "name": "OpenAriaBridge_0.1.5_windows_x86_64-setup.exe",
+        "size": 35078814,
+        "digest": "sha256:ab77680b9d29bbbbd0682d3d2b8a9c807b3cbc34fc63f95ef2af2063469f66ca"
+      },
+      {
+        "name": "OpenAriaBridge_0.1.5_windows_x86_64-setup.exe.sig",
+        "size": 428,
+        "digest": "sha256:89c0109f68b833899cfec183c963fd2df6132cfa7da46650659f33a8558f5f4c"
+      },
+      {
+        "name": "OpenAriaBridge_0.1.5_windows_x86_64.msi",
+        "size": 48672768,
+        "digest": "sha256:75e2842acf46af8943fcf417f968a3a4365b0ae5cb98955186105b2cc5643969"
+      },
+      {
+        "name": "OpenAriaBridge_0.1.5_windows_x86_64.msi.sig",
+        "size": 428,
+        "digest": "sha256:9904c3483bc4e78ed972dc436d0923c58087fdb8347891d1ce3b5c2479c52cff"
+      },
+      {
+        "name": "latest.json",
+        "size": 742,
+        "digest": "sha256:1e49f4c357df2f9832672955b26737c3695710707737c182cd14ef7722678753"
+      }
+    ]
+  },
+  "version_only_files": [
+    "package-lock.json",
+    "package.json",
+    "src-tauri/Cargo.lock",
+    "src-tauri/Cargo.toml",
+    "src-tauri/tauri.conf.json"
+  ],
+  "updater_runtime": {
+    "crate": "tauri-plugin-updater",
+    "version": "2.10.1",
+    "cargo_checksum": "806d9dac662c2e4594ff03c647a552f2c9bd544e7d0f683ec58f872f952ce4af"
+  }
+}

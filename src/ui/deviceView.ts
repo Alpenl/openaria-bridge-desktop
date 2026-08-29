@@ -1,5 +1,6 @@
 import { escapeAttr, escapeHtml, formatBytes, formatBytesParts, formatCount, formatDuration } from "../format";
-import type { SessionView } from "../types";
+import { sessionHasUsableVerification } from "../types";
+import type { SessionCatalogDiagnostic, SessionPaginationUnavailableReason, SessionView } from "../types";
 
 function twoDigits(value: number): string {
   return value.toString().padStart(2, "0");
@@ -27,7 +28,9 @@ export function deviceSummaryHtml(sessions: SessionView[]): string {
   const knownSampleCounts = sessions.flatMap((s) => (s.imuSamples === null ? [] : [s.imuSamples]));
   const totalSamples = knownSampleCounts.reduce((sum, samples) => sum + samples, 0);
   const sampleText = knownSampleCounts.length === 0 ? "--" : formatCount(totalSamples);
-  const pending = sessions.filter((s) => s.downloadStatus === "none" || s.downloadStatus === "failed").length;
+  const pending = sessions.filter(
+    (s) => sessionHasUsableVerification(s) && (s.downloadStatus === "none" || s.downloadStatus === "failed"),
+  ).length;
   const [bytesValue, bytesUnit] = formatBytesParts(totalBytes);
   return (
     `<div class="summary-strip">` +
@@ -48,9 +51,68 @@ export function emptyStateHtml(title: string, body: string): string {
   );
 }
 
+export function sessionPaginationHtml(
+  sessionCount: number,
+  catalog: {
+    catalogRevision: string | null;
+    hasMore: boolean;
+    paginationSupported: boolean;
+    paginationUnavailableReason: SessionPaginationUnavailableReason | null;
+    diagnostics: readonly SessionCatalogDiagnostic[];
+    loadingMore: boolean;
+    loadMoreError: string | null;
+  },
+): string {
+  const shell = (content: string) =>
+    `<div class="section-heading" style="justify-content:center;margin-top:12px;">${content}</div>`;
+  const diagnostics = catalog.diagnostics
+    .map(
+      (diagnostic) =>
+        `<div class="section-heading" style="justify-content:center;margin-top:12px;">` +
+        `<span class="count" style="color:var(--danger-500);">${escapeHtml(diagnostic.message)}</span></div>`,
+    )
+    .join("");
+
+  if (!catalog.paginationSupported) {
+    return (
+      diagnostics +
+      (catalog.paginationUnavailableReason === "catalogRevisionUnavailable"
+        ? shell(`<span class="count">当前设备目录不提供稳定分页，仅显示首批会话</span>`)
+        : "")
+    );
+  }
+  if (catalog.hasMore) {
+    const error =
+      catalog.loadMoreError === null
+        ? ""
+        : `<span class="count" style="color:var(--danger-500);">${escapeHtml(catalog.loadMoreError)}</span>`;
+    const buttonClass = catalog.loadMoreError === null ? "btn-ghost" : "btn-danger-outline";
+    const buttonText = catalog.loadingMore ? "正在加载…" : catalog.loadMoreError === null ? "加载更多" : "重试加载更多";
+    return (
+      diagnostics +
+      shell(
+        `${error}<button class="btn ${buttonClass}" data-action="load-more-sessions" ${catalog.loadingMore ? "disabled" : ""}>${buttonText}</button>`,
+      )
+    );
+  }
+  return (
+    diagnostics +
+    (catalog.catalogRevision === null ? "" : shell(`<span class="count">已加载全部 ${sessionCount} 项</span>`))
+  );
+}
+
 export function sessionRowHtml(
   session: SessionView,
-  opts: { open: boolean; deleting: boolean; checked: boolean },
+  opts: {
+    open: boolean;
+    deleting: boolean;
+    checked: boolean;
+    canDelete?: boolean;
+    canDownloadSession?: boolean;
+    canLoadDetail?: boolean;
+    detailLoading?: boolean;
+    detailError?: string | null;
+  },
 ): string {
   // `session.id`/`session.dateLabel` (and each file's ids/labels) are deserialized
   // straight from a Pi HTTP response body (see pi_http.rs's `SessionSummary`/
@@ -61,6 +123,7 @@ export function sessionRowHtml(
   const idText = escapeHtml(session.id);
   const titleText = escapeHtml(recordingTitleText(session.dateLabel));
   const idTitleAttr = escapeAttr(`会话 ID: ${session.id}`);
+  const verificationEligible = sessionHasUsableVerification(session);
 
   const chipMap: Record<SessionView["downloadStatus"], string> = {
     done: `<span class="chip chip-local">已下载</span>`,
@@ -70,32 +133,54 @@ export function sessionRowHtml(
   };
   let chip = chipMap[session.downloadStatus];
   if (session.backedUp) chip += `<span class="chip chip-ok">☁ 已备份</span>`;
+  chip += verificationEligible
+    ? `<span class="chip chip-ok">已验证</span>`
+    : session.verification === null
+      ? `<span class="chip chip-idle">未验证</span>`
+      : session.verification.verdict === "unusable"
+        ? `<span class="chip chip-fail">验证未通过</span>`
+        : `<span class="chip chip-fail">验证异常</span>`;
 
-  const downloadBtn =
-    session.downloadStatus === "downloading"
-      ? `<button class="btn btn-sm" disabled>下载中</button>`
-      : session.downloadStatus === "failed"
-        ? `<button class="btn btn-primary btn-sm" data-action="download" data-session="${idAttr}">重试下载</button>`
-        : session.downloadStatus === "done"
-          ? `<button class="btn btn-ghost btn-sm" data-action="download" data-session="${idAttr}">重新下载</button>`
-          : `<button class="btn btn-primary btn-sm" data-action="download" data-session="${idAttr}">下载</button>`;
+  const downloadBtn = !verificationEligible
+    ? `<button class="btn btn-sm" disabled>验证不可用</button>`
+    : opts.canDownloadSession === false
+      ? `<button class="btn btn-sm" disabled>下载不可用</button>`
+      : session.downloadStatus === "downloading"
+        ? `<button class="btn btn-sm" disabled>下载中</button>`
+        : session.downloadStatus === "failed"
+          ? `<button class="btn btn-primary btn-sm" data-action="download" data-session="${idAttr}">重试下载</button>`
+          : session.downloadStatus === "done"
+            ? `<button class="btn btn-ghost btn-sm" data-action="download" data-session="${idAttr}">重新下载</button>`
+            : `<button class="btn btn-primary btn-sm" data-action="download" data-session="${idAttr}">下载</button>`;
 
-  const deleteBtn = opts.deleting
-    ? `<button class="btn btn-danger-confirm btn-sm" data-action="delete" data-session="${idAttr}">确认删除</button>`
-    : `<button class="btn btn-danger-outline btn-sm" data-action="delete" data-session="${idAttr}">删除</button>`;
+  const deleteBtn =
+    opts.canDelete === false
+      ? ""
+      : opts.deleting
+        ? `<button class="btn btn-danger-confirm btn-sm" data-action="delete" data-session="${idAttr}">确认删除</button>`
+        : `<button class="btn btn-danger-outline btn-sm" data-action="delete" data-session="${idAttr}">删除</button>`;
 
   const filesHtml = opts.open
-    ? session.files
-        .map((f) => {
-          const pathText = escapeHtml(f.displayPath);
-          const fileIdAttr = escapeAttr(f.fileId);
-          return (
-            `<li class="file-row"><span class="file-path">${pathText}</span>` +
-            `<span class="file-size mono">${formatBytes(f.bytes)}</span>` +
-            `<button class="btn btn-ghost btn-sm" data-action="download-file" data-session="${idAttr}" data-file-id="${fileIdAttr}">下载</button></li>`
-          );
-        })
-        .join("")
+    ? !verificationEligible
+      ? `<li class="file-row"><span class="file-path">会话未通过网关验证，详情不可用</span><span class="file-size mono">--</span></li>`
+      : session.files.length === 0
+        ? opts.detailLoading
+          ? `<li class="file-row"><span class="file-path">正在读取文件清单…</span><span class="file-size mono">--</span></li>`
+          : opts.detailError
+            ? `<li class="file-row"><span class="file-path">${escapeHtml(opts.detailError)}</span><span class="file-size mono">--</span>` +
+              `<button class="btn btn-ghost btn-sm" data-action="retry-session-detail" data-session="${idAttr}">重试</button></li>`
+            : opts.canLoadDetail === false
+              ? `<li class="file-row"><span class="file-path">设备未提供会话文件清单</span><span class="file-size mono">--</span></li>`
+              : `<li class="file-row"><span class="file-path">文件清单将在下载时按需读取</span><span class="file-size mono">--</span></li>`
+        : session.files
+            .map((f) => {
+              const pathText = escapeHtml(f.displayPath);
+              return (
+                `<li class="file-row"><span class="file-path">${pathText}</span>` +
+                `<span class="file-size mono">${formatBytes(f.bytes)}</span></li>`
+              );
+            })
+            .join("")
     : "";
 
   return (

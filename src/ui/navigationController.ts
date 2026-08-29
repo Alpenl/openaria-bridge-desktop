@@ -25,42 +25,63 @@ export interface DeviceNavigationController {
 export function createDeviceNavigationController<TLoaded = SessionView[]>(
   dependencies: DeviceNavigationDependencies<TLoaded>,
 ): DeviceNavigationController {
-  let generation = 0;
-  const inFlightByDevice = new Map<string, Promise<TLoaded>>();
+  let requestGeneration = 0;
+  let invalidationGeneration = 0;
+  const inFlightByDevice = new Map<string, { generation: number; request: Promise<TLoaded> }>();
 
-  function loadSessionsOnce(deviceId: string): Promise<TLoaded> {
+  function loadSessionsOnce(deviceId: string, generation: number): Promise<TLoaded> {
     const existing = inFlightByDevice.get(deviceId);
-    if (existing) return existing;
+    if (existing?.generation === generation) return existing.request;
 
     const request = Promise.resolve().then(() => dependencies.loadSessions(deviceId));
-    inFlightByDevice.set(deviceId, request);
+    const entry = { generation, request };
+    inFlightByDevice.set(deviceId, entry);
     const clear = () => {
-      if (inFlightByDevice.get(deviceId) === request) inFlightByDevice.delete(deviceId);
+      if (inFlightByDevice.get(deviceId) === entry) inFlightByDevice.delete(deviceId);
     };
     void request.then(clear, clear);
     return request;
   }
 
   async function load(deviceId: string, activate: boolean): Promise<DeviceSessionLoadOutcome> {
-    const requestGeneration = ++generation;
+    const currentRequestGeneration = ++requestGeneration;
+    const currentInvalidationGeneration = invalidationGeneration;
     dependencies.onBegin(deviceId, activate);
 
     // Let the cached/skeleton device pane reach the screen before invoking
     // native code. This remains necessary even when the Rust command is async:
     // it protects the first frame if platform IPC scheduling regresses.
     await afterNextPaint();
-    if (requestGeneration !== generation || !dependencies.isCurrent(deviceId)) return "stale";
+    if (
+      currentRequestGeneration !== requestGeneration ||
+      currentInvalidationGeneration !== invalidationGeneration ||
+      !dependencies.isCurrent(deviceId)
+    ) {
+      return "stale";
+    }
 
     let loaded: TLoaded;
     try {
-      loaded = await loadSessionsOnce(deviceId);
+      loaded = await loadSessionsOnce(deviceId, currentInvalidationGeneration);
     } catch (error) {
-      if (requestGeneration !== generation || !dependencies.isCurrent(deviceId)) return "stale";
+      if (
+        currentRequestGeneration !== requestGeneration ||
+        currentInvalidationGeneration !== invalidationGeneration ||
+        !dependencies.isCurrent(deviceId)
+      ) {
+        return "stale";
+      }
       dependencies.onFailed(deviceId, error);
       return "failed";
     }
 
-    if (requestGeneration !== generation || !dependencies.isCurrent(deviceId)) return "stale";
+    if (
+      currentRequestGeneration !== requestGeneration ||
+      currentInvalidationGeneration !== invalidationGeneration ||
+      !dependencies.isCurrent(deviceId)
+    ) {
+      return "stale";
+    }
     dependencies.onLoaded(deviceId, loaded);
     return "applied";
   }
@@ -69,7 +90,8 @@ export function createDeviceNavigationController<TLoaded = SessionView[]>(
     focus: (deviceId) => load(deviceId, true),
     refresh: (deviceId) => load(deviceId, false),
     invalidate: () => {
-      generation += 1;
+      requestGeneration += 1;
+      invalidationGeneration += 1;
       dependencies.onInvalidated();
     },
   };

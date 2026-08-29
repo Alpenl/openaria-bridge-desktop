@@ -24,6 +24,15 @@ fn table_exists(conn: &Connection, table: &str) -> bool {
         > 0
 }
 
+fn index_sql(conn: &Connection, index: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+        [index],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
 /// Hand-builds a database left exactly at `stop_at` — i.e. what an older
 /// build of this app would have written — by applying the migration list
 /// itself, the same way the runner does.
@@ -69,6 +78,30 @@ fn a_fresh_database_migrates_to_the_latest_version_and_creates_every_transfer_ta
     for table in TransferStore::transfer_tables() {
         assert!(table_exists(&conn, table), "missing table {table}");
     }
+}
+
+#[test]
+fn v21_adds_the_download_session_lookup_as_a_partial_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("transfer.sqlite3");
+    build_database_at_version(&path, 20);
+
+    let store = TransferStore::open(&path).expect("migrate v20 to latest");
+    assert_eq!(store.schema_version().expect("version"), 21);
+    drop(store);
+
+    let conn = Connection::open(&path).expect("raw open");
+    let sql = index_sql(&conn, "transfer_jobs_download_device_session_idx")
+        .expect("v21 download-session index");
+    let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        normalized.contains("ON transfer_jobs (device_id, session_id, created_at, job_id)"),
+        "unexpected index columns: {normalized}"
+    );
+    assert!(
+        normalized.contains("WHERE operation_kind = 'download'"),
+        "index must exclude the upload lane: {normalized}"
+    );
 }
 
 #[test]

@@ -1,9 +1,10 @@
 //! Production adapters for Device API networking, storage, credentials,
 //! removable media, and publication authenticity:
 //!
-//! - `pi_http` (PC-03): real HTTPS client for the Pi transfer-daemon
-//!   (`ureq` + a fingerprint-pinned `rustls` `ClientConfig`). See that
-//!   module's doc comment for the TLS trust model and error mapping.
+//! - `pi_http` (PC-03): real Device API client. Current RDK X5 lab/internal
+//!   devices use HTTP `/api/v4` on port 8080; retained legacy v1 devices use
+//!   HTTPS `/api/v1` with a fingerprint-pinned `rustls` `ClientConfig`. See
+//!   that module's doc comment for the transport profiles and error mapping.
 //! - `discovery_mdns` (PC-03): real `mdns-sd`-backed browser for
 //!   `_ylx-capture._tcp.local.` candidates — discovery-only, never a trust
 //!   anchor (ADR-DISC-001); see that module's doc comment for scope.

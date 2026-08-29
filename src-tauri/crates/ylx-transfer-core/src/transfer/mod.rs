@@ -153,10 +153,14 @@ impl std::fmt::Display for JobId {
 /// [`aggregate::JobSnapshot`]. `coordinator` performs what this module
 /// decides; this module performs nothing itself.
 pub mod aggregate;
+/// The final commit port. A transfer only succeeds after the injected
+/// implementation has published its complete canonical local representation.
+pub mod commit;
 /// PC-05: the durable `TransferCoordinator` (bounded-concurrency worker
-/// pool, capture-priority pause, offline/pairing wait, crash recovery) —
-/// see that module's doc comment for the full design. Owns/extends this
-/// module additively; nothing above this point was restructured for it.
+/// pool, capture-priority pause, offline/pairing wait, and fail-closed
+/// previous-process settlement) -- see that module's doc comment for the
+/// full design. Owns/extends this module additively; nothing above this point
+/// was restructured for it.
 pub mod coordinator;
 /// Typed coordinator faults and failure classification (issue #1 commit 48).
 pub mod fault;
@@ -171,9 +175,10 @@ pub mod progress;
 /// interrupt-aware/checkpoint-throttling `DownloadSource` wrapper used to
 /// implement capture-priority pause and cancel-waits-for-handle-close.
 pub mod queue;
-/// PC-05: `TransferCoordinator::recover_on_startup()` — enumerates complete
-/// durable specs and file ledgers from `TransferStore`, then rehydrates
-/// in-memory `ManagedJob`s and schedules the recoverable entries.
+/// Startup transfer policy. Production calls
+/// `TransferCoordinator::fail_interrupted_jobs_on_startup()` so durable
+/// non-terminal rows become explicit failures without being scheduled. The
+/// older `recover_on_startup()` path is retained for compatibility only.
 pub mod recovery;
 /// Bounded ready-set queue used by the coordinator (issue #1 commit 47).
 pub mod scheduler;

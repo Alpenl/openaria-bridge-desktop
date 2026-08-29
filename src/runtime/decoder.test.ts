@@ -18,7 +18,9 @@ import {
   decodeLibrary,
   decodeLibraryMutationResult,
   decodeRevision,
+  decodeSessionPageValue,
   decodeSessions,
+  decodeSessionsUpdate,
   decodeSessionMutationResult,
   decodeRpcErrorValue,
   decodeStorage,
@@ -80,8 +82,201 @@ function session() {
     files: [{ fileId: "file-1", displayPath: "video/left.mp4", bytes: 80, sha256: "a".repeat(64) }],
     downloadStatus: "none",
     backedUp: false,
+    verification: {
+      verdict: "usable",
+      actor: "gateway",
+      validator: { name: "catalog-validator", version: "1", buildSha256: "b".repeat(64) },
+      manifestSha256: "a".repeat(64),
+      verifiedAt: "2026-08-03T00:00:01Z",
+      diagnostics: [],
+    },
   };
 }
+
+function sessionCapabilities() {
+  return {
+    profile: "labHttpV4",
+    sessionDeletion: { supported: false, source: "profileContract" },
+    sessionDetail: { supported: true, source: "profileContract" },
+    artifactDownload: { supported: false, source: "unavailable" },
+    captureStatus: { supported: true, source: "profileContract" },
+  };
+}
+
+test("session pages preserve opaque pagination and explicit capability provenance", () => {
+  const page = decodeSessionPageValue({
+    items: [session()],
+    nextCursor: "opaque:/do-not-parse?token=1",
+    hasMore: true,
+    catalogRevision: "catalog-revision-1",
+    catalogAuthority: "deviceSnapshot",
+    paginationSupported: true,
+    paginationUnavailableReason: null,
+    capabilities: sessionCapabilities(),
+    diagnostics: [
+      {
+        quarantineId: "q-1",
+        code: "adapter.catalog.quarantined",
+        observedAt: "2026-08-03T00:00:02Z",
+        message: "一个目录项已隔离",
+      },
+    ],
+  });
+
+  assert.equal(page.nextCursor, "opaque:/do-not-parse?token=1");
+  assert.equal(page.catalogAuthority, "deviceSnapshot");
+  assert.equal(page.paginationSupported, true);
+  assert.equal(page.capabilities.profile, "labHttpV4");
+  assert.deepEqual(page.capabilities.sessionDeletion, {
+    supported: false,
+    source: "profileContract",
+  });
+  assert.deepEqual(page.capabilities.artifactDownload, { supported: false, source: "unavailable" });
+  assert.equal(page.items[0]?.verification?.verdict, "usable");
+  assert.equal(page.diagnostics[0]?.message, "一个目录项已隔离");
+});
+
+test("session verification is required but malformed manifest evidence remains a visible fail-closed row", () => {
+  const missingVerification = { ...session() } as Record<string, unknown>;
+  delete missingVerification.verification;
+
+  assert.ok(thrown(() => decodeSessions([missingVerification])) instanceof RuntimeDecodeError);
+  assert.ok(
+    thrown(() =>
+      decodeSessions([{ ...session(), verification: { ...session().verification, verdict: "future-verdict" } }]),
+    ) instanceof RuntimeDecodeError,
+  );
+  assert.equal(decodeSessions([{ ...session(), verification: null }])[0]?.verification, null);
+  assert.equal(
+    decodeSessions([
+      {
+        ...session(),
+        verification: { ...session().verification, verdict: "usable", manifestSha256: "NOT-A-DIGEST" },
+      },
+    ])[0]?.verification?.manifestSha256,
+    "NOT-A-DIGEST",
+  );
+  assert.deepEqual(
+    decodeSessions([
+      {
+        ...session(),
+        verification: {
+          ...session().verification,
+          verdict: "unusable",
+          diagnostics: ["artifact digest mismatch"],
+        },
+      },
+    ])[0]?.verification?.diagnostics,
+    ["artifact digest mismatch"],
+  );
+  assert.ok(
+    thrown(() =>
+      decodeSessions([{ ...session(), verification: { ...session().verification, diagnostics: [42] } }]),
+    ) instanceof RuntimeDecodeError,
+  );
+});
+
+test("session page and event metadata fail closed when capabilities or pagination invariants drift", () => {
+  const valid = {
+    items: [session()],
+    nextCursor: null,
+    hasMore: false,
+    catalogRevision: "catalog-revision-1",
+    catalogAuthority: "deviceSnapshot",
+    paginationSupported: true,
+    paginationUnavailableReason: null,
+    capabilities: sessionCapabilities(),
+    diagnostics: [],
+  };
+  const missingCapability = {
+    ...valid,
+    capabilities: { ...sessionCapabilities(), sessionDeletion: undefined },
+  };
+  const unknownProfile = {
+    ...valid,
+    capabilities: { ...sessionCapabilities(), profile: "future-v9" },
+  };
+  const unknownProfileClaimingSupport = {
+    ...valid,
+    capabilities: { ...sessionCapabilities(), profile: "unknown" },
+  };
+  const labProfileClaimingDeletion = {
+    ...valid,
+    capabilities: {
+      ...sessionCapabilities(),
+      sessionDeletion: { supported: true, source: "deviceDescriptor" },
+    },
+  };
+  const inconsistentCursor = { ...valid, nextCursor: "opaque", hasMore: false };
+  const inconsistentAuthority = { ...valid, catalogAuthority: "unavailable" };
+  const unsupportedWithCursor = {
+    ...valid,
+    nextCursor: "opaque",
+    hasMore: true,
+    catalogAuthority: "unavailable",
+    paginationSupported: false,
+    paginationUnavailableReason: "catalogRevisionUnavailable",
+  };
+  const unavailableWithFabricatedRevision = {
+    ...valid,
+    catalogAuthority: "unavailable",
+    paginationSupported: false,
+    paginationUnavailableReason: "catalogRevisionUnavailable",
+  };
+  const authoritativeWithoutRevision = { ...valid, catalogRevision: null };
+  const missingPaginationSupport = { ...valid, paginationSupported: undefined };
+  const missingDiagnostics = { ...valid } as Record<string, unknown>;
+  delete missingDiagnostics.diagnostics;
+
+  assert.ok(thrown(() => decodeSessionPageValue(missingCapability)) instanceof RuntimeDecodeError);
+  assert.ok(thrown(() => decodeSessionPageValue(unknownProfile)) instanceof RuntimeDecodeError);
+  assert.ok(thrown(() => decodeSessionPageValue(unknownProfileClaimingSupport)) instanceof RuntimeDecodeError);
+  assert.ok(thrown(() => decodeSessionPageValue(labProfileClaimingDeletion)) instanceof RuntimeDecodeError);
+  assert.ok(thrown(() => decodeSessionPageValue(inconsistentCursor)) instanceof RuntimeDecodeError);
+  assert.ok(thrown(() => decodeSessionPageValue(inconsistentAuthority)) instanceof RuntimeDecodeError);
+  assert.ok(thrown(() => decodeSessionPageValue(unsupportedWithCursor)) instanceof RuntimeDecodeError);
+  assert.ok(thrown(() => decodeSessionPageValue(unavailableWithFabricatedRevision)) instanceof RuntimeDecodeError);
+  assert.ok(thrown(() => decodeSessionPageValue(authoritativeWithoutRevision)) instanceof RuntimeDecodeError);
+  assert.ok(thrown(() => decodeSessionPageValue(missingPaginationSupport)) instanceof RuntimeDecodeError);
+  assert.ok(thrown(() => decodeSessionPageValue(missingDiagnostics)) instanceof RuntimeDecodeError);
+  const unavailable = decodeSessionPageValue({
+    ...valid,
+    catalogRevision: null,
+    catalogAuthority: "unavailable",
+    paginationSupported: false,
+    paginationUnavailableReason: "catalogRevisionUnavailable",
+  });
+  assert.equal(unavailable.catalogRevision, null);
+  assert.equal(unavailable.paginationSupported, false);
+  assert.ok(
+    thrown(() =>
+      decodeSessionsUpdate({
+        deviceId: DEVICE_A_ID,
+        sessions: [],
+        catalogRevision: null,
+        nextCursor: null,
+        hasMore: false,
+        catalogAuthority: "deviceSnapshot",
+        paginationSupported: true,
+        paginationUnavailableReason: null,
+        capabilities: sessionCapabilities(),
+        diagnostics: [],
+      }),
+    ) instanceof RuntimeDecodeError,
+  );
+  const eventWithoutDiagnostics = {
+    deviceId: DEVICE_A_ID,
+    sessions: [],
+    catalogRevision: "catalog-revision-1",
+    nextCursor: null,
+    hasMore: false,
+    catalogAuthority: "deviceSnapshot",
+    paginationSupported: true,
+    paginationUnavailableReason: null,
+    capabilities: sessionCapabilities(),
+  };
+  assert.ok(thrown(() => decodeSessionsUpdate(eventWithoutDiagnostics)) instanceof RuntimeDecodeError);
+});
 
 function libraryEntry() {
   return {
@@ -291,6 +486,13 @@ test("RPC error decoder rejects unknown codes and non-object details", () => {
     details: { command: "test" },
   } as const;
   assert.deepEqual(decodeRpcErrorValue(valid), valid);
+  const catalogChanged = {
+    code: "session_catalog_changed",
+    message: "catalog changed",
+    retryable: true,
+    details: { catalogRevision: `sha256:${"d".repeat(64)}` },
+  } as const;
+  assert.deepEqual(decodeRpcErrorValue(catalogChanged), catalogChanged);
   assert.deepEqual(decodeRpcErrorValue({ code: "library_batch_failed", message: "操作失败", retryable: false }), {
     code: "library_batch_failed",
     message: "操作失败",

@@ -13,6 +13,10 @@ import type {
   PairingTickPayload,
   RpcError,
   SaveStorageConfigInput,
+  SessionCatalogAuthority,
+  SessionCatalogDiagnostic,
+  SessionCapabilities,
+  SessionPaginationUnavailableReason,
   SessionView,
   StorageConfig,
   Transfer,
@@ -32,9 +36,10 @@ import {
   decodePairingTickPayload,
   decodeRevision,
   decodeRpcErrorValue,
+  decodeSessionPageValue,
+  decodeSessionValue,
   decodeSessionMutationResult,
   decodeSaveStorageConfigInput,
-  decodeSessions,
   decodeSessionsUpdate,
   decodeStorage,
   decodeString,
@@ -221,8 +226,17 @@ export const api = {
     invokeRevisionedDecoded("add_manual_device", decodeDeviceValue, { ip }).then((raw) => raw.value),
   disconnectDevice: (deviceId: string) => invokeValueDecoded("disconnect_device", decodeVoid, { deviceId }),
 
-  listSessions: (deviceId: string) =>
-    invokeRevisionedDecoded("list_sessions", decodeSessions, { deviceId }).then((raw) => raw.value),
+  listSessions: (deviceId: string, cursor: string | null = null, catalogRevision: string | null = null) =>
+    invokeRevisionedDecoded("list_sessions", decodeSessionPageValue, { deviceId, cursor, catalogRevision }).then(
+      (raw) => raw.value,
+    ),
+  getSessionDetail: (deviceId: string, sessionId: string, sessionRevision: string, catalogRevision: string | null) =>
+    invokeRevisionedDecoded("get_session_detail", decodeSessionValue, {
+      deviceId,
+      sessionId,
+      sessionRevision,
+      catalogRevision,
+    }).then((raw) => raw.value),
   deleteSessions: (deviceId: string, sessionIds: string[]) =>
     invokeRevisionedDecoded("delete_sessions", decodeSessionMutationResult, { deviceId, sessionIds }).then(
       (raw) => raw.value,
@@ -243,8 +257,6 @@ export const api = {
     invokeValueDecoded("download_session", decodeString, { deviceId, sessionId }),
   downloadSessions: (deviceId: string, sessionIds: string[]) =>
     invokeValueDecoded("download_sessions", decodeBatchJobs, { deviceId, sessionIds }),
-  downloadFile: (deviceId: string, sessionId: string, fileId: string) =>
-    invokeValueDecoded("download_file", decodeString, { deviceId, sessionId, fileId }),
   uploadEntry: (key: string) => invokeValueDecoded("upload_entry", decodeString, { key }),
   uploadEntries: (keys: string[]) => invokeValueDecoded("upload_entries", decodeBatchJobs, { keys }),
   retryTransfer: (jobId: string) => invokeValueDecoded("retry_transfer", decodeString, { jobId }),
@@ -280,7 +292,15 @@ export const api = {
 export const revisionedApi = {
   readSnapshot: () => invokeSnapshotDecoded("read_snapshot"),
   listDevices: () => invokeRevisionedDecoded("list_devices", decodeDevices),
-  listSessions: (deviceId: string) => invokeRevisionedDecoded("list_sessions", decodeSessions, { deviceId }),
+  listSessions: (deviceId: string, cursor: string | null = null, catalogRevision: string | null = null) =>
+    invokeRevisionedDecoded("list_sessions", decodeSessionPageValue, { deviceId, cursor, catalogRevision }),
+  getSessionDetail: (deviceId: string, sessionId: string, sessionRevision: string, catalogRevision: string | null) =>
+    invokeRevisionedDecoded("get_session_detail", decodeSessionValue, {
+      deviceId,
+      sessionId,
+      sessionRevision,
+      catalogRevision,
+    }),
   listLibrary: () => invokeRevisionedDecoded("list_library", decodeLibrary),
   listTransfers: () => invokeRevisionedDecoded("list_transfers", decodeTransfers),
   getStorageConfig: () => invokeRevisionedDecoded("get_storage_config", decodeStorage),
@@ -306,6 +326,14 @@ export type { PairingResolutionPayload, PairingTickPayload };
 export interface SessionsUpdatePayload {
   deviceId: string;
   sessions: SessionView[];
+  catalogRevision: string | null;
+  nextCursor: string | null;
+  hasMore: boolean;
+  catalogAuthority: SessionCatalogAuthority;
+  paginationSupported: boolean;
+  paginationUnavailableReason: SessionPaginationUnavailableReason | null;
+  capabilities: SessionCapabilities;
+  diagnostics: SessionCatalogDiagnostic[];
 }
 
 export function onDevicesUpdate(cb: (devices: Device[], revision: number) => void): Promise<UnlistenFn> {

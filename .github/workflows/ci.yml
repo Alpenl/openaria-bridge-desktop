@@ -3,432 +3,854 @@ name: CI / Release
 on:
   push:
     branches: [main]
-    tags:
-      - "[0-9]+.[0-9]+.[0-9]+"
   pull_request:
   workflow_dispatch:
     inputs:
       release_tag:
         description: >-
-          Semantic-version tag to create/update after a successful release
-          build. Leave empty to run CI against the selected branch without
-          publishing a release.
+          Numeric application version to publish from the selected ref. It
+          must exactly match src-tauri/tauri.conf.json.
         required: false
         default: ""
         type: string
-      platforms:
-        description: >-
-          Desktop platforms to build and run the recovery contract on.
-          "ubuntu" skips the macOS and Windows lanes, which is for iterating on
-          a Linux-only change; it is not cross-platform verification, so a
-          change that ships still needs a full run.
+      source_commit:
+        description: Exact 40-character commit selected for a Release dispatch.
         required: false
-        default: all
-        type: choice
-        options:
-          - all
-          - ubuntu
+        default: ""
+        type: string
+      immutable_preflight_actor:
+        description: Repository owner who performed the fresh administrator immutable-setting GET.
+        required: false
+        default: ""
+        type: string
+      immutable_preflight_checked_at:
+        description: ISO-8601 time immediately before dispatch when the official immutable setting was read.
+        required: false
+        default: ""
+        type: string
+      immutable_preflight_raw_response:
+        description: Exact raw GET /repos/{owner}/{repo}/immutable-releases response.
+        required: false
+        default: ""
+        type: string
+      immutable_preflight_sha256:
+        description: SHA-256 of the exact raw immutable setting response bytes.
+        required: false
+        default: ""
+        type: string
+      allow_legacy_baseline_bootstrap:
+        description: One-time 0.1.5 -> 0.1.6 mutable-baseline bootstrap; rejected for every other target.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
+  actions: read
   contents: read
 
-# One in-flight run per ref. A superseded push has nothing useful left to
-# say, and letting it finish only delays the run that replaced it.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Publication is an irreversible commit point. Every Release dispatch shares
+  # one non-cancellable lock from baseline capture through read-only postverify.
+  group: ${{ inputs.release_tag != '' && 'openaria-desktop-release-publication' || format('{0}-{1}', github.workflow, github.ref) }}
+  cancel-in-progress: ${{ inputs.release_tag == '' }}
 
 jobs:
   prepare:
-    name: resolve build metadata
+    name: resolve and validate build metadata
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
+      app_version: ${{ steps.metadata.outputs.app_version }}
       checkout_ref: ${{ steps.metadata.outputs.checkout_ref }}
       is_release: ${{ steps.metadata.outputs.is_release }}
       release_tag: ${{ steps.metadata.outputs.release_tag }}
-      platforms: ${{ steps.metadata.outputs.platforms }}
     steps:
-      - name: Resolve build metadata
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.source_commit || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+      - name: Resolve build metadata from the application config
         id: metadata
         shell: bash
         env:
           REQUESTED_TAG: ${{ inputs.release_tag }}
-          REQUESTED_PLATFORMS: ${{ inputs.platforms }}
+          REQUESTED_SOURCE_COMMIT: ${{ inputs.source_commit }}
+          IMMUTABLE_PREFLIGHT_ACTOR: ${{ inputs.immutable_preflight_actor }}
+          IMMUTABLE_CHECKED_AT: ${{ inputs.immutable_preflight_checked_at }}
+          IMMUTABLE_RAW_RESPONSE: ${{ inputs.immutable_preflight_raw_response }}
+          IMMUTABLE_RAW_RESPONSE_SHA256: ${{ inputs.immutable_preflight_sha256 }}
+          ALLOW_LEGACY_BASELINE_BOOTSTRAP: ${{ inputs.allow_legacy_baseline_bootstrap }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          checkout_ref="${GITHUB_REF}"
+          checkout_ref="$(git rev-parse HEAD)"
           release_tag=""
-
-          # A dispatch without a tag is a plain manual CI run against the
-          # selected ref. A dispatch with a tag publishes the selected ref and
-          # creates the tag later if it does not already exist.
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${REQUESTED_TAG}" ]]; then
             release_tag="${REQUESTED_TAG}"
-          elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            release_tag="${GITHUB_REF_NAME}"
-          fi
-
-          if [[ -n "${release_tag}" && ! "${release_tag}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Release tag must use the numeric SemVer form X.Y.Z; got '${release_tag}'." >&2
-            exit 1
           fi
 
           is_release=false
+          version_args=(validate-versions)
           if [[ -n "${release_tag}" ]]; then
             is_release=true
+            if [[ "${GITHUB_RUN_ATTEMPT}" != "1" ]]; then
+              echo "Release publication rejects reruns; dispatch again with a fresh immutable-setting preflight." >&2
+              exit 1
+            fi
+            if [[ "${GITHUB_ACTOR}" != "${GITHUB_REPOSITORY_OWNER}" ]] ||
+              [[ "${IMMUTABLE_PREFLIGHT_ACTOR}" != "${GITHUB_ACTOR}" ]]; then
+              echo "Release publication requires a repository-owner administrator preflight and dispatch." >&2
+              exit 1
+            fi
+            default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+            default_branch_head="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${default_branch}" --jq '.sha')"
+            if [[ ! "${REQUESTED_SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]] ||
+              [[ "${REQUESTED_SOURCE_COMMIT}" != "${checkout_ref}" ]] ||
+              [[ "${GITHUB_SHA}" != "${REQUESTED_SOURCE_COMMIT}" ]] ||
+              [[ "${default_branch_head}" != "${REQUESTED_SOURCE_COMMIT}" ]] ||
+              [[ "${GITHUB_REF}" != "refs/heads/${default_branch}" ]]; then
+              echo "Release dispatch must bind source_commit to checkout HEAD and the protected default-branch workflow ref." >&2
+              exit 1
+            fi
+            if [[ ! "${IMMUTABLE_RAW_RESPONSE_SHA256}" =~ ^[0-9a-f]{64}$ ]] ||
+              [[ -z "${IMMUTABLE_CHECKED_AT}" ]] || [[ -z "${IMMUTABLE_RAW_RESPONSE}" ]]; then
+              echo "Release dispatch lacks the bound official immutable setting preflight." >&2
+              exit 1
+            fi
+            actual_immutable_sha="$(printf %s "${IMMUTABLE_RAW_RESPONSE}" | sha256sum | cut -d ' ' -f 1)"
+            if [[ "${actual_immutable_sha}" != "${IMMUTABLE_RAW_RESPONSE_SHA256}" ]] ||
+              ! jq -e '
+                type == "object" and
+                keys == ["enabled", "enforced_by_owner"] and
+                .enabled == true and
+                (.enforced_by_owner | type) == "boolean"
+              ' <<<"${IMMUTABLE_RAW_RESPONSE}" >/dev/null; then
+              echo "Official immutable setting preflight is not an exact enabled=true response." >&2
+              exit 1
+            fi
+            run_created_at=""
+            for attempt in 1 2 3 4 5 6; do
+              run_created_at="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" --jq '.created_at' || true)"
+              if [[ -n "${run_created_at}" ]]; then
+                break
+              fi
+              sleep "$((attempt * 2))"
+            done
+            if [[ -z "${run_created_at}" ]]; then
+              echo "Unable to read this workflow run's authoritative creation time." >&2
+              exit 1
+            fi
+            checked_epoch="$(date --date="${IMMUTABLE_CHECKED_AT}" +%s)"
+            created_epoch="$(date --date="${run_created_at}" +%s)"
+            dispatch_gap_seconds="$((created_epoch - checked_epoch))"
+            if [[ "${dispatch_gap_seconds}" -lt -60 ]] || [[ "${dispatch_gap_seconds}" -gt 300 ]]; then
+              echo "Immutable setting preflight must occur no more than five minutes before dispatch." >&2
+              exit 1
+            fi
+            version_args+=(--tag "${release_tag}")
           fi
+          app_version="$(node scripts/desktop-release-contract.mjs "${version_args[@]}")"
 
-          # Only a manual dispatch may narrow the matrix, and never for a
-          # release: a published artifact is always built on all three.
-          platforms='["ubuntu-latest","macos-latest","windows-latest"]'
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" \
-                && "${REQUESTED_PLATFORMS}" == "ubuntu" \
-                && "${is_release}" == "false" ]]; then
-            platforms='["ubuntu-latest"]'
+          if [[ "${is_release}" == "true" ]]; then
+            if [[ "${ALLOW_LEGACY_BASELINE_BOOTSTRAP}" == "true" ]] && [[ "${app_version}" != "0.1.6" ]]; then
+              echo "The explicit legacy baseline bootstrap is permanently limited to target 0.1.6." >&2
+              exit 1
+            fi
+            if [[ "${ALLOW_LEGACY_BASELINE_BOOTSTRAP}" != "true" ]] && [[ "${app_version}" == "0.1.6" ]]; then
+              echo "Target 0.1.6 requires explicit allow_legacy_baseline_bootstrap=true." >&2
+              exit 1
+            fi
+            mkdir -p release-dispatch-preflight
+            printf %s "${IMMUTABLE_RAW_RESPONSE}" > release-dispatch-preflight/immutable-release-setting.json
+            jq -n \
+              --arg schema "openaria.desktop.release-dispatch-preflight.v1" \
+              --arg repository "${GITHUB_REPOSITORY}" \
+              --arg actor "${GITHUB_ACTOR}" \
+              --arg event "${GITHUB_EVENT_NAME}" \
+              --arg target_version "${app_version}" \
+              --arg source_commit "${checkout_ref}" \
+              --arg default_branch "${default_branch}" \
+              --arg default_branch_head "${default_branch_head}" \
+              --arg run_id "${GITHUB_RUN_ID}" \
+              --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+              --arg run_created_at "${run_created_at}" \
+              --arg checked_at "${IMMUTABLE_CHECKED_AT}" \
+              --arg raw_response_sha256 "${IMMUTABLE_RAW_RESPONSE_SHA256}" \
+              --argjson dispatch_gap_seconds "${dispatch_gap_seconds}" \
+              --argjson allow_legacy_baseline_bootstrap "${ALLOW_LEGACY_BASELINE_BOOTSTRAP}" \
+              '{schema: $schema, repository: $repository, actor: $actor, event: $event,
+                target_version: $target_version, source_commit: $source_commit,
+                default_branch: $default_branch, default_branch_head: $default_branch_head,
+                run_id: $run_id, run_attempt: $run_attempt, run_created_at: $run_created_at,
+                allow_legacy_baseline_bootstrap: $allow_legacy_baseline_bootstrap,
+                immutable_setting: {enabled: true, checked_at: $checked_at,
+                  raw_response_sha256: $raw_response_sha256,
+                  checked_before_dispatch: true,
+                  dispatch_gap_seconds: $dispatch_gap_seconds}}' \
+              > release-dispatch-preflight/release-dispatch-preflight.json
           fi
 
           {
+            echo "app_version=${app_version}"
             echo "checkout_ref=${checkout_ref}"
             echo "is_release=${is_release}"
             echo "release_tag=${release_tag}"
-            echo "platforms=${platforms}"
           } >> "${GITHUB_OUTPUT}"
 
+      - name: Upload exact Release dispatch preflight evidence
+        if: steps.metadata.outputs.is_release == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: openaria-release-dispatch-preflight-${{ steps.metadata.outputs.app_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+          path: release-dispatch-preflight
+
   frontend:
-    name: frontend (lint, typecheck, build)
+    name: frontend (test, format, lint, typecheck, build)
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: npm
       - run: npm ci
       - run: npm test
-      - run: npm run contracts:check
       - run: npm run format:check
       - run: npm run lint
       - run: npm run typecheck
       - run: npm run build
 
-  # Rust checks for the single Cargo workspace. The root manifest owns the
-  # application, core crate, and adapter crate, so one all-targets/all-features
-  # gate covers production and test code together.
-  rust:
-    name: rust (fmt, clippy, test)
+  device-contracts:
+    name: Device API contract identity
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Test fail-closed Device API contract verification
+        run: npm run contracts:test
+      - name: Verify vendored Device API and session contract identities
+        run: npm run contracts:check
+
+  updater-contract:
+    name: updater lifecycle and Release contract
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Run deterministic updater lifecycle tests
+        run: >-
+          node src/test-support/run-tests.mjs
+          src/app/transferApp.test.ts
+          src/runtime/appUpdateError.test.ts
+      - run: npm run release:check
+
+  updater-baseline:
+    name: capture signed pre-publish updater baseline
+    if: needs.prepare.outputs.is_release == 'true'
+    needs:
+      - prepare
+      - updater-contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+          fetch-depth: 0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+      - name: Download the exact Release dispatch preflight
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: openaria-release-dispatch-preflight-${{ needs.prepare.outputs.app_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-dispatch-preflight
+      - name: Download and verify pinned minisign
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_root="${RUNNER_TEMP}/openaria-baseline-tools"
+          mkdir -p "${tool_root}"
+          archive="${tool_root}/$(node -p 'require("./scripts/release-tools.json").minisign.archive')"
+          url="$(node -p 'require("./scripts/release-tools.json").minisign.url')"
+          expected_bytes="$(node -p 'require("./scripts/release-tools.json").minisign.bytes')"
+          expected_sha="$(node -p 'require("./scripts/release-tools.json").minisign.sha256')"
+          binary_path="$(node -p 'require("./scripts/release-tools.json").minisign.binary_path')"
+          curl --fail --location --silent --show-error "${url}" --output "${archive}"
+          test "$(wc -c < "${archive}")" = "${expected_bytes}"
+          echo "${expected_sha}  ${archive}" | sha256sum --check --strict
+          tar -xzf "${archive}" -C "${tool_root}"
+          install -m 0755 "${tool_root}/${binary_path}" "${tool_root}/minisign"
+          echo "${tool_root}" >> "${GITHUB_PATH}"
+          "${tool_root}/minisign" -v
+      - name: Capture latest before publishing the target Release
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.app_version }}
+        run: >-
+          node scripts/windows-updater-acceptance.mjs capture-baseline
+          --to "${RELEASE_VERSION}"
+          --dispatch-preflight release-dispatch-preflight/release-dispatch-preflight.json
+          --output pre-publish-updater-baseline
+      - name: Upload the immutable updater baseline
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: openaria-updater-baseline-${{ needs.prepare.outputs.app_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+          path: pre-publish-updater-baseline
+
+  rust-current:
+    name: rust (fmt, clippy, current product build check)
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
-
-      # The outer crate links against the system webkit/gtk stack, so even
-      # `cargo clippy` on it needs these present.
-      - name: Install Linux system dependencies
+      - name: Install Linux Tauri dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
             libayatana-appindicator3-dev patchelf build-essential curl wget file libssl-dev
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
         with:
           components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
-
-      - name: cargo fmt --check
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-
-      - name: cargo clippy
-        run: >-
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+      - run: >-
           cargo clippy --manifest-path src-tauri/Cargo.toml
-          --workspace --all-targets --all-features -- -D warnings
-
-      - name: cargo test
+          --workspace --all-features -- -D warnings
+      - name: Check current production crates without compatibility test targets
         run: >-
-          cargo test --manifest-path src-tauri/Cargo.toml
-          --workspace --all-targets --all-features
+          cargo check --manifest-path src-tauri/Cargo.toml
+          --workspace --all-features
 
-  object-store-minio:
-    name: hermetic object-store contract (MinIO)
+  media-contract:
+    name: media conversion and timeline contract
     needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      - name: Install media smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
+      - name: Run session media export and timeline tests
+        run: >-
+          cargo test --manifest-path src-tauri/Cargo.toml
+          -p ylx-transfer-adapters --all-features session_export --
+          --nocapture --test-threads=1
 
+  object-store-minio:
+    name: hermetic object-store publication contract
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
       - name: Run the pinned MinIO contract lane
         env:
           YLX_MINIO_IMAGE: minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
         run: bash src-tauri/crates/ylx-transfer-adapters/tests/support/run_minio_object_store_contract.sh
 
-  fs-recovery:
-    name: filesystem recovery (${{ matrix.os }})
-    needs: prepare
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        os: ${{ fromJSON(needs.prepare.outputs.platforms) }}
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.prepare.outputs.checkout_ref }}
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-
-      - name: Run filesystem recovery contract
-        run: >-
-          cargo test --manifest-path src-tauri/Cargo.toml
-          -p ylx-transfer-core --test fs_recovery_contract
-          --all-targets --all-features -- --nocapture
-
-  # Builds the full desktop app on all three target platforms. This is the
-  # actual cross-platform verification: a Linux workstation cannot exercise
-  # the macOS and Windows cfg-gated code or native installer packaging.
   tauri:
-    name: tauri build (${{ matrix.platform }})
-    needs: [prepare, frontend, rust]
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: ${{ fromJSON(needs.prepare.outputs.platforms) }}
-    runs-on: ${{ matrix.platform }}
+    name: Windows x86_64 application bundle
+    needs:
+      - prepare
+      - frontend
+      - device-contracts
+      - updater-contract
+      - rust-current
+      - media-contract
+      - object-store-minio
+    runs-on: windows-latest
+    timeout-minutes: 75
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
-
-      - name: Install Linux system dependencies
-        if: matrix.platform == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
-            libayatana-appindicator3-dev patchelf build-essential curl wget file libssl-dev
-
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: npm
-
-      - name: Set bundle version from Release tag
-        if: needs.prepare.outputs.is_release == 'true'
-        shell: bash
-        env:
-          RELEASE_VERSION: ${{ needs.prepare.outputs.release_tag }}
-        run: |
-          node - <<'NODE'
-          const fs = require("node:fs");
-          const path = "src-tauri/tauri.conf.json";
-          const config = JSON.parse(fs.readFileSync(path, "utf8"));
-
-          config.version = process.env.RELEASE_VERSION;
-          config.bundle = config.bundle ?? {};
-          config.bundle.createUpdaterArtifacts = true;
-          fs.writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
-          NODE
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
         with:
           components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
-
       - run: npm ci
 
-      # Formatting is platform-independent and already gated by the `rust`
-      # job; clippy and all-target tests are not -- cfg-gated paths differ per
-      # OS, which is the whole point of running this matrix.
-      - name: cargo clippy
-        run: >-
-          cargo clippy --manifest-path src-tauri/Cargo.toml
-          --workspace --all-targets --all-features -- -D warnings
-
-      - name: Rust workspace tests
-        run: >-
-          cargo test --manifest-path src-tauri/Cargo.toml
-          --workspace --all-targets --all-features
-
-      - name: tauri build
-        uses: tauri-apps/tauri-action@v0
+      - name: Require updater signing configuration for a Release
+        if: needs.prepare.outputs.is_release == 'true'
+        shell: pwsh
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ needs.prepare.outputs.is_release == 'true' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-
-      - name: Upload Tauri artifacts
-        uses: actions/upload-artifact@v6
-        with:
-          name: ylx-transfer-${{ matrix.platform }}
-          if-no-files-found: error
-          path: |
-            src-tauri/target/release/bundle/**
-            src-tauri/target/release/ylx-transfer
-            src-tauri/target/release/ylx-transfer.exe
-
-  release:
-    name: publish GitHub Release
-    if: needs.prepare.outputs.is_release == 'true'
-    needs: [prepare, tauri]
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ needs.prepare.outputs.checkout_ref }}
-          fetch-depth: 0
-
-      - name: Download platform artifacts
-        uses: actions/download-artifact@v7
-        with:
-          pattern: ylx-transfer-*
-          path: release-assets
-
-      - name: Create Release and upload installers
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
-          set -euo pipefail
-
-          git fetch --tags --force
-          head_commit="$(git rev-parse HEAD)"
-          if git rev-parse -q --verify "refs/tags/${RELEASE_TAG}" >/dev/null; then
-            tag_commit="$(git rev-list -n 1 "${RELEASE_TAG}")"
-            if [[ "${tag_commit}" != "${head_commit}" ]]; then
-              echo "Release tag ${RELEASE_TAG} already exists at ${tag_commit}, but this build checked out ${head_commit}." >&2
-              exit 1
-            fi
-          else
-            git tag "${RELEASE_TAG}" "${head_commit}"
-            git push origin "refs/tags/${RELEASE_TAG}"
-          fi
-
-          release_url="https://github.com/${GH_REPO}/releases/download/${RELEASE_TAG}"
-          assets=()
-          while IFS= read -r -d '' asset; do
-            assets+=("${asset}")
-          done < <(
-            find release-assets -type f \
-              \( -name '*.AppImage' \
-                -o -name '*.deb' \
-                -o -name '*.rpm' \
-                -o -name '*.dmg' \
-                -o -name '*.msi' \
-                -o -name '*-setup.exe' \
-                -o -name '*.tar.gz' \
-                -o -name '*.zip' \
-                -o -name '*.sig' \) \
-              -print0 | sort -z
-          )
-
-          if (( ${#assets[@]} == 0 )); then
-            echo "No packaged desktop installers were found in the build artifacts." >&2
-            exit 1
-          fi
-
-          node - "${RELEASE_TAG}" "${release_url}" release-assets <<'NODE'
-          const fs = require("node:fs");
-          const path = require("node:path");
-
-          const [, , version, releaseUrl, root] = process.argv;
-          const osByRunner = new Map([
-            ["ubuntu-latest", "linux"],
-            ["macos-latest", "darwin"],
-            ["windows-latest", "windows"],
-          ]);
-          const archByRunner = new Map([
-            ["ubuntu-latest", "x86_64"],
-            ["macos-latest", "aarch64"],
-            ["windows-latest", "x86_64"],
-          ]);
-
-          function walk(dir) {
-            return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
-              const full = path.join(dir, entry.name);
-              return entry.isDirectory() ? walk(full) : [full];
-            });
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw "TAURI_SIGNING_PRIVATE_KEY is required for a Release build."
+          }
+          $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          if ([string]::IsNullOrWhiteSpace($config.plugins.updater.pubkey)) {
+            throw "The application updater public key is missing from tauri.conf.json."
           }
 
-          const files = walk(root);
-          const platforms = {};
-          for (const file of files) {
-            if (!fs.existsSync(`${file}.sig`)) continue;
-            const parts = file.split(path.sep);
-            const runner = [...osByRunner.keys()].find((name) => parts.includes(`ylx-transfer-${name}`));
-            if (runner === undefined) continue;
-            const platform = `${osByRunner.get(runner)}-${archByRunner.get(runner)}`;
-            platforms[platform] = {
-              signature: fs.readFileSync(`${file}.sig`, "utf8").trim(),
-              url: `${releaseUrl}/${encodeURIComponent(path.basename(file))}`,
-            };
+      - name: Download and verify pinned Windows FFmpeg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $manifest = Get-Content src-tauri/resources/windows-ffmpeg.json -Raw | ConvertFrom-Json
+          $archive = Join-Path $env:RUNNER_TEMP $manifest.archive
+          $extractRoot = Join-Path $env:RUNNER_TEMP "openaria-ffmpeg-$($manifest.version)"
+          Invoke-WebRequest -Uri $manifest.url -OutFile $archive
+
+          $archiveInfo = Get-Item $archive
+          if ($archiveInfo.Length -ne [int64]$manifest.bytes) {
+            throw "FFmpeg archive size $($archiveInfo.Length) does not match pinned $($manifest.bytes)."
+          }
+          $actualSha = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha -ne $manifest.sha256) {
+            throw "FFmpeg archive SHA-256 $actualSha does not match the pinned digest."
           }
 
-          if (Object.keys(platforms).length === 0) {
-            console.error("No updater artifacts with .sig sidecars were found.");
-            process.exit(1);
-          }
+          Expand-Archive -Path $archive -DestinationPath $extractRoot
+          New-Item -ItemType Directory -Force src-tauri/binaries | Out-Null
 
-          for (const required of ["linux-x86_64", "darwin-aarch64", "windows-x86_64"]) {
-            if (platforms[required] === undefined) {
-              console.error(`Missing updater manifest entry for ${required}.`);
-              process.exit(1);
+          function Assert-X64Pe([string]$Path, [string]$Label) {
+            $bytes = [System.IO.File]::ReadAllBytes($Path)
+            if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) {
+              throw "$Label is not a PE executable."
+            }
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+            if ($peOffset -lt 0 -or $peOffset + 6 -gt $bytes.Length) {
+              throw "$Label has a truncated PE header."
+            }
+            $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+            if ($machine -ne 0x8664) {
+              throw "$Label machine 0x$($machine.ToString('x4')) is not Windows x86_64."
             }
           }
 
-          const manifest = {
-            version,
-            notes: `Open Aria Bridge ${version}`,
-            pub_date: new Date().toISOString(),
-            platforms,
-          };
-          fs.writeFileSync("latest.json", `${JSON.stringify(manifest, null, 2)}\n`);
+          $toolSpecs = @(
+            [pscustomobject]@{
+              Name = "ffmpeg"
+              ArchiveName = $manifest.executables.ffmpeg.archive_name
+              TauriSource = $manifest.executables.ffmpeg.tauri_source
+            },
+            [pscustomobject]@{
+              Name = "ffprobe"
+              ArchiveName = $manifest.executables.ffprobe.archive_name
+              TauriSource = $manifest.executables.ffprobe.tauri_source
+            }
+          )
+          foreach ($tool in $toolSpecs) {
+            $matches = @(Get-ChildItem -Path $extractRoot -Recurse -File -Filter $tool.ArchiveName)
+            if ($matches.Count -ne 1) {
+              throw "Expected one $($tool.ArchiveName) in the pinned archive; found $($matches.Count)."
+            }
+            $target = Join-Path "src-tauri" $tool.TauriSource
+            Copy-Item $matches[0].FullName $target -Force
+            Assert-X64Pe $target "Pinned $($tool.ArchiveName)"
+            $versionLine = (& $target -version 2>&1 | Select-Object -First 1)
+            if ($versionLine -notlike "$($tool.Name) version $($manifest.version)*") {
+              throw "Unexpected pinned $($tool.Name) version line: $versionLine"
+            }
+          }
+
+          $ffmpegSidecar = Join-Path "src-tauri" $manifest.executables.ffmpeg.tauri_source
+          $ffprobeSidecar = Join-Path "src-tauri" $manifest.executables.ffprobe.tauri_source
+          $smoke = Join-Path $env:RUNNER_TEMP "openaria-ffmpeg-smoke.mp4"
+          & $ffmpegSidecar -hide_banner -loglevel error `
+            -f lavfi -i "testsrc2=size=64x64:rate=5:duration=1" `
+            -f lavfi -i "sine=frequency=1000:duration=1" `
+            -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest -y $smoke
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $smoke) -or (Get-Item $smoke).Length -le 0) {
+            throw "Pinned FFmpeg encode smoke failed."
+          }
+          & $ffmpegSidecar -hide_banner -loglevel error -i $smoke -f null NUL
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned FFmpeg decode smoke failed."
+          }
+
+          $probeLines = & $ffprobeSidecar -v error -print_format json -count_frames `
+            -show_entries "stream=codec_type,codec_name,time_base,start_pts,start_time,duration_ts,duration,nb_frames,nb_read_frames,sample_rate,channels,width,height" `
+            -show_streams $smoke
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned FFprobe output verification failed."
+          }
+          try {
+            $probe = ($probeLines -join "`n") | ConvertFrom-Json
+          } catch {
+            throw "Pinned FFprobe emitted invalid JSON: $($_.Exception.Message)"
+          }
+          $streams = @($probe.streams)
+          $video = @($streams | Where-Object { $_.codec_type -eq "video" })
+          $audio = @($streams | Where-Object { $_.codec_type -eq "audio" })
+          if ($video.Count -ne 1 -or $audio.Count -ne 1) {
+            throw "Pinned FFprobe did not report exactly one video and one audio stream."
+          }
+          if ([int]$video[0].width -ne 64 -or [int]$video[0].height -ne 64 -or [int64]$video[0].nb_read_frames -le 0) {
+            throw "Pinned FFprobe video timeline report is incomplete."
+          }
+          if ([int]$audio[0].sample_rate -le 0 -or [int]$audio[0].channels -le 0) {
+            throw "Pinned FFprobe audio timeline report is incomplete."
+          }
+
+      - name: Configure the Windows-only bundle
+        shell: bash
+        env:
+          CREATE_UPDATER_ARTIFACTS: ${{ needs.prepare.outputs.is_release }}
+        run: |
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const file = "src-tauri/tauri.conf.json";
+          const config = JSON.parse(fs.readFileSync(file, "utf8"));
+          const windowsConfig = JSON.parse(fs.readFileSync("src-tauri/tauri.windows.conf.json", "utf8"));
+          const expectedSidecars = ["binaries/ffmpeg", "binaries/ffprobe"];
+          if (config.bundle.externalBin !== undefined) {
+            throw new Error("Windows sidecars must not be declared in the cross-platform base config");
+          }
+          if (JSON.stringify(windowsConfig.bundle.externalBin) !== JSON.stringify(expectedSidecars)) {
+            throw new Error(`Unexpected Windows externalBin contract: ${JSON.stringify(windowsConfig.bundle.externalBin)}`);
+          }
+          config.bundle.createUpdaterArtifacts = process.env.CREATE_UPDATER_ARTIFACTS === "true";
+          fs.writeFileSync(file, `${JSON.stringify(config, null, 2)}\n`);
           NODE
 
-          assets+=("latest.json")
+      - name: Windows Rust clippy
+        run: >-
+          cargo clippy --manifest-path src-tauri/Cargo.toml
+          --workspace --all-features -- -D warnings
+      - name: Windows current production Rust check
+        run: >-
+          cargo check --manifest-path src-tauri/Cargo.toml
+          --workspace --all-features
+      - name: Build NSIS and MSI bundles
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ needs.prepare.outputs.is_release == 'true' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ needs.prepare.outputs.is_release == 'true' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+      - name: Verify NSIS and MSI media sidecar contents
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $nsis = @(Get-ChildItem src-tauri/target/release/bundle/nsis -File -Filter "*-setup.exe")
+          $msi = @(Get-ChildItem src-tauri/target/release/bundle/msi -File -Filter "*.msi")
+          if ($nsis.Count -ne 1 -or $msi.Count -ne 1) {
+            throw "Expected exactly one NSIS setup and one MSI bundle."
+          }
 
-          printf 'Release assets:\n'
-          printf '  %s\n' "${assets[@]}"
+          $sevenZip = (Get-Command 7z.exe -ErrorAction Stop).Source
+          $nsisListing = (& $sevenZip l -ba $nsis[0].FullName 2>&1) -join "`n"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to inspect the NSIS bundle with 7-Zip."
+          }
+          foreach ($name in @("ffmpeg.exe", "ffprobe.exe")) {
+            if ($nsisListing -notmatch [regex]::Escape($name)) {
+              throw "NSIS bundle does not contain $name."
+            }
+          }
 
-          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release create "${RELEASE_TAG}" \
-              --draft \
-              --generate-notes \
-              --title "Release ${RELEASE_TAG}" \
-              --verify-tag
-          fi
+          $msiRoot = Join-Path $env:RUNNER_TEMP "openaria-msi-contents"
+          New-Item -ItemType Directory -Force $msiRoot | Out-Null
+          $msiProcess = Start-Process msiexec.exe -Wait -PassThru -ArgumentList @(
+            "/a",
+            "`"$($msi[0].FullName)`"",
+            "/qn",
+            "TARGETDIR=`"$msiRoot`""
+          )
+          if ($msiProcess.ExitCode -notin @(0, 3010)) {
+            throw "MSI administrative extraction failed with exit code $($msiProcess.ExitCode)."
+          }
+          $msiNames = @(Get-ChildItem $msiRoot -Recurse -File | ForEach-Object { $_.Name })
+          foreach ($name in @("ffmpeg.exe", "ffprobe.exe")) {
+            if ($msiNames -notcontains $name) {
+              throw "MSI bundle does not contain $name."
+            }
+          }
+      - name: Upload Windows bundle artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: openaria-bridge-windows-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/nsis/*-setup.exe.sig
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/msi/*.msi.sig
 
-          gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
-          gh release edit "${RELEASE_TAG}" \
-            --draft=false \
-            --prerelease=false \
-            --title "Release ${RELEASE_TAG}"
+  # Repository prerequisite: immutable Releases must remain enabled in GitHub
+  # settings. The workflow verifies the resulting public Release is immutable.
+  release-draft:
+    name: prepare exact never-public Windows draft
+    if: needs.prepare.outputs.is_release == 'true'
+    needs:
+      - prepare
+      - frontend
+      - device-contracts
+      - updater-contract
+      - rust-current
+      - media-contract
+      - object-store-minio
+      - tauri
+      - updater-baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+      - name: Download the Windows bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: openaria-bridge-windows-x86_64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-assets
+      - name: Download the captured baseline
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: openaria-updater-baseline-${{ needs.prepare.outputs.app_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: updater-baseline
+      - name: Download the exact dispatch preflight
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: openaria-release-dispatch-preflight-${{ needs.prepare.outputs.app_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-dispatch-preflight
+      - name: Download and verify pinned minisign
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_root="${RUNNER_TEMP}/openaria-draft-tools"
+          mkdir -p "${tool_root}"
+          archive="${tool_root}/$(node -p 'require("./scripts/release-tools.json").minisign.archive')"
+          url="$(node -p 'require("./scripts/release-tools.json").minisign.url')"
+          expected_bytes="$(node -p 'require("./scripts/release-tools.json").minisign.bytes')"
+          expected_sha="$(node -p 'require("./scripts/release-tools.json").minisign.sha256')"
+          binary_path="$(node -p 'require("./scripts/release-tools.json").minisign.binary_path')"
+          curl --fail --location --silent --show-error "${url}" --output "${archive}"
+          test "$(wc -c < "${archive}")" = "${expected_bytes}"
+          echo "${expected_sha}  ${archive}" | sha256sum --check --strict
+          tar -xzf "${archive}" -C "${tool_root}"
+          install -m 0755 "${tool_root}/${binary_path}" "${tool_root}/minisign"
+          echo "${tool_root}" >> "${GITHUB_PATH}"
+          "${tool_root}/minisign" -v
+      - name: Stage the exact six Windows Release assets
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.app_version }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: >-
+          node scripts/desktop-release-contract.mjs stage
+          --version "${RELEASE_VERSION}"
+          --repository "${RELEASE_REPOSITORY}"
+          --input release-assets
+          --output release-upload-assets
+      - name: Verify candidate signatures with the shipped public key
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.app_version }}
+        run: >-
+          node scripts/desktop-release-contract.mjs verify-signatures
+          --version "${RELEASE_VERSION}"
+          --assets release-upload-assets
+      - name: Prepare a fresh numeric never-public draft
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.app_version }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.checkout_ref }}
+        run: >-
+          node scripts/desktop-release-commit-point.mjs prepare-draft
+          --repository "${GITHUB_REPOSITORY}"
+          --version "${RELEASE_VERSION}"
+          --commit "${SOURCE_COMMIT}"
+          --run-id "${GITHUB_RUN_ID}"
+          --run-attempt "${GITHUB_RUN_ATTEMPT}"
+          --assets release-upload-assets
+          --baseline updater-baseline/baseline.json
+          --preflight release-dispatch-preflight/release-dispatch-preflight.json
+          --output release-candidate
+      - name: Upload exact candidate bytes and numeric ownership receipt
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: openaria-release-candidate-${{ needs.prepare.outputs.app_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+          path: release-candidate
+
+  windows-updater-acceptance:
+    name: pre-publish real Windows in-app updater acceptance
+    if: needs.prepare.outputs.is_release == 'true'
+    needs:
+      - prepare
+      - updater-baseline
+      - release-draft
+    runs-on: windows-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+      - name: Download the captured public baseline
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: openaria-updater-baseline-${{ needs.prepare.outputs.app_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: updater-baseline
+      - name: Download the exact never-public candidate
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: openaria-release-candidate-${{ needs.prepare.outputs.app_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-candidate
+      - name: Install unchanged public baseline and update through its production updater
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.app_version }}
+        run: |
+          node scripts/windows-updater-acceptance.mjs accept `
+            --to ${env:RELEASE_VERSION} `
+            --baseline updater-baseline `
+            --candidate release-candidate `
+            --ownership release-candidate/release-ownership.json `
+            --output windows-updater-acceptance
+      - name: Upload pre-publish updater lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: openaria-windows-updater-acceptance-${{ needs.prepare.outputs.app_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+          path: windows-updater-acceptance
+
+  release-publication:
+    name: irreversible numeric publication and read-only verification
+    if: needs.prepare.outputs.is_release == 'true'
+    needs:
+      - prepare
+      - release-draft
+      - windows-updater-acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+      - name: Download the exact never-public candidate
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: openaria-release-candidate-${{ needs.prepare.outputs.app_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-candidate
+      - name: Download the passed pre-publish updater receipt
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: openaria-windows-updater-acceptance-${{ needs.prepare.outputs.app_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: windows-updater-acceptance
+      - name: Publish the accepted draft by numeric Release ID
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          node scripts/desktop-release-commit-point.mjs publish
+          --ownership release-candidate/release-ownership.json
+          --acceptance windows-updater-acceptance/windows-updater-acceptance.json
+          --request-log windows-updater-acceptance/controlled-update-server-log.json
+          --run-id "${GITHUB_RUN_ID}"
+          --run-attempt "${GITHUB_RUN_ATTEMPT}"
+          --output release-publication
+      - name: Download and verify pinned minisign for read-only postverify
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_root="${RUNNER_TEMP}/openaria-postverify-tools"
+          mkdir -p "${tool_root}"
+          archive="${tool_root}/$(node -p 'require("./scripts/release-tools.json").minisign.archive')"
+          url="$(node -p 'require("./scripts/release-tools.json").minisign.url')"
+          expected_bytes="$(node -p 'require("./scripts/release-tools.json").minisign.bytes')"
+          expected_sha="$(node -p 'require("./scripts/release-tools.json").minisign.sha256')"
+          binary_path="$(node -p 'require("./scripts/release-tools.json").minisign.binary_path')"
+          curl --fail --location --silent --show-error "${url}" --output "${archive}"
+          test "$(wc -c < "${archive}")" = "${expected_bytes}"
+          echo "${expected_sha}  ${archive}" | sha256sum --check --strict
+          tar -xzf "${archive}" -C "${tool_root}"
+          install -m 0755 "${tool_root}/${binary_path}" "${tool_root}/minisign"
+          echo "${tool_root}" >> "${GITHUB_PATH}"
+      - name: Read-only anonymous exact-byte postverification
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.app_version }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: >-
+          node scripts/desktop-release-contract.mjs verify-published
+          --version "${RELEASE_VERSION}"
+          --repository "${RELEASE_REPOSITORY}"
+          --output published-release-verification
+      - name: Upload immutable publication and anonymous byte evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: openaria-release-publication-${{ needs.prepare.outputs.app_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            release-publication
+            published-release-verification
