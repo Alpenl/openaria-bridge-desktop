@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { releaseAssetUrl, validateReleaseAssetUrl } from "./desktop-release-commit-point.mjs";
 
 const NUMERIC_SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const WINDOWS_PLATFORM = "windows-x86_64";
@@ -182,7 +183,7 @@ export function validateLatestManifest(manifest, { version, repository }) {
     "latest.json must contain only windows-x86_64",
   );
   const names = releaseNames(version);
-  const expectedUrl = `https://github.com/${repository}/releases/download/${version}/${names.setup}`;
+  const expectedUrl = releaseAssetUrl(repository, version, names.setup);
   const platform = manifest.platforms[WINDOWS_PLATFORM];
   invariant(platform.url === expectedUrl, `latest.json URL ${platform.url} != ${expectedUrl}`);
   decodedMinisign(platform.signature, "latest.json signature");
@@ -281,10 +282,14 @@ export function validatePublishedReleaseMetadata(metadata, { repository, version
   for (const [name, bytes] of assets) {
     const asset = publishedAssets.get(name);
     const digest = createHash("sha256").update(bytes).digest("hex");
-    const expectedUrl = `https://github.com/${repository}/releases/download/${version}/${name}`;
     invariant(asset.size === bytes.length, `${name} GitHub size ${asset.size} != downloaded ${bytes.length}`);
     invariant(asset.digest === `sha256:${digest}`, `${name} GitHub digest ${asset.digest} != sha256:${digest}`);
-    invariant(asset.browser_download_url === expectedUrl, `${name} GitHub download URL is inconsistent with the tag`);
+    validateReleaseAssetUrl(asset.browser_download_url, {
+      repository,
+      version,
+      name,
+      expectedDraft: false,
+    });
   }
 }
 
