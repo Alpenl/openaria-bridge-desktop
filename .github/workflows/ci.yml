@@ -303,7 +303,9 @@ jobs:
           expected_bytes="$(node -p 'require("./scripts/release-tools.json").minisign.bytes')"
           expected_sha="$(node -p 'require("./scripts/release-tools.json").minisign.sha256')"
           binary_path="$(node -p 'require("./scripts/release-tools.json").minisign.binary_path')"
-          curl --fail --location --silent --show-error "${url}" --output "${archive}"
+          curl --fail --location --silent --show-error --retry 3 --retry-all-errors \
+            --connect-timeout 20 --max-time 120 --max-filesize "${expected_bytes}" \
+            "${url}" --output "${archive}"
           test "$(wc -c < "${archive}")" = "${expected_bytes}"
           echo "${expected_sha}  ${archive}" | sha256sum --check --strict
           tar -xzf "${archive}" -C "${tool_root}"
@@ -691,7 +693,9 @@ jobs:
           expected_bytes="$(node -p 'require("./scripts/release-tools.json").minisign.bytes')"
           expected_sha="$(node -p 'require("./scripts/release-tools.json").minisign.sha256')"
           binary_path="$(node -p 'require("./scripts/release-tools.json").minisign.binary_path')"
-          curl --fail --location --silent --show-error "${url}" --output "${archive}"
+          curl --fail --location --silent --show-error --retry 3 --retry-all-errors \
+            --connect-timeout 20 --max-time 120 --max-filesize "${expected_bytes}" \
+            "${url}" --output "${archive}"
           test "$(wc -c < "${archive}")" = "${expected_bytes}"
           echo "${expected_sha}  ${archive}" | sha256sum --check --strict
           tar -xzf "${archive}" -C "${tool_root}"
@@ -834,7 +838,7 @@ jobs:
           --run-id "${GITHUB_RUN_ID}"
           --run-attempt "${GITHUB_RUN_ATTEMPT}"
           --output release-publication
-      - name: Download and verify pinned minisign for read-only postverify
+      - name: Download and verify pinned postverify tools
         shell: bash
         run: |
           set -euo pipefail
@@ -845,12 +849,33 @@ jobs:
           expected_bytes="$(node -p 'require("./scripts/release-tools.json").minisign.bytes')"
           expected_sha="$(node -p 'require("./scripts/release-tools.json").minisign.sha256')"
           binary_path="$(node -p 'require("./scripts/release-tools.json").minisign.binary_path')"
-          curl --fail --location --silent --show-error "${url}" --output "${archive}"
+          curl --fail --location --silent --show-error --retry 3 --retry-all-errors \
+            --connect-timeout 20 --max-time 120 --max-filesize "${expected_bytes}" \
+            "${url}" --output "${archive}"
           test "$(wc -c < "${archive}")" = "${expected_bytes}"
           echo "${expected_sha}  ${archive}" | sha256sum --check --strict
           tar -xzf "${archive}" -C "${tool_root}"
           install -m 0755 "${tool_root}/${binary_path}" "${tool_root}/minisign"
+
+          seven_archive="${tool_root}/$(node -p 'require("./scripts/release-tools.json").seven_zip.archive')"
+          seven_url="$(node -p 'require("./scripts/release-tools.json").seven_zip.url')"
+          seven_bytes="$(node -p 'require("./scripts/release-tools.json").seven_zip.bytes')"
+          seven_sha="$(node -p 'require("./scripts/release-tools.json").seven_zip.sha256')"
+          seven_binary_path="$(node -p 'require("./scripts/release-tools.json").seven_zip.binary_path')"
+          seven_binary_bytes="$(node -p 'require("./scripts/release-tools.json").seven_zip.binary_bytes')"
+          seven_binary_sha="$(node -p 'require("./scripts/release-tools.json").seven_zip.binary_sha256')"
+          curl --fail --location --silent --show-error --retry 3 --retry-all-errors \
+            --connect-timeout 20 --max-time 120 --max-filesize "${seven_bytes}" \
+            "${seven_url}" --output "${seven_archive}"
+          test "$(wc -c < "${seven_archive}")" = "${seven_bytes}"
+          echo "${seven_sha}  ${seven_archive}" | sha256sum --check --strict
+          tar -xJf "${seven_archive}" -C "${tool_root}"
+          seven_binary="${tool_root}/${seven_binary_path}"
+          test "$(wc -c < "${seven_binary}")" = "${seven_binary_bytes}"
+          echo "${seven_binary_sha}  ${seven_binary}" | sha256sum --check --strict
+          chmod 0755 "${seven_binary}"
           echo "${tool_root}" >> "${GITHUB_PATH}"
+          echo "OPENARIA_SEVEN_ZIP=${seven_binary}" >> "${GITHUB_ENV}"
       - name: Read-only anonymous exact-byte postverification
         env:
           RELEASE_VERSION: ${{ needs.prepare.outputs.app_version }}
@@ -859,6 +884,7 @@ jobs:
           node scripts/desktop-release-contract.mjs verify-published
           --version "${RELEASE_VERSION}"
           --repository "${RELEASE_REPOSITORY}"
+          --seven-zip "${OPENARIA_SEVEN_ZIP}"
           --output published-release-verification
       - name: Upload immutable publication and anonymous byte evidence
         if: always()

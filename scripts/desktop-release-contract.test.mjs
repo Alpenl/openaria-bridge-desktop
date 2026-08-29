@@ -7,8 +7,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import {
+  inspectPortableExecutable,
   parseSha256Sums,
+  parseMsiSummaryInformation,
+  requireUniqueArchiveEntry,
   stageReleaseAssets,
+  validateWindowsBundleArchitecture,
   validateLatestManifest,
   validatePublishedReleaseMetadata,
   validateVersionSources,
@@ -30,6 +34,154 @@ const WRONG_VERSION = VERSION.replace(/\d+$/, (patch) => String(Number(patch) + 
 const FAKE_SIGNATURE = Buffer.from(
   "untrusted comment: signature from test key\nRWQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
 ).toString("base64");
+
+function portableExecutable(machine, optionalMagic) {
+  const bytes = Buffer.alloc(512);
+  bytes.write("MZ", 0, "ascii");
+  bytes.writeUInt32LE(0x80, 0x3c);
+  bytes.write("PE\0\0", 0x80, "binary");
+  bytes.writeUInt16LE(machine, 0x84);
+  bytes.writeUInt16LE(1, 0x86);
+  bytes.writeUInt16LE(0xf0, 0x94);
+  bytes.writeUInt16LE(optionalMagic, 0x98);
+  return bytes;
+}
+
+function msiSummaryInformation({ template = "x64;0", pageCount = 450 } = {}) {
+  const templateBytes = Buffer.from(`${template}\0`, "ascii");
+  const templateValueSize = 8 + Math.ceil(templateBytes.length / 4) * 4;
+  const sectionOffset = 48;
+  const propertyDirectorySize = 8 + 2 * 8;
+  const pageCountOffset = propertyDirectorySize + templateValueSize;
+  const sectionSize = pageCountOffset + 8;
+  const bytes = Buffer.alloc(sectionOffset + sectionSize);
+  bytes.writeUInt16LE(0xfffe, 0);
+  bytes.writeUInt16LE(0, 2);
+  bytes.writeUInt32LE(1, 24);
+  Buffer.from("e0859ff2f94f6810ab9108002b27b3d9", "hex").copy(bytes, 28);
+  bytes.writeUInt32LE(sectionOffset, 44);
+  bytes.writeUInt32LE(sectionSize, sectionOffset);
+  bytes.writeUInt32LE(2, sectionOffset + 4);
+  bytes.writeUInt32LE(7, sectionOffset + 8);
+  bytes.writeUInt32LE(propertyDirectorySize, sectionOffset + 12);
+  bytes.writeUInt32LE(14, sectionOffset + 16);
+  bytes.writeUInt32LE(pageCountOffset, sectionOffset + 20);
+  const templateOffset = sectionOffset + propertyDirectorySize;
+  bytes.writeUInt32LE(30, templateOffset);
+  bytes.writeUInt32LE(templateBytes.length, templateOffset + 4);
+  templateBytes.copy(bytes, templateOffset + 8);
+  const pageOffset = sectionOffset + pageCountOffset;
+  bytes.writeUInt32LE(3, pageOffset);
+  bytes.writeInt32LE(pageCount, pageOffset + 4);
+  return bytes;
+}
+
+test("postverify accepts an i386 NSIS stub only when its real application and MSI target are x64", () => {
+  const setup = portableExecutable(0x14c, 0x10b);
+  const application = portableExecutable(0x8664, 0x20b);
+  const summary = msiSummaryInformation();
+
+  assert.deepEqual(inspectPortableExecutable(setup, "setup.exe"), {
+    machine: 0x14c,
+    machine_hex: "0x014c",
+    optional_magic: 0x10b,
+    pe_format: "PE32",
+  });
+  assert.deepEqual(parseMsiSummaryInformation(summary, "installer.msi"), {
+    languages: ["0"],
+    page_count: 450,
+    platform: "x64",
+    template: "x64;0",
+  });
+  assert.deepEqual(
+    validateWindowsBundleArchitecture({
+      setupBytes: setup,
+      applicationBytes: application,
+      msiSummaryBytes: summary,
+      setupLabel: "setup.exe",
+      applicationLabel: "ylx-transfer.exe",
+      msiLabel: "installer.msi",
+    }),
+    {
+      application: {
+        machine: 0x8664,
+        machine_hex: "0x8664",
+        optional_magic: 0x20b,
+        pe_format: "PE32+",
+      },
+      msi: { languages: ["0"], page_count: 450, platform: "x64", template: "x64;0" },
+      setup_stub: { machine: 0x14c, machine_hex: "0x014c", optional_magic: 0x10b, pe_format: "PE32" },
+    },
+  );
+});
+
+test("postverify rejects x86 payloads and malformed PE or MSI architecture bytes", () => {
+  const setup = portableExecutable(0x14c, 0x10b);
+  const x64 = portableExecutable(0x8664, 0x20b);
+  const x86 = portableExecutable(0x14c, 0x10b);
+  const x64Summary = msiSummaryInformation();
+  const x86Summary = msiSummaryInformation({ template: "Intel;0", pageCount: 200 });
+  const staleSchema = msiSummaryInformation({ pageCount: 150 });
+  const tamperedPe = Buffer.from(setup);
+  tamperedPe.write("PX\0\0", 0x80, "binary");
+  const tamperedSummary = Buffer.from(x64Summary);
+  tamperedSummary.writeUInt32LE(0xfffffff0, 60);
+
+  assert.throws(
+    () =>
+      validateWindowsBundleArchitecture({
+        setupBytes: setup,
+        applicationBytes: x86,
+        msiSummaryBytes: x64Summary,
+      }),
+    /application payload is not Windows x86_64/,
+  );
+  assert.throws(
+    () =>
+      validateWindowsBundleArchitecture({
+        setupBytes: setup,
+        applicationBytes: x64,
+        msiSummaryBytes: x86Summary,
+      }),
+    /MSI Template platform Intel does not target x64/,
+  );
+  assert.throws(
+    () =>
+      validateWindowsBundleArchitecture({
+        setupBytes: setup,
+        applicationBytes: x64,
+        msiSummaryBytes: staleSchema,
+      }),
+    /MSI Page Count 150 is below the x64 minimum 200/,
+  );
+  assert.throws(() => inspectPortableExecutable(tamperedPe, "tampered setup"), /invalid PE header/);
+  assert.throws(() => parseMsiSummaryInformation(tamperedSummary, "tampered MSI"), /property offset/);
+});
+
+test("archive entry gates reject missing, duplicate, nested, and oversized payloads", () => {
+  const listing = "Path = ylx-transfer.exe\nSize = 33713152\nPacked Size =\n";
+  assert.deepEqual(requireUniqueArchiveEntry(listing, "ylx-transfer.exe", "NSIS application", 64 * 1024 * 1024), {
+    path: "ylx-transfer.exe",
+    size: 33713152,
+  });
+  assert.throws(
+    () => requireUniqueArchiveEntry("Path = ffmpeg.exe\nSize = 1\n", "ylx-transfer.exe", "NSIS application"),
+    /expected exactly one/,
+  );
+  assert.throws(
+    () => requireUniqueArchiveEntry(`${listing}\n${listing}`, "ylx-transfer.exe", "NSIS application"),
+    /expected exactly one/,
+  );
+  assert.throws(
+    () =>
+      requireUniqueArchiveEntry("Path = nested/ylx-transfer.exe\nSize = 10\n", "ylx-transfer.exe", "NSIS application"),
+    /unsafe or ambiguous path/,
+  );
+  assert.throws(
+    () => requireUniqueArchiveEntry(listing, "ylx-transfer.exe", "NSIS application", 1024),
+    /exceeds the byte limit/,
+  );
+});
 
 test("source versions and Windows bundle targets have one release authority", () => {
   assert.equal(validateVersionSources(ROOT, VERSION).appVersion, VERSION);
