@@ -245,6 +245,7 @@ test("Release is staged, accepted through the old production updater, then publi
   assert.ok(acceptanceStart > draftStart && publicationStart > acceptanceStart);
 
   const baseline = workflow.slice(baselineStart, tauriStart);
+  const tauri = workflow.slice(tauriStart, draftStart);
   const draft = workflow.slice(draftStart, acceptanceStart);
   const acceptance = workflow.slice(acceptanceStart, publicationStart);
   const publication = workflow.slice(publicationStart);
@@ -283,6 +284,23 @@ test("Release is staged, accepted through the old production updater, then publi
   assert.match(acceptance, /--ownership release-candidate\/release-ownership\.json/);
   assert.match(acceptance, /Install unchanged public baseline and update through its production updater/);
   const acceptanceClient = readFileSync(path.resolve(import.meta.dirname, "windows-updater-acceptance.mjs"), "utf8");
+  assert.match(tauri, /Smoke controlled updater TLS certificate setup/);
+  assert.match(tauri, /windows-updater-acceptance\.mjs smoke-controlled-tls/);
+  assert.match(acceptanceClient, /Get-PSDrive -Name Cert/);
+  assert.match(acceptanceClient, /New-PSDrive -Name Cert -PSProvider Certificate/);
+  assert.match(acceptanceClient, /spawnSync\(\s*"pwsh\.exe"/);
+  assert.doesNotMatch(acceptanceClient, /spawnSync\(\s*"powershell\.exe"/);
+  assert.match(acceptanceClient, /certutil\.exe -f -addstore Root/);
+  assert.match(acceptanceClient, /certutil\.exe -delstore Root/);
+  assert.match(acceptanceClient, /certutil\.exe -user -delstore My/);
+  assert.doesNotMatch(acceptanceClient, /certutil\.exe -user .*Root/);
+  assert.doesNotMatch(acceptanceClient, /Remove-Item -LiteralPath \$item/);
+  assert.match(acceptanceClient, /-ChainOption EndEntityCertOnly/);
+  assert.doesNotMatch(acceptanceClient, /-ChainOption BuildChain/);
+  assert.match(acceptanceClient, /controlled TLS phase/);
+  assert.doesNotMatch(acceptanceClient, /X509Store/);
+  assert.doesNotMatch(acceptanceClient, /Import-Certificate/);
+  assert.match(acceptanceClient, /command === "smoke-controlled-tls"/);
   const captureStart = acceptanceClient.indexOf("async function capturePrePublishBaseline(");
   const recheckStart = acceptanceClient.indexOf("async function authenticatedGithubJson(");
   const capture = acceptanceClient.slice(captureStart, recheckStart);

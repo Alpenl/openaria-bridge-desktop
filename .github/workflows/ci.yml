@@ -426,6 +426,12 @@ jobs:
           workspaces: src-tauri
       - run: npm ci
 
+      - name: Smoke controlled updater TLS certificate setup
+        run: >-
+          node scripts/windows-updater-acceptance.mjs smoke-controlled-tls
+          --to ${{ needs.prepare.outputs.app_version }}
+          --output controlled-tls-smoke
+
       - name: Require updater signing configuration for a Release
         if: needs.prepare.outputs.is_release == 'true'
         shell: pwsh
