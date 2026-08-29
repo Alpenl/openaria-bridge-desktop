@@ -426,6 +426,12 @@ jobs:
           workspaces: src-tauri
       - run: npm ci
 
+      - name: Smoke absent WebView2 policy value restoration
+        run: >-
+          node scripts/windows-updater-acceptance.mjs smoke-webview-policy-restore
+          --to ${{ needs.prepare.outputs.app_version }}
+          --output webview-policy-restore-smoke
+
       - name: Smoke controlled updater TLS certificate setup
         run: >-
           node scripts/windows-updater-acceptance.mjs smoke-controlled-tls

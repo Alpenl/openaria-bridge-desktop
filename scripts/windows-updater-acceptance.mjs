@@ -1991,11 +1991,8 @@ if (Test-Path -LiteralPath $keyPath) {
     }
   } else {
     Remove-ItemProperty -LiteralPath $keyPath -Name $valueName -Force -ErrorAction SilentlyContinue
-    $remaining = @(Get-ItemProperty -LiteralPath $keyPath -ErrorAction SilentlyContinue |
-      Get-Member -MemberType NoteProperty |
-      Where-Object { $_.Name -notmatch "^PS" })
-    $children = @(Get-ChildItem -LiteralPath $keyPath -ErrorAction SilentlyContinue)
-    if ($remaining.Count -eq 0 -and $children.Count -eq 0) {
+    $key = Get-Item -LiteralPath $keyPath -ErrorAction Stop
+    if (@($key.GetValueNames()).Count -eq 0 -and @($key.GetSubKeyNames()).Count -eq 0) {
       Remove-Item -LiteralPath $keyPath -Force -ErrorAction SilentlyContinue
     }
   }
@@ -2010,6 +2007,88 @@ foreach ($createdKey in @($createdKeys | Sort-Object { $_.Length } -Descending))
 }
 `;
   runPowerShell(source, "restore WebView2 policy value");
+}
+
+function smokeWebviewPolicyRestore() {
+  invariant(process.platform === "win32", "WebView2 policy restore smoke requires Windows");
+  const suffix = `${process.pid}-${randomBytes(8).toString("hex")}`;
+  const leaf = `OpenAriaPolicyRestoreSmoke-${suffix}`;
+  const registrySubkey = `${WEBVIEW2_POLICY_SUBPATH}\\${leaf}`;
+  const registryPath = `HKCU:\\${registrySubkey}`;
+  const valueName = `openaria-policy-restore-${suffix}.exe`;
+  let policy;
+  let result;
+  let smokeError;
+  try {
+    policy = configureWebviewPolicyValue({
+      registryPath,
+      registrySubkey,
+      valueName,
+      value: "--remote-debugging-port=49152",
+      label: "configure WebView2 policy restore smoke value",
+    });
+    invariant(policy.key_existed === false, "WebView2 policy restore smoke key unexpectedly existed");
+    invariant(policy.value_existed === false, "WebView2 policy restore smoke value unexpectedly existed");
+    restoreWebviewPolicyValue(policy);
+    const createdKeys = policy.created_keys.map(powershellLiteral).join(", ");
+    const observed = JSON.parse(
+      runPowerShell(
+        String.raw`
+$createdKeys = @(${createdKeys})
+[pscustomobject]@{
+  leaf_exists = [bool](Test-Path -LiteralPath ${powershellLiteral(registryPath)})
+  created_keys_remaining = @($createdKeys | Where-Object { Test-Path -LiteralPath $_ }).Count
+} | ConvertTo-Json -Compress
+`,
+        "verify WebView2 policy restore smoke cleanup",
+      ),
+    );
+    invariant(observed.leaf_exists === false, "WebView2 policy restore smoke leaf was not removed");
+    invariant(observed.created_keys_remaining === 0, "WebView2 policy restore smoke left created registry keys");
+    result = {
+      restored_absent_value: true,
+      removed_empty_leaf: true,
+      removed_created_keys: policy.created_keys.length,
+    };
+  } catch (error) {
+    smokeError = error;
+  }
+
+  let cleanupError;
+  if (policy?.key_existed === false) {
+    try {
+      const createdKeys = policy.created_keys.map(powershellLiteral).join(", ");
+      runPowerShell(
+        String.raw`
+$testPath = ${powershellLiteral(registryPath)}
+$createdKeys = @(${createdKeys})
+if (Test-Path -LiteralPath $testPath) {
+  Remove-Item -LiteralPath $testPath -Recurse -Force -ErrorAction Stop
+}
+foreach ($createdKey in @($createdKeys | Sort-Object { $_.Length } -Descending)) {
+  if (Test-Path -LiteralPath $createdKey) {
+    $key = Get-Item -LiteralPath $createdKey -ErrorAction Stop
+    if (@($key.GetValueNames()).Count -eq 0 -and @($key.GetSubKeyNames()).Count -eq 0) {
+      Remove-Item -LiteralPath $createdKey -Force -ErrorAction Stop
+    }
+  }
+}
+`,
+        "clean up WebView2 policy restore smoke",
+      );
+    } catch (error) {
+      cleanupError = error;
+    }
+  }
+  if (smokeError && cleanupError) {
+    throw new AggregateError(
+      [smokeError, cleanupError],
+      `WebView2 policy restore smoke failed (${smokeError instanceof Error ? smokeError.message : String(smokeError)}); cleanup also failed (${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)})`,
+    );
+  }
+  if (smokeError) throw smokeError;
+  if (cleanupError) throw cleanupError;
+  return result;
 }
 
 function restoreWebviewPolicyValues(values) {
@@ -2945,6 +3024,12 @@ async function main(argv) {
     if (command === "smoke-controlled-tls") {
       const result = smokeControlledTls();
       writeFileSync(path.join(outputRoot, "controlled-tls-smoke.json"), `${JSON.stringify(result, null, 2)}\n`);
+      console.log(JSON.stringify(result));
+      return;
+    }
+    if (command === "smoke-webview-policy-restore") {
+      const result = smokeWebviewPolicyRestore();
+      writeFileSync(path.join(outputRoot, "webview-policy-restore-smoke.json"), `${JSON.stringify(result, null, 2)}\n`);
       console.log(JSON.stringify(result));
       return;
     }
