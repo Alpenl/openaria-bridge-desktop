@@ -27,6 +27,9 @@ const WINDOWS_PLATFORM = "windows-x86_64";
 const FETCH_ATTEMPTS = 6;
 const APP_START_TIMEOUT_MS = 90_000;
 const UPDATE_HANDOFF_TIMEOUT_MS = 5 * 60_000;
+const WEBVIEW2_POLICY_SUBPATH = "Software\\Policies\\Microsoft\\Edge\\WebView2";
+const WEBVIEW2_DEBUG_POLICY_SUBKEY = `${WEBVIEW2_POLICY_SUBPATH}\\AdditionalBrowserArguments`;
+const WEBVIEW2_USER_DATA_POLICY_SUBKEY = `${WEBVIEW2_POLICY_SUBPATH}\\UserDataFolder`;
 
 function invariant(condition, message) {
   if (!condition) throw new Error(message);
@@ -1761,6 +1764,369 @@ $items = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.E
   return Array.isArray(parsed) ? parsed : [parsed];
 }
 
+function parsePowerShellCollection(output) {
+  if (!output) return [];
+  const parsed = JSON.parse(output);
+  return Array.isArray(parsed) ? parsed : [parsed];
+}
+
+function processInfoForWebview() {
+  const source = String.raw`
+$items = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.Name -ieq "msedgewebview2.exe" } | ForEach-Object {
+  [pscustomobject]@{
+    pid = [int]$_.ProcessId
+    parent_pid = [int]$_.ParentProcessId
+    name = $_.Name
+    executable = $_.ExecutablePath
+    command_line = $_.CommandLine
+  }
+})
+@($items) | ConvertTo-Json -Compress
+`;
+  return parsePowerShellCollection(runPowerShell(source, "inspect WebView2 processes"));
+}
+
+function tcpPortInfo(port) {
+  invariant(Number.isInteger(port) && port > 0 && port < 65_536, "WebView2 debug port is invalid");
+  const source = String.raw`
+$items = @()
+if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+  $items = @(Get-NetTCPConnection -LocalPort ${port} -ErrorAction SilentlyContinue | ForEach-Object {
+    [pscustomobject]@{
+      state = [string]$_.State
+      local_address = [string]$_.LocalAddress
+      local_port = [int]$_.LocalPort
+      remote_address = [string]$_.RemoteAddress
+      remote_port = [int]$_.RemotePort
+      owning_process = [int]$_.OwningProcess
+    }
+  })
+}
+@($items) | ConvertTo-Json -Compress
+`;
+  return parsePowerShellCollection(runPowerShell(source, `inspect TCP port ${port}`));
+}
+
+function collectWebviewDiagnostics(executable, port) {
+  const diagnostics = { application: null, webview_processes: null, tcp_connections: null };
+  try {
+    diagnostics.application = processInfoForExecutable(executable);
+  } catch (error) {
+    diagnostics.application = { error: error instanceof Error ? error.message : String(error) };
+  }
+  try {
+    diagnostics.webview_processes = processInfoForWebview();
+    diagnostics.browser_process_ids = diagnostics.webview_processes
+      .filter((process) => !/\s--type=/.test(process.command_line ?? ""))
+      .map((process) => process.pid);
+  } catch (error) {
+    diagnostics.webview_processes = { error: error instanceof Error ? error.message : String(error) };
+    diagnostics.browser_process_ids = [];
+  }
+  try {
+    diagnostics.tcp_connections = tcpPortInfo(port);
+  } catch (error) {
+    diagnostics.tcp_connections = { error: error instanceof Error ? error.message : String(error) };
+  }
+  return diagnostics;
+}
+
+function windowsTokenIntegrity() {
+  const source = String.raw`
+$ErrorActionPreference = "Stop"
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [Security.Principal.WindowsPrincipal]::new($identity)
+$integritySid = @($identity.Groups | Where-Object { $_.Value -match '^S-1-16-' } | Select-Object -First 1)
+$rid = if ($integritySid.Count -eq 1) { [int](($integritySid[0].Value -split '-')[-1]) } else { $null }
+$level = if ($null -eq $rid) {
+  "unknown"
+} elseif ($rid -ge 16384) {
+  "system"
+} elseif ($rid -ge 12288) {
+  "high"
+} elseif ($rid -ge 8192) {
+  "medium"
+} elseif ($rid -ge 4096) {
+  "low"
+} else {
+  "untrusted"
+}
+[pscustomobject]@{
+  user = $identity.Name
+  is_administrator = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  integrity_sid = if ($integritySid.Count -eq 1) { $integritySid[0].Value } else { $null }
+  integrity_rid = $rid
+  integrity_level = $level
+} | ConvertTo-Json -Compress
+`;
+  return JSON.parse(runPowerShell(source, "inspect Windows process integrity"));
+}
+
+export function webviewDebugPolicyValueName(executable) {
+  invariant(typeof executable === "string" && executable.trim().length > 0, "WebView2 executable is missing");
+  const valueName = path.win32.basename(executable.trim());
+  invariant(/^[^\\/:*?"<>|]+\.exe$/i.test(valueName), `WebView2 executable name is invalid: ${valueName}`);
+  return valueName;
+}
+
+function webviewPolicyPaths(scope) {
+  invariant(scope === "HKLM" || scope === "HKCU", `unsupported WebView2 registry policy scope ${scope}`);
+  return {
+    scope,
+    root_path: `${scope}:\\${WEBVIEW2_POLICY_SUBPATH}`,
+    debug_path: `${scope}:\\${WEBVIEW2_DEBUG_POLICY_SUBKEY}`,
+    user_data_path: `${scope}:\\${WEBVIEW2_USER_DATA_POLICY_SUBKEY}`,
+  };
+}
+
+export function webviewDebugPolicyDescriptor(executable, port, scope = "HKCU") {
+  invariant(Number.isInteger(port) && port > 0 && port < 65_536, "WebView2 debug port is invalid");
+  const paths = webviewPolicyPaths(scope);
+  return {
+    scope: paths.scope,
+    registry_root_path: paths.root_path,
+    registry_path: paths.debug_path,
+    registry_subkey: WEBVIEW2_DEBUG_POLICY_SUBKEY,
+    user_data_registry_path: paths.user_data_path,
+    user_data_registry_subkey: WEBVIEW2_USER_DATA_POLICY_SUBKEY,
+    value_name: webviewDebugPolicyValueName(executable),
+    argument: `--remote-debugging-port=${port}`,
+  };
+}
+
+function configureWebviewPolicyValue({ registryPath, registrySubkey, valueName, value, label }) {
+  const leaf = registrySubkey.slice(registrySubkey.lastIndexOf("\\") + 1);
+  const scope = registryPath.slice(0, registryPath.indexOf(":"));
+  const registryHive = scope === "HKLM" ? "LocalMachine" : scope === "HKCU" ? "CurrentUser" : null;
+  invariant(registryHive !== null, `unsupported WebView2 registry policy path ${registryPath}`);
+  const source = String.raw`
+$ErrorActionPreference = "Stop"
+$keyPath = ${powershellLiteral(registryPath)}
+$subKey = ${powershellLiteral(registrySubkey)}
+$registryHive = [Microsoft.Win32.Registry]::${registryHive}
+$valueName = ${powershellLiteral(valueName)}
+$value = ${powershellLiteral(value)}
+$keyExisted = Test-Path -LiteralPath $keyPath
+$valueExisted = $false
+$previousValue = $null
+$previousKind = $null
+$createdKeys = [System.Collections.Generic.List[string]]::new()
+if ($keyExisted) {
+  $key = $registryHive.OpenSubKey($subKey, $false)
+  if ($null -ne $key) {
+    if (@($key.GetValueNames()) -contains $valueName) {
+      $valueExisted = $true
+      $previousKind = $key.GetValueKind($valueName).ToString()
+      if ($previousKind -notin @("String", "ExpandString")) {
+        $key.Close()
+        throw "existing WebView2 policy value $valueName has unsupported registry type $previousKind"
+      }
+      $previousValue = [string]$key.GetValue(
+        $valueName,
+        $null,
+        [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+      )
+    }
+    $key.Close()
+  }
+}
+if (-not $keyExisted) {
+  $segments = @("Software", "Policies", "Microsoft", "Edge", "WebView2", ${powershellLiteral(leaf)})
+  $current = ${powershellLiteral(`${scope}:\\`)}
+  foreach ($segment in $segments) {
+    $current = Join-Path $current $segment
+    if (-not (Test-Path -LiteralPath $current)) {
+      New-Item -Path $current -Force | Out-Null
+      $createdKeys.Add($current)
+    }
+  }
+}
+New-ItemProperty -LiteralPath $keyPath -Name $valueName -PropertyType String -Value $value -Force | Out-Null
+[pscustomobject]@{
+  key_existed = [bool]$keyExisted
+  value_existed = [bool]$valueExisted
+  previous_value = $previousValue
+  previous_kind = $previousKind
+  created_keys = @($createdKeys)
+} | ConvertTo-Json -Compress
+`;
+  const state = JSON.parse(runPowerShell(source, label));
+  const createdKeys = Array.isArray(state.created_keys)
+    ? state.created_keys
+    : state.created_keys
+      ? [state.created_keys]
+      : [];
+  return {
+    registry_path: registryPath,
+    registry_subkey: registrySubkey,
+    value_name: valueName,
+    value,
+    ...state,
+    created_keys: createdKeys,
+  };
+}
+
+function restoreWebviewPolicyValue(policy) {
+  if (!policy) return;
+  const previousValue = policy.previous_value === null ? "$null" : powershellLiteral(policy.previous_value);
+  const previousKind = policy.previous_kind === null ? "$null" : powershellLiteral(policy.previous_kind);
+  const keyExisted = policy.key_existed === true ? "$true" : "$false";
+  const valueExisted = policy.value_existed === true ? "$true" : "$false";
+  const createdKeys = (policy.created_keys ?? []).map(powershellLiteral).join(", ");
+  const source = String.raw`
+$ErrorActionPreference = "Stop"
+$keyPath = ${powershellLiteral(policy.registry_path)}
+$valueName = ${powershellLiteral(policy.value_name)}
+$keyExisted = ${keyExisted}
+$valueExisted = ${valueExisted}
+$previousValue = ${previousValue}
+$previousKind = ${previousKind}
+$createdKeys = @(${createdKeys})
+if (Test-Path -LiteralPath $keyPath) {
+  if ($keyExisted) {
+    if ($valueExisted) {
+      New-ItemProperty -LiteralPath $keyPath -Name $valueName -PropertyType $previousKind -Value $previousValue -Force | Out-Null
+    } else {
+      Remove-ItemProperty -LiteralPath $keyPath -Name $valueName -Force -ErrorAction SilentlyContinue
+    }
+  } else {
+    Remove-ItemProperty -LiteralPath $keyPath -Name $valueName -Force -ErrorAction SilentlyContinue
+    $remaining = @(Get-ItemProperty -LiteralPath $keyPath -ErrorAction SilentlyContinue |
+      Get-Member -MemberType NoteProperty |
+      Where-Object { $_.Name -notmatch "^PS" })
+    $children = @(Get-ChildItem -LiteralPath $keyPath -ErrorAction SilentlyContinue)
+    if ($remaining.Count -eq 0 -and $children.Count -eq 0) {
+      Remove-Item -LiteralPath $keyPath -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+foreach ($createdKey in @($createdKeys | Sort-Object { $_.Length } -Descending)) {
+  if (Test-Path -LiteralPath $createdKey) {
+    $key = Get-Item -LiteralPath $createdKey -ErrorAction Stop
+    if (@($key.GetValueNames()).Count -eq 0 -and @($key.GetSubKeyNames()).Count -eq 0) {
+      Remove-Item -LiteralPath $createdKey -Force -ErrorAction Stop
+    }
+  }
+}
+`;
+  runPowerShell(source, "restore WebView2 policy value");
+}
+
+function restoreWebviewPolicyValues(values) {
+  let firstError;
+  for (const value of values) {
+    try {
+      restoreWebviewPolicyValue(value);
+    } catch (error) {
+      firstError ??= error;
+    }
+  }
+  if (firstError) throw firstError;
+}
+
+function configureWebviewDebugPolicy(executable, port, userDataFolder, tokenIntegrity, evidence) {
+  invariant(process.platform === "win32", "WebView2 registry policy requires Windows");
+  invariant(typeof userDataFolder === "string" && userDataFolder.length > 0, "WebView2 user data folder is missing");
+  let hklmError;
+  for (const scope of ["HKLM", "HKCU"]) {
+    const descriptor = webviewDebugPolicyDescriptor(executable, port, scope);
+    let argumentsPolicy;
+    let userDataPolicy;
+    try {
+      argumentsPolicy = configureWebviewPolicyValue({
+        registryPath: descriptor.registry_path,
+        registrySubkey: descriptor.registry_subkey,
+        valueName: descriptor.value_name,
+        value: descriptor.argument,
+        label: `configure ${scope} WebView2 debug arguments policy`,
+      });
+      userDataPolicy = configureWebviewPolicyValue({
+        registryPath: descriptor.user_data_registry_path,
+        registrySubkey: descriptor.user_data_registry_subkey,
+        valueName: descriptor.value_name,
+        value: userDataFolder,
+        label: `configure ${scope} WebView2 user data policy`,
+      });
+    } catch (error) {
+      let cleanupError;
+      try {
+        restoreWebviewPolicyValues([userDataPolicy, argumentsPolicy]);
+      } catch (candidateCleanupError) {
+        cleanupError = candidateCleanupError;
+        evidence?.event("webview2_debug_policy_restore_failed", {
+          scope,
+          error: candidateCleanupError instanceof Error ? candidateCleanupError.message : String(candidateCleanupError),
+        });
+      }
+      if (cleanupError) {
+        throw new Error(
+          `WebView2 ${scope} policy configuration failed (${error instanceof Error ? error.message : String(error)}); partial policy cleanup also failed (${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)})`,
+          { cause: error },
+        );
+      }
+      if (scope === "HKLM") {
+        hklmError = error;
+        evidence?.event("webview2_hklm_policy_unavailable", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+      throw new Error(
+        `WebView2 policy could not be configured in HKLM or HKCU; HKLM=${hklmError instanceof Error ? hklmError.message : String(hklmError ?? "not attempted")}; HKCU=${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+    if (scope === "HKCU" && ["high", "system"].includes(tokenIntegrity?.integrity_level)) {
+      restoreWebviewPolicyValues([userDataPolicy, argumentsPolicy]);
+      throw new Error(
+        `WebView2 ignores HKCU policy for ${tokenIntegrity.integrity_level}-integrity hosts, and HKLM policy was unavailable: ${hklmError instanceof Error ? hklmError.message : String(hklmError ?? "unknown")}`,
+      );
+    }
+    const policy = {
+      descriptor,
+      arguments: argumentsPolicy,
+      user_data: userDataPolicy,
+      token_integrity: tokenIntegrity,
+    };
+    evidence?.event("webview2_debug_policy_configured", {
+      scope,
+      registry_path: descriptor.registry_path,
+      value_name: descriptor.value_name,
+      argument: descriptor.argument,
+      user_data_registry_path: descriptor.user_data_registry_path,
+      user_data_folder: userDataFolder,
+      arguments_key_preexisted: argumentsPolicy.key_existed,
+      arguments_value_preexisted: argumentsPolicy.value_existed,
+      user_data_key_preexisted: userDataPolicy.key_existed,
+      user_data_value_preexisted: userDataPolicy.value_existed,
+      hklm_fallback_error: hklmError instanceof Error ? hklmError.message : null,
+      token_integrity: tokenIntegrity,
+    });
+    return policy;
+  }
+  throw new Error("WebView2 policy configuration exhausted all supported scopes");
+}
+
+function restoreWebviewDebugPolicy(policy, evidence) {
+  if (!policy) return;
+  try {
+    restoreWebviewPolicyValues([policy.user_data, policy.arguments]);
+  } catch (error) {
+    evidence?.event("webview2_debug_policy_restore_failed", {
+      registry_path: policy.descriptor?.registry_path ?? null,
+      value_name: policy.descriptor?.value_name ?? null,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+  evidence?.event("webview2_debug_policy_restored", {
+    scope: policy.descriptor?.scope ?? null,
+    registry_path: policy.descriptor?.registry_path ?? null,
+    value_name: policy.descriptor?.value_name ?? null,
+    user_data_registry_path: policy.descriptor?.user_data_registry_path ?? null,
+  });
+}
+
 function installBootstrap(installer, evidence) {
   evidence.event("bootstrap_install_started", { installer, arguments: ["/S"] });
   const result = spawnSync(installer, ["/S"], {
@@ -1899,7 +2265,13 @@ async function webviewTargets(port) {
   throw new Error(`WebView2 CDP endpoint unavailable on port ${port} (${errors.join("; ")})`);
 }
 
-async function connectAppWebview(port, excludedTargetId = null, timeoutMs = APP_START_TIMEOUT_MS, evidence = null) {
+async function connectAppWebview(
+  port,
+  excludedTargetId = null,
+  timeoutMs = APP_START_TIMEOUT_MS,
+  evidence = null,
+  executable = null,
+) {
   const deadline = Date.now() + timeoutMs;
   const startedAt = Date.now();
   let attempts = 0;
@@ -1946,6 +2318,11 @@ async function connectAppWebview(port, excludedTargetId = null, timeoutMs = APP_
     last_targets: lastTargets,
     last_error: lastError instanceof Error ? lastError.message : String(lastError ?? "none"),
   };
+  if (executable !== null) {
+    const processDiagnostics = collectWebviewDiagnostics(executable, port);
+    evidence?.event("webview2_process_diagnostics", processDiagnostics);
+    diagnostics.process_diagnostics = processDiagnostics;
+  }
   evidence?.event("webview2_observation_failed", diagnostics);
   throw new Error(`Open Aria Bridge WebView2 target was not observable: ${JSON.stringify(diagnostics)}`);
 }
@@ -2160,13 +2537,19 @@ async function runAcceptance({ root, config, version, baselineRoot, candidateRoo
   let newProcess;
   let controlled;
   let webviewUserDataFolder;
+  let webviewDebugPolicy;
+  let tokenIntegrity;
+  let acceptanceError;
+  let acceptanceResult;
+  let cleanupError;
   try {
     evidence.set("runner", {
       platform: process.platform,
       arch: process.arch,
       node: process.version,
       os_release: os.release(),
-      webview2_automation: "Chrome DevTools Protocol over WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+      webview2_automation: "Chrome DevTools Protocol over executable-scoped WebView2 registry policy",
+      webview2_registry_policy_preference: ["HKLM", "HKCU"],
     });
     evidence.event("pre_publish_baseline_artifact_verified", {
       captured_at: baseline.captured_at,
@@ -2207,16 +2590,50 @@ async function runAcceptance({ root, config, version, baselineRoot, candidateRoo
     // guarantees that this run's remote-debugging argument is applied instead
     // of being ignored by a browser process left by another application/run.
     webviewUserDataFolder = createWebviewAutomationProfile();
+    tokenIntegrity = windowsTokenIntegrity();
+    evidence.event("windows_process_integrity_observed", tokenIntegrity);
+    webviewDebugPolicy = configureWebviewDebugPolicy(
+      installedBootstrap.executable,
+      debugPort,
+      webviewUserDataFolder,
+      tokenIntegrity,
+      evidence,
+    );
     const appEnvironment = {
       ...process.env,
-      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${debugPort}`,
-      WEBVIEW2_USER_DATA_FOLDER: webviewUserDataFolder,
       NO_PROXY: "github.com,127.0.0.1,localhost",
       no_proxy: "github.com,127.0.0.1,localhost",
     };
-    for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]) {
+    for (const name of [
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "all_proxy",
+      "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER",
+      "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+      "WEBVIEW2_RELEASE_CHANNEL_PREFERENCE",
+      "WEBVIEW2_CHANNEL_SEARCH_KIND",
+      "WEBVIEW2_RELEASE_CHANNELS",
+      "WEBVIEW2_USER_DATA_FOLDER",
+      "WEBVIEW2_WAIT_FOR_SCRIPT_DEBUGGER",
+      "WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER",
+    ]) {
       delete appEnvironment[name];
     }
+    evidence.event("webview2_debug_environment_overrides_removed", {
+      variables: [
+        "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER",
+        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+        "WEBVIEW2_RELEASE_CHANNEL_PREFERENCE",
+        "WEBVIEW2_CHANNEL_SEARCH_KIND",
+        "WEBVIEW2_RELEASE_CHANNELS",
+        "WEBVIEW2_USER_DATA_FOLDER",
+        "WEBVIEW2_WAIT_FOR_SCRIPT_DEBUGGER",
+        "WEBVIEW2_PIPE_FOR_SCRIPT_DEBUGGER",
+      ],
+    });
     oldProcess = spawn(installedBootstrap.executable, [], {
       env: appEnvironment,
       stdio: "ignore",
@@ -2235,7 +2652,13 @@ async function runAcceptance({ root, config, version, baselineRoot, candidateRoo
       webview2_user_data_folder: webviewUserDataFolder,
     });
 
-    const oldWebview = await connectAppWebview(debugPort, null, APP_START_TIMEOUT_MS, evidence);
+    const oldWebview = await connectAppWebview(
+      debugPort,
+      null,
+      APP_START_TIMEOUT_MS,
+      evidence,
+      installedBootstrap.executable,
+    );
     oldClient = oldWebview.client;
     evidence.event("bootstrap_webview_attached", {
       target_id: oldWebview.target.id,
@@ -2356,7 +2779,13 @@ async function runAcceptance({ root, config, version, baselineRoot, candidateRoo
 
     oldClient.close();
     oldClient = null;
-    const newWebview = await connectAppWebview(debugPort, oldWebview.target.id, APP_START_TIMEOUT_MS, evidence);
+    const newWebview = await connectAppWebview(
+      debugPort,
+      oldWebview.target.id,
+      APP_START_TIMEOUT_MS,
+      evidence,
+      installedBootstrap.executable,
+    );
     const newClient = newWebview.client;
     try {
       evidence.event("target_webview_attached", {
@@ -2422,10 +2851,10 @@ async function runAcceptance({ root, config, version, baselineRoot, candidateRoo
     restoreControlledEnvironment(controlled.tls, controlled.hosts, evidence);
     controlled.cleaned = true;
     evidence.pass();
-    return evidence.value;
+    acceptanceResult = evidence.value;
   } catch (error) {
+    acceptanceError = error;
     evidence.fail(error);
-    throw error;
   } finally {
     oldClient?.close();
     const pids = [oldProcess?.pid, newProcess?.pid].filter((pid) => Number.isInteger(pid));
@@ -2443,12 +2872,40 @@ async function runAcceptance({ root, config, version, baselineRoot, candidateRoo
         timeout: 15_000,
       });
     }
+    const cleanupErrors = [];
     try {
       if (controlled?.cleaned !== true) restoreControlledEnvironment(controlled?.tls, controlled?.hosts, evidence);
-    } finally {
-      removeWebviewAutomationProfile(webviewUserDataFolder, evidence);
+    } catch (error) {
+      cleanupErrors.push(error);
     }
+    try {
+      restoreWebviewDebugPolicy(webviewDebugPolicy, evidence);
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    removeWebviewAutomationProfile(webviewUserDataFolder, evidence);
+    cleanupError =
+      cleanupErrors.length > 1
+        ? new AggregateError(
+            cleanupErrors,
+            `Windows updater acceptance cleanup failed in ${cleanupErrors.length} steps`,
+          )
+        : cleanupErrors[0];
   }
+  if (acceptanceError && cleanupError) {
+    const combined = new AggregateError(
+      [acceptanceError, cleanupError],
+      `Windows updater acceptance failed (${acceptanceError instanceof Error ? acceptanceError.message : String(acceptanceError)}); cleanup also failed (${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)})`,
+    );
+    evidence.fail(combined);
+    throw combined;
+  }
+  if (acceptanceError) throw acceptanceError;
+  if (cleanupError) {
+    evidence.fail(cleanupError);
+    throw cleanupError;
+  }
+  return acceptanceResult;
 }
 
 async function main(argv) {

@@ -16,6 +16,8 @@ import {
   validateDispatchPreflight,
   validateTargetRelease,
   validateVersionOnlyUpgrade,
+  webviewDebugPolicyDescriptor,
+  webviewDebugPolicyValueName,
 } from "./windows-updater-acceptance.mjs";
 import { normalizedAssetPins, releaseAssetUrl, validateReleaseAssetUrl } from "./desktop-release-commit-point.mjs";
 import { resolveControlledRequest, validateControlledServerPlan } from "./windows-controlled-update-server.mjs";
@@ -323,6 +325,32 @@ test("acceptance declares the 0.1.6 hardened baseline and 0.1.7 formal second ho
   const changedClosure = JSON.parse(readFileSync(path.join(ROOT, "scripts/windows-updater-acceptance.json"), "utf8"));
   changedClosure.legacy_bootstrap.canonical_closure.published_at = "2026-08-28T11:03:13Z";
   assert.throws(() => validateAcceptanceConfig(changedClosure), /closure tuple digest is inconsistent/);
+});
+
+test("WebView2 debug policy targets only the installed executable and selected port", () => {
+  assert.equal(
+    webviewDebugPolicyValueName("C:\\Users\\runneradmin\\AppData\\Local\\Open Aria Bridge\\ylx-transfer.exe"),
+    "ylx-transfer.exe",
+  );
+  assert.deepEqual(
+    webviewDebugPolicyDescriptor("C:\\Users\\runneradmin\\AppData\\Local\\Open Aria Bridge\\ylx-transfer.exe", 54128),
+    {
+      registry_path: "HKCU:\\Software\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments",
+      registry_root_path: "HKCU:\\Software\\Policies\\Microsoft\\Edge\\WebView2",
+      registry_subkey: "Software\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments",
+      scope: "HKCU",
+      user_data_registry_path: "HKCU:\\Software\\Policies\\Microsoft\\Edge\\WebView2\\UserDataFolder",
+      user_data_registry_subkey: "Software\\Policies\\Microsoft\\Edge\\WebView2\\UserDataFolder",
+      value_name: "ylx-transfer.exe",
+      argument: "--remote-debugging-port=54128",
+    },
+  );
+  assert.equal(
+    webviewDebugPolicyDescriptor("ylx-transfer.exe", 54128, "HKLM").registry_path,
+    "HKLM:\\Software\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments",
+  );
+  assert.throws(() => webviewDebugPolicyDescriptor("ylx-transfer.exe", 0), /debug port is invalid/);
+  assert.throws(() => webviewDebugPolicyValueName("ylx-transfer"), /executable name is invalid/);
 });
 
 test("acceptance harness can fetch only the captured baseline executable", () => {
