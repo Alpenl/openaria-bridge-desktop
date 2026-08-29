@@ -488,8 +488,7 @@ async function fetchPublicReleaseHistory(config, targetVersion, fetchPolicy) {
   const publicReleases = [];
   for (let page = 1; page <= 20; page += 1) {
     const url = `https://api.github.com/repos/${config.repository}/releases?per_page=100&page=${page}`;
-    const pageBytes = await fetchBytes(url, `public Release history page ${page}`, fetchPolicy, "history-metadata");
-    const releases = parseJson(pageBytes, `public Release history page ${page}`);
+    const releases = await authenticatedGithubJson(url, `public Release history page ${page}`);
     invariant(Array.isArray(releases), "public Release history page is not an array");
     for (const release of releases) {
       if (release.draft === false && typeof release.published_at === "string") {
@@ -830,13 +829,10 @@ async function capturePrePublishBaseline({ root, config, targetVersion, outputRo
   });
   const allowLegacyBootstrap = dispatchPreflight.allow_legacy_baseline_bootstrap;
   const metadataPolicy = { config, targetVersion };
-  const latestReleaseBytes = await fetchBytes(
+  const release = await authenticatedGithubJson(
     `https://api.github.com/repos/${config.repository}/releases/latest`,
-    "anonymous latest Release metadata",
-    metadataPolicy,
-    "bootstrap-metadata",
+    "latest Release metadata",
   );
-  const release = parseJson(latestReleaseBytes, "anonymous latest Release metadata");
   invariant(release.draft === false && release.prerelease === false, "latest Release is not public and stable");
   const history = await fetchPublicReleaseHistory(config, targetVersion, metadataPolicy);
   const latestHistoryMatches = history.manifests.filter((entry) => entry.release_id === release.id);
@@ -860,11 +856,10 @@ async function capturePrePublishBaseline({ root, config, targetVersion, outputRo
   const fetchPolicy = { config, targetVersion, bootstrapUrl };
   const tagApi = `https://api.github.com/repos/${config.repository}/git/ref/tags/${baselineVersion}`;
   const signatureUrl = `${bootstrapUrl}.sig`;
-  const [tagBytes, signatureBytes] = await Promise.all([
-    fetchBytes(tagApi, "anonymous bootstrap tag metadata", fetchPolicy, "bootstrap-metadata"),
+  const [tagRef, signatureBytes] = await Promise.all([
+    authenticatedGithubJson(tagApi, "bootstrap tag metadata"),
     fetchBytes(signatureUrl, "anonymous bootstrap signature", fetchPolicy, "bootstrap-signature"),
   ]);
-  const tagRef = parseJson(tagBytes, "anonymous bootstrap tag metadata");
   const validated = validateBootstrapRelease({
     config,
     targetVersion,
