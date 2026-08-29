@@ -271,10 +271,18 @@ test("Release is staged, accepted through the old production updater, then publi
   assert.match(draft, /--output release-candidate/);
   assert.match(acceptance, /needs:[^]*release-draft/);
   assert.match(acceptance, /runs-on: windows-latest/);
+  assert.match(
+    acceptance,
+    /permissions:\n {6}contents: write/,
+    "GitHub only exposes draft Releases to tokens with push access; the acceptance job must be able to recheck the owned numeric draft",
+  );
+  assert.match(acceptance, /persist-credentials: false/);
   assert.match(acceptance, /windows-updater-acceptance\.mjs accept/);
   assert.match(acceptance, /--candidate release-candidate/);
   assert.match(acceptance, /--ownership release-candidate\/release-ownership\.json/);
   assert.match(acceptance, /Install unchanged public baseline and update through its production updater/);
+  const acceptanceClient = readFileSync(path.resolve(import.meta.dirname, "windows-updater-acceptance.mjs"), "utf8");
+  assert.doesNotMatch(acceptanceClient, /method:\s*["'](?:POST|PATCH|PUT|DELETE)["']/);
   assert.match(publication, /needs:[^]*windows-updater-acceptance/);
   assert.match(publication, /desktop-release-commit-point\.mjs publish/);
   assert.match(publication, /--request-log windows-updater-acceptance\/controlled-update-server-log\.json/);
