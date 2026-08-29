@@ -1,7 +1,16 @@
 import { Buffer } from "node:buffer";
 import { createHash, randomBytes } from "node:crypto";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -1385,7 +1394,7 @@ async function recheckRemotePrepublishState({ config, baseline, candidate }) {
 
 function runPowerShell(script, label) {
   const result = spawnSync(
-    "powershell.exe",
+    "pwsh.exe",
     ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
     { encoding: "utf8", windowsHide: true, timeout: 60_000 },
   );
@@ -1398,6 +1407,17 @@ function powershellLiteral(value) {
   return `'${value.replaceAll("'", "''")}'`;
 }
 
+function certificateProviderSetup() {
+  return String.raw`
+if (-not (Get-PSDrive -Name Cert -ErrorAction SilentlyContinue)) {
+  New-PSDrive -Name Cert -PSProvider Certificate -Root '\' -Scope Script | Out-Null
+}
+if (-not (Test-Path -LiteralPath "Cert:\CurrentUser")) {
+  throw "The current-user Windows certificate store is unavailable."
+}
+`;
+}
+
 function configureControlledTls(evidence) {
   const tlsRoot = mkdtempSync(path.join(os.tmpdir(), "openaria-controlled-tls-"));
   const pfx = path.join(tlsRoot, "github.com.pfx");
@@ -1406,8 +1426,14 @@ function configureControlledTls(evidence) {
   const passphrase = randomBytes(24).toString("hex");
   writeFileSync(passphraseFile, passphrase);
   const resultFile = path.join(tlsRoot, "certificate-installation.json");
+  const phaseFile = path.join(tlsRoot, "certificate-installation.phase");
   const source = String.raw`
 $ErrorActionPreference = "Stop"
+function Set-ControlledTlsPhase([string]$phase) {
+  [IO.File]::WriteAllText(${powershellLiteral(phaseFile)}, $phase, [Text.UTF8Encoding]::new($false))
+}
+${certificateProviderSetup()}
+Set-ControlledTlsPhase "certificate_provider_ready"
 $caParams = @{
   Type = "Custom"
   Subject = "CN=OpenAria Desktop Release Acceptance Root"
@@ -1422,6 +1448,7 @@ $caParams = @{
   TextExtension = @("2.5.29.19={critical}{text}ca=1&pathlength=0")
 }
 $ca = New-SelfSignedCertificate @caParams
+Set-ControlledTlsPhase "root_certificate_created"
 $serverParams = @{
   Type = "Custom"
   Subject = "CN=github.com"
@@ -1438,19 +1465,32 @@ $serverParams = @{
   TextExtension = @("2.5.29.19={critical}{text}ca=0", "2.5.29.37={text}1.3.6.1.5.5.7.3.1")
 }
 $server = New-SelfSignedCertificate @serverParams
+Set-ControlledTlsPhase "server_certificate_created"
 $password = ConvertTo-SecureString -String ${powershellLiteral(passphrase)} -Force -AsPlainText
 Export-Certificate -Cert $ca -FilePath ${powershellLiteral(ca)} -Type CERT | Out-Null
-$trusted = Import-Certificate -FilePath ${powershellLiteral(ca)} -CertStoreLocation "Cert:\CurrentUser\Root"
-Export-PfxCertificate -Cert $server -FilePath ${powershellLiteral(pfx)} -Password $password -ChainOption BuildChain | Out-Null
+Set-ControlledTlsPhase "root_certificate_exported"
+$certutilOutput = & certutil.exe -f -addstore Root ${powershellLiteral(ca)} 2>&1
+if ($LASTEXITCODE -ne 0) {
+  throw "certutil failed to trust the controlled updater root: $($certutilOutput -join [Environment]::NewLine)"
+}
+Set-ControlledTlsPhase "root_certificate_trusted"
+Export-PfxCertificate -Cert $server -FilePath ${powershellLiteral(pfx)} -Password $password -ChainOption EndEntityCertOnly | Out-Null
+Set-ControlledTlsPhase "server_pfx_exported"
 [pscustomobject]@{
   ca_thumbprint = $ca.Thumbprint
-  trusted_thumbprint = $trusted.Thumbprint
+  trusted_thumbprint = $ca.Thumbprint
   server_thumbprint = $server.Thumbprint
   dns_name = "github.com"
   not_after = $server.NotAfter.ToUniversalTime().ToString("o")
 } | ConvertTo-Json -Compress | Set-Content -LiteralPath ${powershellLiteral(resultFile)} -Encoding utf8NoBOM
+Set-ControlledTlsPhase "metadata_written"
 `;
-  runPowerShell(source, "create and trust controlled updater TLS certificate");
+  try {
+    runPowerShell(source, "create and trust controlled updater TLS certificate");
+  } catch (error) {
+    const phase = existsSync(phaseFile) ? readFileSync(phaseFile, "utf8").trim() : "not_started";
+    throw new Error(`${error.message}; controlled TLS phase: ${phase}`, { cause: error });
+  }
   const certificate = JSON.parse(readFileSync(resultFile, "utf8"));
   evidence.event("controlled_tls_certificate_trusted", certificate);
   return { tlsRoot, pfx, ca, passphraseFile, certificate };
@@ -1494,17 +1534,49 @@ ipconfig /flushdns | Out-Null
   if (tls?.certificate) {
     const source = String.raw`
 $ErrorActionPreference = "Stop"
-foreach ($item in @(
-  "Cert:\CurrentUser\Root\${tls.certificate.trusted_thumbprint}",
-  "Cert:\CurrentUser\My\${tls.certificate.server_thumbprint}",
-  "Cert:\CurrentUser\My\${tls.certificate.ca_thumbprint}"
+${certificateProviderSetup()}
+$certutilOutput = & certutil.exe -delstore Root ${powershellLiteral(tls.certificate.trusted_thumbprint)} 2>&1
+if ($LASTEXITCODE -ne 0) {
+  throw "certutil failed to remove the controlled updater root: $($certutilOutput -join [Environment]::NewLine)"
+}
+foreach ($thumbprint in @(
+  "${tls.certificate.server_thumbprint}",
+  "${tls.certificate.ca_thumbprint}"
 )) {
-  if (Test-Path -LiteralPath $item) { Remove-Item -LiteralPath $item -Force }
+  $certutilOutput = & certutil.exe -user -delstore My $thumbprint 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    throw "certutil failed to remove a controlled updater private certificate: $($certutilOutput -join [Environment]::NewLine)"
+  }
 }
 `;
     runPowerShell(source, "remove controlled updater TLS certificates");
     evidence?.event("controlled_tls_certificate_removed");
   }
+}
+
+export function smokeControlledTls() {
+  invariant(process.platform === "win32", "controlled TLS smoke requires Windows");
+  const events = [];
+  const evidence = {
+    event(name, value) {
+      events.push({ name, value: value ?? null });
+    },
+  };
+  let tls;
+  try {
+    tls = configureControlledTls(evidence);
+    invariant(existsSync(tls.pfx) && statSync(tls.pfx).size > 0, "controlled TLS smoke did not export a PFX");
+    invariant(existsSync(tls.ca) && statSync(tls.ca).size > 0, "controlled TLS smoke did not export a CA certificate");
+  } finally {
+    restoreControlledEnvironment(tls, undefined, evidence);
+  }
+  const result = {
+    schema: "openaria.desktop.controlled-tls-smoke.v1",
+    certificate: tls.certificate,
+    events,
+  };
+  rmSync(tls.tlsRoot, { recursive: true, force: true });
+  return result;
 }
 
 async function startControlledUpdateServer({ root, config, version, candidate, outputRoot, evidence }) {
@@ -2352,6 +2424,12 @@ async function main(argv) {
         ownershipFile: path.resolve(required(values, "ownership")),
         outputRoot,
       });
+      return;
+    }
+    if (command === "smoke-controlled-tls") {
+      const result = smokeControlledTls();
+      writeFileSync(path.join(outputRoot, "controlled-tls-smoke.json"), `${JSON.stringify(result, null, 2)}\n`);
+      console.log(JSON.stringify(result));
       return;
     }
     throw new Error(`unknown Windows updater acceptance command ${JSON.stringify(command)}`);
