@@ -16,8 +16,10 @@ import {
 import {
   draftOwnershipMarker,
   observedTargetTag,
+  releaseAssetUrl,
   validateAcceptance,
   validateCandidateStartState,
+  validateReleaseAssetUrl,
   validateReleaseRunIdentity,
 } from "./desktop-release-commit-point.mjs";
 
@@ -417,6 +419,13 @@ test("irreversible publication verifies the exact controlled-server request log"
   };
 
   assert.equal(validateAcceptance(receipt, ownership, requestLogBytes), receipt);
+
+  const draftUrlReceipt = JSON.parse(JSON.stringify(receipt));
+  draftUrlReceipt.candidate.assets = draftUrlReceipt.candidate.assets.map((asset) => ({
+    ...asset,
+    browser_download_url: `https://github.com/${REPOSITORY}/releases/download/untagged-820a80450dde06c5eeccf9/${asset.name}`,
+  }));
+  assert.equal(validateAcceptance(draftUrlReceipt, ownership, requestLogBytes), draftUrlReceipt);
   assert.throws(
     () => validateAcceptance(receipt, ownership, Buffer.concat([requestLogBytes, Buffer.from(" ")])),
     /request log exact-byte binding changed/,
@@ -433,6 +442,34 @@ test("irreversible publication verifies the exact controlled-server request log"
   assert.throws(
     () => validateAcceptance(wrongPathReceipt, ownership, wrongPathBytes),
     /does not bind the exact candidate manifest/,
+  );
+});
+
+test("draft URL normalization accepts only GitHub untagged slugs and formalizes published paths", () => {
+  const name = `OpenAriaBridge_${VERSION}_windows_x86_64-setup.exe`;
+  const formal = releaseAssetUrl(REPOSITORY, VERSION, name);
+  const draft = `https://github.com/${REPOSITORY}/releases/download/untagged-820a80450dde06c5eeccf9/${name}`;
+  assert.deepEqual(validateReleaseAssetUrl(formal, { repository: REPOSITORY, version: VERSION, name }), {
+    kind: "formal",
+    url: formal,
+  });
+  assert.equal(
+    validateReleaseAssetUrl(draft, { repository: REPOSITORY, version: VERSION, name, expectedDraft: true }).kind,
+    "draft",
+  );
+  assert.throws(
+    () => validateReleaseAssetUrl(draft, { repository: REPOSITORY, version: VERSION, name, expectedDraft: false }),
+    /formal tag URL/,
+  );
+  assert.throws(
+    () =>
+      validateReleaseAssetUrl(`https://github.com/${REPOSITORY}/releases/download/untagged-not-hex/${name}`, {
+        repository: REPOSITORY,
+        version: VERSION,
+        name,
+        expectedDraft: true,
+      }),
+    /untagged GitHub draft URL/,
   );
 });
 

@@ -8,6 +8,7 @@ import path from "node:path";
 import { clearTimeout, setTimeout } from "node:timers";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { normalizedAssetPins, releaseAssetUrl, validateReleaseAssetUrl } from "./desktop-release-commit-point.mjs";
 import { validateControlledServerPlan } from "./windows-controlled-update-server.mjs";
 
 const NUMERIC_SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
@@ -89,12 +90,6 @@ function canonicalReleaseClosure(release) {
 
 function canonicalReleaseClosureSha256(release) {
   return sha256(Buffer.from(JSON.stringify(canonicalReleaseClosure(release))));
-}
-
-function normalizedAssetPins(assets) {
-  return assets
-    .map(({ name, size, digest }) => ({ name, size, digest }))
-    .sort((left, right) => left.name.localeCompare(right.name));
 }
 
 function validateMinisignDocument(value, label) {
@@ -252,11 +247,12 @@ export function validateBootstrapRelease({
     invariant(asset.state === undefined || asset.state === "uploaded", `${name} is not uploaded`);
     invariant(Number.isSafeInteger(asset.size) && asset.size > 0, `${name} published size is invalid`);
     invariant(/^sha256:[a-f0-9]{64}$/.test(asset.digest), `${name} GitHub digest is invalid`);
-    invariant(
-      asset.browser_download_url ===
-        `https://github.com/${config.repository}/releases/download/${baselineVersion}/${name}`,
-      `${name} URL is inconsistent with the baseline tag`,
-    );
+    validateReleaseAssetUrl(asset.browser_download_url, {
+      repository: config.repository,
+      version: baselineVersion,
+      name,
+      expectedDraft: false,
+    });
   }
   invariant(signatureBytes.length === signatureAsset.size, "downloaded bootstrap signature size differs from GitHub");
   invariant(
@@ -373,10 +369,12 @@ export function validateTargetRelease({
       typeof asset.digest === "string" && /^sha256:[a-f0-9]{64}$/.test(asset.digest),
       `${name} GitHub digest is invalid`,
     );
-    invariant(
-      asset.browser_download_url === `https://github.com/${config.repository}/releases/download/${version}/${name}`,
-      `${name} download URL is inconsistent with the Release tag`,
-    );
+    validateReleaseAssetUrl(asset.browser_download_url, {
+      repository: config.repository,
+      version,
+      name,
+      expectedDraft,
+    });
   }
   invariant(latestAsset.size === manifestBytes.length, "latest.json GitHub size differs from anonymous bytes");
   invariant(
@@ -394,7 +392,7 @@ export function validateTargetRelease({
     "setup signature GitHub digest differs from anonymous bytes",
   );
 
-  const expectedUrl = `https://github.com/${config.repository}/releases/download/${version}/${names.setup}`;
+  const expectedUrl = releaseAssetUrl(config.repository, version, names.setup);
   const platform = manifest.platforms[WINDOWS_PLATFORM];
   invariant(platform.url === expectedUrl, `latest.json installer URL ${platform.url} != ${expectedUrl}`);
   const manifestSignature = validateMinisignDocument(platform.signature, "latest.json signature");
@@ -1271,18 +1269,22 @@ export function validateNeverPublicCandidate({ config, version, candidateRoot, o
     expectedDraft: true,
   });
   invariant(validated.release_id === ownership.release_id, "validated candidate Release ID changed");
-  const expectedAssets = ownership.assets
-    .map(({ name, size, digest, browser_download_url }) => ({
-      name,
-      bytes: size,
-      digest,
-      url: browser_download_url,
-    }))
-    .sort((left, right) => left.name.localeCompare(right.name));
-  const validatedAssets = [...validated.release_assets].sort((left, right) => left.name.localeCompare(right.name));
+  for (const asset of ownership.assets ?? []) {
+    validateReleaseAssetUrl(asset.browser_download_url, {
+      repository: config.repository,
+      version,
+      name: asset.name,
+      expectedDraft: true,
+    });
+  }
+  const expectedAssets = normalizedAssetPins(ownership.assets, "ownership asset pins");
+  const validatedAssets = normalizedAssetPins(
+    validated.release_assets.map(({ name, bytes: size, digest }) => ({ name, size, digest })),
+    "validated candidate asset pins",
+  );
   invariant(
     JSON.stringify(validatedAssets) === JSON.stringify(expectedAssets),
-    "candidate asset closure differs from ownership",
+    "candidate asset pins differ from ownership",
   );
 
   const installer = path.join(candidateRoot, names.setup);
@@ -1346,9 +1348,28 @@ async function recheckRemotePrepublishState({ config, baseline, candidate }) {
       draft.body.includes(candidate.ownership.draft_ownership_marker),
     "candidate is no longer the owned never-public numeric draft",
   );
+  for (const asset of draft.assets ?? []) {
+    validateReleaseAssetUrl(asset.browser_download_url, {
+      repository: config.repository,
+      version: candidate.ownership.target_version,
+      name: asset.name,
+      expectedDraft: true,
+    });
+  }
+  for (const asset of candidate.release.assets ?? []) {
+    validateReleaseAssetUrl(asset.browser_download_url, {
+      repository: config.repository,
+      version: candidate.ownership.target_version,
+      name: asset.name,
+      expectedDraft: true,
+    });
+  }
+  const releaseStateFields = ["draft", "id", "immutable", "prerelease", "published_at", "tag_name"];
   invariant(
-    JSON.stringify(canonicalReleaseClosure(draft)) === JSON.stringify(canonicalReleaseClosure(candidate.release)),
-    "candidate draft asset closure changed before Windows updater acceptance",
+    releaseStateFields.every((field) => draft[field] === candidate.release[field]) &&
+      JSON.stringify(normalizedAssetPins(draft.assets, "remote candidate asset pins")) ===
+        JSON.stringify(normalizedAssetPins(candidate.release.assets, "captured candidate asset pins")),
+    "candidate draft identity or asset pins changed before Windows updater acceptance",
   );
   const observedTargetTag = targetTag === null ? null : { commit: targetTag.object?.sha, type: targetTag.object?.type };
   invariant(

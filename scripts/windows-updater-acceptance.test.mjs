@@ -17,6 +17,7 @@ import {
   validateTargetRelease,
   validateVersionOnlyUpgrade,
 } from "./windows-updater-acceptance.mjs";
+import { normalizedAssetPins, releaseAssetUrl, validateReleaseAssetUrl } from "./desktop-release-commit-point.mjs";
 import { resolveControlledRequest, validateControlledServerPlan } from "./windows-controlled-update-server.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -456,6 +457,73 @@ test("target metadata binds latest.json, signature, checksums and exact GitHub a
         },
       }),
     /exactly the six Windows updater assets/,
+  );
+});
+
+test("never-public draft accepts GitHub untagged asset URLs but keeps formal updater URLs", () => {
+  const fixture = targetFixture();
+  const draftSlug = "untagged-820a80450dde06c5eeccf9";
+  const draft = {
+    ...fixture.release,
+    draft: true,
+    immutable: false,
+    published_at: null,
+    assets: fixture.release.assets.map((asset) => ({
+      ...asset,
+      browser_download_url: `https://github.com/${CONFIG.repository}/releases/download/${draftSlug}/${asset.name}`,
+    })),
+  };
+
+  assert.doesNotThrow(() =>
+    validateReleaseAssetUrl(draft.assets[0].browser_download_url, {
+      repository: CONFIG.repository,
+      version: TARGET_VERSION,
+      name: draft.assets[0].name,
+      expectedDraft: true,
+    }),
+  );
+  assert.doesNotThrow(() =>
+    validateReleaseAssetUrl(releaseAssetUrl(CONFIG.repository, TARGET_VERSION, draft.assets[0].name), {
+      repository: CONFIG.repository,
+      version: TARGET_VERSION,
+      name: draft.assets[0].name,
+      expectedDraft: true,
+    }),
+  );
+  assert.throws(
+    () =>
+      validateReleaseAssetUrl(draft.assets[0].browser_download_url, {
+        repository: CONFIG.repository,
+        version: TARGET_VERSION,
+        name: draft.assets[0].name,
+        expectedDraft: false,
+      }),
+    /formal tag URL/,
+  );
+
+  const validated = validateTargetRelease({
+    config: CONFIG,
+    ...fixture,
+    release: draft,
+    expectedDraft: true,
+  });
+  assert.equal(validated.setup.url, releaseAssetUrl(CONFIG.repository, TARGET_VERSION, names(TARGET_VERSION).setup));
+  assert.deepEqual(normalizedAssetPins(draft.assets), normalizedAssetPins(fixture.release.assets));
+
+  const malformed = {
+    ...draft,
+    assets: draft.assets.map((asset, index) =>
+      index === 0
+        ? {
+            ...asset,
+            browser_download_url: `https://github.com/${CONFIG.repository}/releases/download/not-a-draft/${asset.name}`,
+          }
+        : asset,
+    ),
+  };
+  assert.throws(
+    () => validateTargetRelease({ config: CONFIG, ...fixture, release: malformed, expectedDraft: true }),
+    /download URL/,
   );
 });
 

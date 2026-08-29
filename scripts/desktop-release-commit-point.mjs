@@ -12,6 +12,7 @@ const EXPECTED_REPOSITORY = "Alpenl/openaria-bridge-desktop";
 const EXPECTED_ASSET_COUNT = 6;
 const POSTVERIFY_ATTEMPTS = 20;
 const LEGACY_BASELINE_CLOSURE_SHA256 = "f8e432c016f570421caee8e3f253df8c94f323e45a0cf7296c98b8a956a00007";
+const DRAFT_DOWNLOAD_SLUG = /^untagged-[0-9a-f]{8,64}$/;
 
 function invariant(condition, message) {
   if (!condition) throw new Error(message);
@@ -70,6 +71,49 @@ export function observedTargetTag(tag, commit) {
     "GitHub created an unexpected target tag while creating the numeric draft",
   );
   return { commit: tag.object.sha, type: tag.object.type };
+}
+
+export function releaseAssetUrl(repository, version, name) {
+  invariant(
+    typeof repository === "string" && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository),
+    "Release repository is invalid",
+  );
+  numericVersion(version, "Release asset version");
+  invariant(typeof name === "string" && name.length > 0 && !name.includes("/"), "Release asset name is invalid");
+  return `https://github.com/${repository}/releases/download/${version}/${name}`;
+}
+
+export function validateReleaseAssetUrl(url, { repository, version, name, expectedDraft = false }) {
+  const formalUrl = releaseAssetUrl(repository, version, name);
+  invariant(typeof url === "string" && url.length > 0, `${name} download URL is missing`);
+  if (url === formalUrl) return { kind: "formal", url: formalUrl };
+
+  invariant(expectedDraft === true, `${name} download URL must use the formal tag URL after publication`);
+  const prefix = `https://github.com/${repository}/releases/download/`;
+  invariant(url.startsWith(prefix), `${name} draft download URL is not a GitHub repository URL`);
+  const suffix = url.slice(prefix.length);
+  const separator = suffix.indexOf("/");
+  const slug = separator === -1 ? "" : suffix.slice(0, separator);
+  const assetName = separator === -1 ? "" : suffix.slice(separator + 1);
+  invariant(
+    DRAFT_DOWNLOAD_SLUG.test(slug) && assetName === name,
+    `${name} draft download URL must use an untagged GitHub draft URL`,
+  );
+  return { kind: "draft", slug, url };
+}
+
+export function normalizedAssetPins(assets, label = "asset pins") {
+  invariant(Array.isArray(assets), `${label} must be an array`);
+  const pins = assets.map((asset, index) => {
+    invariant(asset !== null && typeof asset === "object", `${label} entry ${index} is invalid`);
+    const { name, size, digest } = asset;
+    invariant(typeof name === "string" && name.length > 0, `${label} entry ${index} name is invalid`);
+    invariant(Number.isSafeInteger(size) && size > 0, `${label} ${name} size is invalid`);
+    invariant(typeof digest === "string" && /^sha256:[a-f0-9]{64}$/.test(digest), `${label} ${name} digest is invalid`);
+    return { name, size, digest };
+  });
+  invariant(new Set(pins.map((asset) => asset.name)).size === pins.length, `${label} contain duplicate names`);
+  return pins.sort((left, right) => left.name.localeCompare(right.name));
 }
 
 export function canonicalAssets(release) {
@@ -333,10 +377,12 @@ async function prepareDraft(values) {
     const remote = remoteAssets.find((candidate) => candidate.name === asset.name);
     invariant(remote !== undefined, `draft lacks ${asset.name}`);
     invariant(remote.size === asset.size && remote.digest === asset.digest, `draft ${asset.name} bytes changed`);
-    invariant(
-      remote.browser_download_url === `https://github.com/${repository}/releases/download/${version}/${asset.name}`,
-      `draft ${asset.name} future public URL changed`,
-    );
+    validateReleaseAssetUrl(remote.browser_download_url, {
+      repository,
+      version,
+      name: asset.name,
+      expectedDraft: true,
+    });
   }
   const targetTagAfterDraft = observedTargetTag(
     await api.optional(`/repos/${repository}/git/ref/tags/${version}`),
@@ -402,9 +448,29 @@ export function validateAcceptance(receipt, ownership, requestLogBytes) {
   );
   invariant(
     receipt.candidate?.release_id === ownership.release_id &&
-      receipt.candidate?.target_commit === ownership.target_commit &&
-      JSON.stringify(receipt.candidate?.assets) === JSON.stringify(ownership.assets),
-    "acceptance candidate identity or asset closure changed",
+      receipt.candidate?.target_commit === ownership.target_commit,
+    "acceptance candidate identity changed",
+  );
+  const acceptanceAssets = receipt.candidate?.assets;
+  for (const asset of ownership.assets ?? []) {
+    validateReleaseAssetUrl(asset.browser_download_url, {
+      repository: ownership.repository,
+      version: ownership.target_version,
+      name: asset.name,
+      expectedDraft: true,
+    });
+  }
+  for (const asset of acceptanceAssets ?? []) {
+    validateReleaseAssetUrl(asset.browser_download_url, {
+      repository: ownership.repository,
+      version: ownership.target_version,
+      name: asset.name,
+      expectedDraft: true,
+    });
+  }
+  invariant(
+    JSON.stringify(normalizedAssetPins(acceptanceAssets)) === JSON.stringify(normalizedAssetPins(ownership.assets)),
+    "acceptance candidate asset pins changed",
   );
   invariant(receipt.browser_or_manual_download_used === false, "acceptance used a browser or manual download");
   invariant(receipt.target_installer_downloaded_by_harness === false, "acceptance harness downloaded the installer");
@@ -510,9 +576,18 @@ async function verifyPublishState(api, ownership) {
     tag.object?.type === "commit" && tag.object.sha === ownership.target_commit,
     "published tag commit changed",
   );
+  const publishedAssets = canonicalAssets(release);
+  for (const asset of publishedAssets) {
+    validateReleaseAssetUrl(asset.browser_download_url, {
+      repository,
+      version: ownership.target_version,
+      name: asset.name,
+      expectedDraft: false,
+    });
+  }
   invariant(
-    JSON.stringify(canonicalAssets(release)) === JSON.stringify(ownership.assets),
-    "published assets differ from ownership",
+    JSON.stringify(normalizedAssetPins(publishedAssets)) === JSON.stringify(normalizedAssetPins(ownership.assets)),
+    "published asset pins differ from ownership",
   );
   return { release, latest, tag };
 }
@@ -565,9 +640,18 @@ async function publish(values) {
     releaseId: ownership.release_id,
     ownershipMarker: ownership.draft_ownership_marker,
   });
+  const draftAssets = canonicalAssets(before);
+  for (const asset of draftAssets) {
+    validateReleaseAssetUrl(asset.browser_download_url, {
+      repository: ownership.repository,
+      version: ownership.target_version,
+      name: asset.name,
+      expectedDraft: true,
+    });
+  }
   invariant(
-    JSON.stringify(canonicalAssets(before)) === JSON.stringify(ownership.assets),
-    "candidate assets changed after acceptance",
+    JSON.stringify(normalizedAssetPins(draftAssets)) === JSON.stringify(normalizedAssetPins(ownership.assets)),
+    "candidate asset pins changed after acceptance",
   );
   const targetTagBeforePublish = observedTargetTag(
     await api.optional(`/repos/${ownership.repository}/git/ref/tags/${ownership.target_version}`),
