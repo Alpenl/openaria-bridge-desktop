@@ -2920,6 +2920,9 @@ fn read_ledger(conn: &Connection, job_id: &str) -> Result<Vec<FileLedgerEntry>, 
     Ok(rows)
 }
 
+#[cfg(feature = "performance-benchmark")]
+pub mod performance;
+
 #[cfg(test)]
 mod tests {
     use std::ffi::{c_char, c_void};

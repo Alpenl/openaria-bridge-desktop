@@ -9,6 +9,11 @@ description = "YLX Transfer PC core domain/persistence crate — no Tauri, reqwe
 name = "ylx_transfer_core"
 path = "src/lib.rs"
 
+[[bin]]
+name = "session-refresh-benchmark"
+path = "src/bin/session_refresh_benchmark.rs"
+required-features = ["performance-benchmark"]
+
 [features]
 # Exposes `library::download_contract` (the shared `DownloadSource`
 # contract suite) to *dependent* crates' test builds — `ylx-transfer-
@@ -20,6 +25,9 @@ test-support = []
 # dependants' integration tests. Off by default; never enabled in a
 # production build.
 testing = []
+# Deterministic, synthetic scale harness for Score #32. The benchmark is an
+# explicit developer/CI target and is never linked into the desktop product.
+performance-benchmark = []
 
 [dependencies]
 serde = { workspace = true }
