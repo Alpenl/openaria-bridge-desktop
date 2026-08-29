@@ -20,6 +20,11 @@ import type {
   PairingTickPayload,
   RpcError,
   SaveStorageConfigInput,
+  SessionCatalogAuthority,
+  SessionCatalogDiagnostic,
+  SessionCapabilities,
+  SessionPaginationUnavailableReason,
+  SessionPageView,
   SessionView,
   StorageConfig,
   Transfer,
@@ -56,6 +61,16 @@ export type BackendEvent =
       readonly revision: number;
       readonly deviceId: string;
       readonly sessions: SessionView[];
+      /** Optional only for in-process compatibility events. Production IPC
+       * decoding requires all four fields; absence fails closed in state. */
+      readonly catalogRevision?: string | null;
+      readonly nextCursor?: string | null;
+      readonly hasMore?: boolean;
+      readonly catalogAuthority?: SessionCatalogAuthority;
+      readonly paginationSupported?: boolean;
+      readonly paginationUnavailableReason?: SessionPaginationUnavailableReason | null;
+      readonly capabilities?: SessionCapabilities;
+      readonly diagnostics?: SessionCatalogDiagnostic[];
     }
   | { readonly kind: "library"; readonly revision: number; readonly library: LibraryEntry[] }
   | { readonly kind: "transfers"; readonly revision: number; readonly transfers: Transfer[] }
@@ -112,7 +127,17 @@ export interface TransferBackend {
   readSnapshot(): Promise<Revisioned<BackendSnapshot>>;
 
   listDevices(): Promise<Revisioned<Device[]>>;
-  listSessions(deviceId: DeviceId): Promise<Revisioned<SessionView[]>>;
+  listSessions(
+    deviceId: DeviceId,
+    cursor?: string | null,
+    catalogRevision?: string | null,
+  ): Promise<Revisioned<SessionPageView>>;
+  getSessionDetail(
+    deviceId: DeviceId,
+    sessionId: SessionId,
+    sessionRevision: string,
+    catalogRevision: string | null,
+  ): Promise<Revisioned<SessionView>>;
   listLibrary(): Promise<Revisioned<LibraryEntry[]>>;
   listTransfers(): Promise<Revisioned<Transfer[]>>;
   getStorageConfig(): Promise<Revisioned<StorageConfig>>;
@@ -135,7 +160,6 @@ export interface TransferBackend {
     deviceId: DeviceId,
     sessionIds: readonly SessionId[],
   ): Promise<JobDispatch<SessionId, DownloadJobId>>;
-  downloadFile(deviceId: DeviceId, sessionId: SessionId, fileId: FileId): Promise<DownloadJobId>;
   uploadEntry(key: LibraryKey): Promise<UploadJobId>;
   uploadEntries(keys: readonly LibraryKey[]): Promise<JobDispatch<LibraryKey, UploadJobId>>;
 

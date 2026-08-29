@@ -18,7 +18,7 @@ ylx-transfer-core = { path = "crates/ylx-transfer-core" }
 
 [package]
 name = "ylx-transfer"
-version = "0.1.0"
+version = "0.1.6"
 description = "Open Aria Bridge desktop client for verified recording import and publication"
 authors = ["Alpenl"]
 edition.workspace = true
@@ -54,6 +54,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+jsonschema = { version = "0.50", default-features = false }
 sha2 = { workspace = true }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 rand = { version = "0.8", optional = true }
@@ -68,6 +69,12 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 
 [dev-dependencies]
+# Composition tests sign an exact lab-v4 compatibility publication before
+# exercising the real local derived-media boundary. The adapter already uses
+# this same Ring version at runtime, so this only makes the signing API
+# available to the root crate's test build.
+ring = "0.17"
+
 # Startup failpoint tests need an independent SQLite connection to hold a
 # transaction or mutate a durable row while the production connection is
 # executing reconciliation. Keep this test-only; production code uses typed

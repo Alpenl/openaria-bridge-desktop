@@ -31,6 +31,14 @@ function session(id: string): SessionView {
     files: [],
     downloadStatus: "none",
     backedUp: false,
+    verification: {
+      verdict: "usable",
+      actor: "gateway",
+      validator: { name: "catalog-validator", version: "1", buildSha256: "b".repeat(64) },
+      manifestSha256: "a".repeat(64),
+      verifiedAt: "2026-08-03T00:00:01Z",
+      diagnostics: [],
+    },
   };
 }
 
@@ -96,7 +104,7 @@ test("discover, pair, browse, download and converge — driven only by the runti
     key: "device:sessions:YLX-A",
     run: () => backend.listSessions(asDeviceId("YLX-A")),
     commit: ({ revision, value }) =>
-      store.commit({ type: "sessions/loaded", revision, deviceId: "YLX-A", sessions: value }),
+      store.commit({ type: "sessions/pageLoaded", revision, deviceId: "YLX-A", page: value, mode: "replace" }),
   });
   assert.deepEqual(
     sessionsOf(store.getState(), "YLX-A")?.map((s) => s.id),

@@ -1,0 +1,17 @@
+{
+  "schema": "ylx.device-api-consumer-support.v1",
+  "consumer": "openaria-bridge-desktop",
+  "supported_device_api_majors": [4],
+  "unknown_major_policy": "fail_closed",
+  "required_contracts": [
+    {
+      "major": 4,
+      "path": "openapi/ylx-device-v4.openapi.yaml",
+      "sha256": "b6f3c677c038e55c03581c587973811b0aa2dc91cfb8b602a95128fbac225827",
+      "bytes": 124739,
+      "info_version": "4.0.0",
+      "server_base_path": "/api/v4",
+      "lifecycle": "current"
+    }
+  ]
+}

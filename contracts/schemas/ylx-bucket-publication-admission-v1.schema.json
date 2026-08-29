@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ylx:schema:bucket-publication-admission:v1",
+  "title": "YLX Bucket Publication Admission v1",
+  "description": "Closed object-store acknowledgement emitted by Studio only after evaluating one exact Bucket Publication v4 marker. Desktop treats only an exact admitted acknowledgement as publication complete.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "admission_id",
+    "publication_id",
+    "publication_schema",
+    "marker",
+    "consumer",
+    "admission_object_key",
+    "admitted_at",
+    "verdict",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema": {"const": "ylx.bucket-publication-admission.v1"},
+    "admission_id": {"$ref": "#/$defs/uuidV7"},
+    "publication_id": {"$ref": "#/$defs/uuidV7"},
+    "publication_schema": {"const": "ylx.bucket-publication.v4"},
+    "marker": {"$ref": "#/$defs/markerReference"},
+    "consumer": {"$ref": "#/$defs/consumer"},
+    "admission_object_key": {"$ref": "#/$defs/admissionObjectKey"},
+    "admitted_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Time at which the consumer completed this admission decision, including a rejected decision."
+    },
+    "verdict": {"enum": ["admitted", "rejected"]},
+    "diagnostics": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {"$ref": "#/$defs/diagnostic"}
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["verdict"],
+        "properties": {"verdict": {"const": "admitted"}}
+      },
+      "then": {
+        "properties": {"diagnostics": {"maxItems": 0}}
+      }
+    },
+    {
+      "if": {
+        "required": ["verdict"],
+        "properties": {"verdict": {"const": "rejected"}}
+      },
+      "then": {
+        "properties": {"diagnostics": {"minItems": 1}}
+      }
+    }
+  ],
+  "$defs": {
+    "uuidV7": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "markerObjectKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*[\\u0000-\\u001f\\u007f-\\u009f])(?!.*(?:^|/)\\.{1,2}(?:/|$)).+/__ylx_evidence__/publication\\.json$"
+    },
+    "admissionObjectKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*[\\u0000-\\u001f\\u007f-\\u009f])(?!.*(?:^|/)\\.{1,2}(?:/|$)).+/__ylx_evidence__/admission-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.json$"
+    },
+    "markerReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["object_key", "bytes", "sha256"],
+      "properties": {
+        "object_key": {"$ref": "#/$defs/markerObjectKey"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "consumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "build"],
+      "properties": {
+        "name": {"const": "egoview-console"},
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z.-]+)?$"
+        },
+        "build": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["commit", "artifact_sha256"],
+          "properties": {
+            "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "artifact_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        }
+      }
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "summary"],
+      "properties": {
+        "code": {
+          "enum": [
+            "unsupported_publication",
+            "marker_readback_mismatch",
+            "publication_invalid",
+            "source_manifest_invalid",
+            "derived_media_receipt_invalid",
+            "derived_output_invalid",
+            "timeline_verification_failed",
+            "provenance_invalid",
+            "object_readback_mismatch",
+            "index_write_failed"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[ -~]+$"
+        }
+      }
+    }
+  }
+}

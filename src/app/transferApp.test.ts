@@ -9,12 +9,13 @@ import { createTransferApp } from "./transferApp";
 import type { AppUpdater, AppUpdateProgress, PendingAppUpdate } from "../runtime/appUpdater";
 import { createFakeClock } from "../runtime/clock";
 import { createMemoryBackend, memoryTransferJob } from "../runtime/memoryBackend";
-import type { AppState } from "../runtime/reducer";
+import { sessionCatalogOf, sessionDetailStateOf, sessionsOf, type AppState } from "../runtime/reducer";
 import type { TraySelection } from "../ui/traySelector";
 import type { FrameScheduler } from "../ui/renderScheduler";
 import { asDeviceId, asLibraryKey, asSessionId } from "../ids";
-import type { LibraryEntry, SessionView, StorageConfig } from "../types";
-import { BackendError } from "../runtime/backend";
+import { deviceRowKey } from "../store";
+import type { LibraryEntry, RpcError, SessionView, StorageConfig } from "../types";
+import { BackendError, type TransferBackend } from "../runtime/backend";
 import { asCandidateId, asDerivedId, asMediaId, asPipelineId, asSourceId } from "../runtime/media/ids";
 import { createMemoryMediaBackend } from "../runtime/media/memoryBackend";
 import type { MediaLibraryEntryProjection, MediaScanSnapshot, PipelineSession } from "../runtime/media/types";
@@ -126,6 +127,10 @@ function createRecordedView(): RecordedView {
   };
 }
 
+function latestUpdateModel(recorded: RecordedView): AppUpdateViewModel | undefined {
+  return recorded.updateModels[recorded.updateModels.length - 1];
+}
+
 async function until(predicate: () => boolean): Promise<void> {
   for (let count = 0; count < 100; count += 1) {
     if (predicate()) return;
@@ -142,6 +147,22 @@ async function untilTask(predicate: () => boolean): Promise<void> {
   throw new Error("timed out waiting for controller task");
 }
 
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+  reject(error: unknown): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolvePromise!: (value: T) => void;
+  let rejectPromise!: (error: unknown) => void;
+  const promise = new Promise<T>((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+  });
+  return { promise, resolve: resolvePromise, reject: rejectPromise };
+}
+
 function session(id: string): SessionView {
   return {
     id,
@@ -154,6 +175,14 @@ function session(id: string): SessionView {
     files: [],
     downloadStatus: "none",
     backedUp: false,
+    verification: {
+      verdict: "usable",
+      actor: "gateway",
+      validator: { name: "catalog-validator", version: "1", buildSha256: "b".repeat(64) },
+      manifestSha256: "a".repeat(64),
+      verifiedAt: "2026-08-03T00:00:01Z",
+      diagnostics: [],
+    },
   };
 }
 
@@ -175,13 +204,20 @@ function libraryEntry(deviceId: string, sessionId: string, deviceDisplayId = DIS
 }
 
 class FakePendingUpdate implements PendingAppUpdate {
-  readonly currentVersion = "0.1.0";
-  readonly version = "0.2.0";
+  readonly currentVersion: string;
+  readonly version: string;
   readonly date = "2026-08-27T00:00:00Z";
   readonly body = "Bridge update";
   closed = false;
+  downloads = 0;
+
+  constructor(version = "0.2.0", currentVersion = "0.1.0") {
+    this.version = version;
+    this.currentVersion = currentVersion;
+  }
 
   async downloadAndInstall(onProgress: (progress: AppUpdateProgress) => void): Promise<void> {
+    this.downloads += 1;
     onProgress({ downloadedBytes: 128, totalBytes: 256 });
     onProgress({ downloadedBytes: 256, totalBytes: 256 });
   }
@@ -432,7 +468,8 @@ test("media configure-storage action opens the existing storage settings", async
 
 test("application updater checks, downloads, installs and relaunches from the settings modal", async () => {
   const recorded = createRecordedView();
-  const updater = fakeUpdater(new FakePendingUpdate());
+  const updaterUpdate = new FakePendingUpdate();
+  const updater = fakeUpdater(updaterUpdate);
   const app = createTransferApp({
     backend: createMemoryBackend(),
     clock: createFakeClock(),
@@ -454,6 +491,248 @@ test("application updater checks, downloads, installs and relaunches from the se
 
     assert.ok(recorded.updateModels.some((model) => model.progressLabel === "50% · 128 B / 256 B"));
     assert.ok(recorded.updateModels.some((model) => model.message === "更新已安装，正在重启"));
+    assert.equal(updaterUpdate.closed, true);
+  } finally {
+    app.dispose();
+  }
+});
+
+test("application updater atomically coalesces rapid checks and installs", async () => {
+  const recorded = createRecordedView();
+  const checkResult = deferred<PendingAppUpdate | null>();
+  const update = new FakePendingUpdate();
+  let checks = 0;
+  const updater: AppUpdater = {
+    currentVersion: async () => "0.1.0",
+    check: () => {
+      checks += 1;
+      return checkResult.promise;
+    },
+    relaunch: async () => {},
+  };
+  const app = createTransferApp({
+    backend: createMemoryBackend(),
+    clock: createFakeClock(),
+    toast: () => {},
+    updater,
+    view: () => recorded.appView,
+  });
+
+  try {
+    await app.start();
+    app.dispatch({ kind: "updates/check" });
+    app.dispatch({ kind: "updates/check" });
+    assert.equal(latestUpdateModel(recorded)?.checking, true);
+    await until(() => checks === 1);
+
+    checkResult.resolve(update);
+    await until(() => latestUpdateModel(recorded)?.canInstall === true);
+    app.dispatch({ kind: "updates/install" });
+    app.dispatch({ kind: "updates/install" });
+    await until(() => update.closed);
+    assert.equal(update.downloads, 1);
+  } finally {
+    app.dispose();
+  }
+});
+
+test("application updater keeps an active install owned when its modal closes", async () => {
+  class BlockingPendingUpdate extends FakePendingUpdate {
+    private readonly completion: Promise<void>;
+
+    constructor(completion: Promise<void>) {
+      super();
+      this.completion = completion;
+    }
+
+    override async downloadAndInstall(onProgress: (progress: AppUpdateProgress) => void): Promise<void> {
+      this.downloads += 1;
+      onProgress({ downloadedBytes: 128, totalBytes: 256 });
+      await this.completion;
+    }
+  }
+
+  const recorded = createRecordedView();
+  const completion = deferred<void>();
+  const update = new BlockingPendingUpdate(completion.promise);
+  let checks = 0;
+  let relaunches = 0;
+  const updater: AppUpdater = {
+    currentVersion: async () => "0.1.0",
+    check: async () => {
+      checks += 1;
+      return update;
+    },
+    relaunch: async () => {
+      relaunches += 1;
+    },
+  };
+  const app = createTransferApp({
+    backend: createMemoryBackend(),
+    clock: createFakeClock(),
+    toast: () => {},
+    updater,
+    view: () => recorded.appView,
+  });
+
+  try {
+    await app.start();
+    app.dispatch({ kind: "updates/check" });
+    await until(() => latestUpdateModel(recorded)?.canInstall === true);
+    app.dispatch({ kind: "updates/install" });
+    await until(() => update.downloads === 1);
+
+    app.dispatch({ kind: "updates/close" });
+    await Promise.resolve();
+    assert.equal(update.closed, false, "closing the modal must not release an active updater handle");
+
+    app.dispatch({ kind: "updates/check" });
+    await Promise.resolve();
+    assert.equal(checks, 1, "an active install must exclude a second update check");
+
+    completion.resolve();
+    await until(() => relaunches === 1);
+    assert.equal(update.closed, true, "the updater handle closes after downloadAndInstall completes");
+    assert.equal(latestUpdateModel(recorded)?.message, "更新已安装，正在重启");
+  } finally {
+    app.dispose();
+  }
+});
+
+test("application updater closes stale check results and keeps the newest generation", async () => {
+  const recorded = createRecordedView();
+  const first = deferred<PendingAppUpdate | null>();
+  const second = deferred<PendingAppUpdate | null>();
+  const staleUpdate = new FakePendingUpdate("0.2.0");
+  const currentUpdate = new FakePendingUpdate("0.3.0");
+  let checks = 0;
+  const updater: AppUpdater = {
+    currentVersion: async () => "0.1.0",
+    check: () => {
+      const result = checks === 0 ? first.promise : second.promise;
+      checks += 1;
+      return result;
+    },
+    relaunch: async () => {},
+  };
+  const app = createTransferApp({
+    backend: createMemoryBackend(),
+    clock: createFakeClock(),
+    toast: () => {},
+    updater,
+    view: () => recorded.appView,
+  });
+
+  try {
+    await app.start();
+    app.dispatch({ kind: "updates/check" });
+    await until(() => checks === 1);
+    app.dispatch({ kind: "updates/close" });
+    app.dispatch({ kind: "updates/check" });
+    await until(() => checks === 2);
+
+    second.resolve(currentUpdate);
+    await until(() => latestUpdateModel(recorded)?.availableVersion === "0.3.0");
+    first.resolve(staleUpdate);
+    await until(() => staleUpdate.closed);
+    assert.equal(latestUpdateModel(recorded)?.availableVersion, "0.3.0");
+    assert.equal(currentUpdate.closed, false);
+  } finally {
+    app.dispose();
+  }
+  await until(() => currentUpdate.closed);
+});
+
+test("application updater closes a handle returned after app disposal without repainting", async () => {
+  const recorded = createRecordedView();
+  const checkResult = deferred<PendingAppUpdate | null>();
+  const lateUpdate = new FakePendingUpdate();
+  let checks = 0;
+  const updater: AppUpdater = {
+    currentVersion: async () => "0.1.0",
+    check: () => {
+      checks += 1;
+      return checkResult.promise;
+    },
+    relaunch: async () => {},
+  };
+  const app = createTransferApp({
+    backend: createMemoryBackend(),
+    clock: createFakeClock(),
+    toast: () => {},
+    updater,
+    view: () => recorded.appView,
+  });
+
+  await app.start();
+  app.dispatch({ kind: "updates/check" });
+  await until(() => checks === 1);
+  const paintsBeforeDispose = recorded.updateModels.length;
+  app.dispose();
+  checkResult.resolve(lateUpdate);
+  await until(() => lateUpdate.closed);
+  assert.equal(recorded.updateModels.length, paintsBeforeDispose);
+});
+
+test("application updater treats missing metadata as a source failure, not current", async () => {
+  const recorded = createRecordedView();
+  const toasts: string[] = [];
+  const updater: AppUpdater = {
+    currentVersion: async () => "0.1.0",
+    check: async () => {
+      throw new Error("Download request failed with status: 404 NotFound");
+    },
+    relaunch: async () => {},
+  };
+  const app = createTransferApp({
+    backend: createMemoryBackend(),
+    clock: createFakeClock(),
+    toast: (message) => toasts.push(message),
+    updater,
+    view: () => recorded.appView,
+  });
+
+  try {
+    await app.start();
+    app.dispatch({ kind: "updates/check" });
+    await until(() => latestUpdateModel(recorded)?.error?.includes("HTTP 404") === true);
+    assert.equal(latestUpdateModel(recorded)?.checked, false);
+    assert.ok(latestUpdateModel(recorded)?.message !== "已是最新版本");
+    assert.ok(toasts.some((message) => message.includes("更新源文件不存在")));
+  } finally {
+    app.dispose();
+  }
+});
+
+test("application updater surfaces signature verification failure and permits a normal retry", async () => {
+  class SignatureFailureUpdate extends FakePendingUpdate {
+    override async downloadAndInstall(): Promise<void> {
+      this.downloads += 1;
+      throw new Error("updater signature verification failed");
+    }
+  }
+
+  const recorded = createRecordedView();
+  const update = new SignatureFailureUpdate();
+  const updater = fakeUpdater(update);
+  const app = createTransferApp({
+    backend: createMemoryBackend(),
+    clock: createFakeClock(),
+    toast: () => {},
+    updater,
+    view: () => recorded.appView,
+  });
+
+  try {
+    await app.start();
+    app.dispatch({ kind: "updates/check" });
+    await until(() => latestUpdateModel(recorded)?.canInstall === true);
+    app.dispatch({ kind: "updates/install" });
+    await until(() => latestUpdateModel(recorded)?.error?.includes("更新签名验证失败") === true);
+    assert.equal(latestUpdateModel(recorded)?.canCheck, true);
+
+    app.dispatch({ kind: "updates/check" });
+    await until(() => update.closed);
   } finally {
     app.dispose();
   }
@@ -1051,6 +1330,11 @@ test("the application controller carries a paired session through download, tray
     // same command a real device-screen click would produce.
     app.dispatch({ kind: "session/download", deviceId, sessionId });
     await until(() => backend.callNames().includes("downloadSession"));
+    const detailCallIndex = backend.callNames().indexOf("getSessionDetail");
+    const downloadCallIndex = backend.callNames().indexOf("downloadSession");
+    assert.ok(detailCallIndex >= 0 && detailCallIndex < downloadCallIndex, "detail must be fenced before download");
+    const detailCall = backend.calls[detailCallIndex];
+    assert.deepEqual(detailCall?.args, [deviceId, sessionId, "r1", `memory-catalog:${DEVICE_A}:1`]);
     const downloadCall = backend.calls.find((call) => call.name === "downloadSession");
     assert.deepEqual(downloadCall?.args, [deviceId, sessionId]);
 
@@ -1225,9 +1509,16 @@ test("session mutation operation errors remain visible and structured without be
   }
 });
 
-test("summary-only device sessions never call destructive deletion commands", async () => {
+test("Lab v4 never calls destructive commands even when contradictory flags claim support", async () => {
   const backend = createMemoryBackend({ snapshot: { devices: [device(DEVICE_A)] } });
   backend.setSessions(DEVICE_A, [session("s1")]);
+  backend.setSessionCapabilities(DEVICE_A, {
+    profile: "labHttpV4",
+    sessionDeletion: { supported: true, source: "deviceDescriptor" },
+    sessionDetail: { supported: true, source: "profileContract" },
+    artifactDownload: { supported: true, source: "profileContract" },
+    captureStatus: { supported: true, source: "profileContract" },
+  });
   const toasts: Array<{ message: string; tone: string }> = [];
   const app = createTransferApp({
     backend,
@@ -1241,6 +1532,9 @@ test("summary-only device sessions never call destructive deletion commands", as
     app.dispatch({ kind: "device/select", deviceId: asDeviceId(DEVICE_A) });
     await untilTask(() => backend.calls.some((call) => call.name === "listSessions" && call.args[0] === DEVICE_A));
     await until(() => app.store.getState().sessions.get(DEVICE_A)?.value?.length === 1);
+
+    app.dispatch({ kind: "session/download", deviceId: asDeviceId(DEVICE_A), sessionId: asSessionId("s1") });
+    await untilTask(() => backend.callNames().includes("downloadSession"));
 
     app.dispatch({ kind: "session/remove", deviceId: asDeviceId(DEVICE_A), sessionId: asSessionId("s1") });
     app.dispatch({ kind: "session/remove", deviceId: asDeviceId(DEVICE_A), sessionId: asSessionId("s1") });
@@ -1259,11 +1553,596 @@ test("summary-only device sessions never call destructive deletion commands", as
     assert.ok(!backend.callNames().includes("deleteSessions"));
     assert.ok(!backend.callNames().includes("cleanupBackedUp"));
     assert.ok(!backend.callNames().includes("previewDownloadedCleanup"));
+    assert.ok(backend.callNames().includes("downloadSession"));
     assert.ok(
       toasts.some(
         (toast) => toast.tone === "danger" && toast.message.includes("Device API v4 契约不支持删除设备端会话"),
       ),
     );
+  } finally {
+    app.dispose();
+  }
+});
+
+test("the application backend contract has no selected-file lane for any device profile", () => {
+  const backend = createMemoryBackend();
+  assert.equal(Object.prototype.hasOwnProperty.call(backend, "downloadFile"), false);
+});
+
+test("rows without eligible gateway verification never reach detail or download commands", async () => {
+  const usable = session("usable-template").verification!;
+  const rows: SessionView[] = [
+    { ...session("missing"), verification: null },
+    {
+      ...session("unusable"),
+      verification: {
+        ...usable,
+        verdict: "unusable",
+        diagnostics: [{ code: "verification_failed", summary: "gateway rejected publication" }],
+      },
+    },
+    {
+      ...session("malformed"),
+      verification: { ...usable, verdict: "usable", manifestSha256: "NOT-A-DIGEST" },
+    },
+  ];
+  const backend = createMemoryBackend({ snapshot: { devices: [device(DEVICE_A)] } });
+  backend.setSessions(DEVICE_A, rows);
+  const toasts: Array<{ message: string; tone: string }> = [];
+  const app = createTransferApp({
+    backend,
+    clock: createFakeClock(),
+    toast: (message, tone) => toasts.push({ message, tone }),
+    view: () => createRecordedView().appView,
+  });
+
+  try {
+    await app.start();
+    await untilTask(() => sessionsOf(app.store.getState(), DEVICE_A)?.length === rows.length);
+    for (const row of rows) {
+      app.dispatch({
+        kind: "session/download",
+        deviceId: asDeviceId(DEVICE_A),
+        sessionId: asSessionId(row.id),
+      });
+      app.dispatch({ kind: "list/select", scope: "device", key: row.id, selected: true });
+    }
+    const missingRowKey = deviceRowKey(DEVICE_A, "missing");
+    app.dispatch({ kind: "list/toggleRow", scope: "device", rowKey: missingRowKey });
+    app.dispatch({
+      kind: "session/loadDetail",
+      deviceId: asDeviceId(DEVICE_A),
+      sessionId: asSessionId("missing"),
+    });
+    app.dispatch({ kind: "list/bulkAction", scope: "device" });
+    app.dispatch({ kind: "device/downloadAllNew", deviceId: asDeviceId(DEVICE_A) });
+
+    await untilTask(() => toasts.length >= 5);
+    assert.ok(!backend.callNames().includes("getSessionDetail"));
+    assert.ok(!backend.callNames().includes("downloadSession"));
+    assert.ok(!backend.callNames().includes("downloadSessions"));
+    assert.ok(toasts.some((toast) => toast.message.includes("未通过网关验证")));
+    assert.ok(toasts.some((toast) => toast.message.includes("没有已验证的新数据")));
+  } finally {
+    app.dispose();
+  }
+});
+
+test("a fresh detail whose manifest evidence changed cannot proceed to download", async () => {
+  const summary = session("s1");
+  const backend = createMemoryBackend({ snapshot: { devices: [device(DEVICE_A)] } });
+  backend.setSessions(DEVICE_A, [summary]);
+  backend.hold("getSessionDetail");
+  const toasts: Array<{ message: string; tone: string }> = [];
+  const app = createTransferApp({
+    backend,
+    clock: createFakeClock(),
+    toast: (message, tone) => toasts.push({ message, tone }),
+    view: () => createRecordedView().appView,
+  });
+
+  try {
+    await app.start();
+    await untilTask(() => sessionsOf(app.store.getState(), DEVICE_A)?.length === 1);
+    app.dispatch({
+      kind: "session/download",
+      deviceId: asDeviceId(DEVICE_A),
+      sessionId: asSessionId("s1"),
+    });
+    await untilTask(() => backend.pending("getSessionDetail") === 1);
+    backend.release("getSessionDetail", {
+      ...summary,
+      verification: { ...summary.verification!, manifestSha256: "d".repeat(64) },
+      files: [{ fileId: "f1", displayPath: "video/left.mp4", bytes: 1, sha256: "d".repeat(64) }],
+    });
+    await untilTask(() => backend.pending("getSessionDetail") === 0);
+    await untilTask(() => toasts.some((toast) => toast.message.includes("验证证据已变化")));
+
+    assert.ok(!backend.callNames().includes("downloadSession"));
+    assert.equal(sessionDetailStateOf(app.store.getState(), DEVICE_A, "s1")?.loading, false);
+    assert.ok(sessionDetailStateOf(app.store.getState(), DEVICE_A, "s1")?.error?.includes("验证证据已变化"));
+  } finally {
+    app.dispose();
+  }
+});
+
+test("device navigation reaches 200 sessions through explicit load-more actions", async () => {
+  const backend = createMemoryBackend({ snapshot: { devices: [device(DEVICE_A)] } });
+  backend.setSessions(
+    DEVICE_A,
+    Array.from({ length: 200 }, (_unused, index) => ({
+      ...session(`session-${index}`),
+      dateLabel: new Date(Date.parse("2026-08-03T00:00:00Z") - index * 1_000).toISOString(),
+    })),
+  );
+  let sessionReadRevision = 0;
+  const appBackend = {
+    ...backend,
+    async listSessions(...args: Parameters<TransferBackend["listSessions"]>) {
+      const loaded = await backend.listSessions(...args);
+      return { ...loaded, revision: (sessionReadRevision += 1) };
+    },
+  } satisfies TransferBackend;
+  const app = createTransferApp({
+    backend: appBackend,
+    clock: createFakeClock(),
+    toast: () => {},
+    view: () => createRecordedView().appView,
+  });
+
+  try {
+    await app.start();
+    await untilTask(() => (sessionsOf(app.store.getState(), DEVICE_A)?.length ?? 0) === 50);
+    for (const expected of [100, 150, 200]) {
+      app.dispatch({ kind: "device/loadMoreSessions", deviceId: asDeviceId(DEVICE_A) });
+      await untilTask(() => (sessionsOf(app.store.getState(), DEVICE_A)?.length ?? 0) === expected);
+    }
+
+    assert.equal(sessionCatalogOf(app.store.getState(), DEVICE_A).hasMore, false);
+    assert.equal(new Set(sessionsOf(app.store.getState(), DEVICE_A)?.map((item) => item.id)).size, 200);
+    assert.equal(backend.calls.filter((call) => call.name === "listSessions").length, 4);
+  } finally {
+    app.dispose();
+  }
+});
+
+test("revisionless v2 sessions open verified detail but never request load more", async () => {
+  const memory = createMemoryBackend({ snapshot: { devices: [device(DEVICE_A)] } });
+  const summary = session("session-v2");
+  let listCalls = 0;
+  let detailCatalogRevision: string | null | undefined;
+  const backend: TransferBackend = {
+    ...memory,
+    async listSessions() {
+      listCalls += 1;
+      return {
+        revision: listCalls,
+        value: {
+          items: [summary],
+          nextCursor: null,
+          hasMore: false,
+          catalogRevision: null,
+          catalogAuthority: "unavailable",
+          paginationSupported: false,
+          paginationUnavailableReason: "catalogRevisionUnavailable",
+          capabilities: {
+            profile: "labHttpV4",
+            sessionDeletion: { supported: false, source: "profileContract" },
+            sessionDetail: { supported: true, source: "profileContract" },
+            artifactDownload: { supported: true, source: "deviceDescriptor" },
+            captureStatus: { supported: true, source: "profileContract" },
+          },
+          diagnostics: [],
+        },
+      };
+    },
+    async getSessionDetail(_deviceId, _sessionId, _sessionRevision, catalogRevision) {
+      detailCatalogRevision = catalogRevision;
+      return {
+        revision: 2,
+        value: {
+          ...summary,
+          files: [{ fileId: "f1", displayPath: "video/left.mp4", bytes: 10, sha256: "c".repeat(64) }],
+        },
+      };
+    },
+  };
+  const app = createTransferApp({
+    backend,
+    clock: createFakeClock(),
+    toast: () => {},
+    view: () => createRecordedView().appView,
+  });
+
+  try {
+    await app.start();
+    await untilTask(() => sessionsOf(app.store.getState(), DEVICE_A)?.length === 1);
+    assert.equal(sessionCatalogOf(app.store.getState(), DEVICE_A).catalogRevision, null);
+
+    app.dispatch({ kind: "device/loadMoreSessions", deviceId: asDeviceId(DEVICE_A) });
+    await Promise.resolve();
+    assert.equal(listCalls, 1);
+
+    app.dispatch({
+      kind: "list/toggleRow",
+      scope: "device",
+      rowKey: deviceRowKey(DEVICE_A, summary.id),
+    });
+    app.dispatch({
+      kind: "session/loadDetail",
+      deviceId: asDeviceId(DEVICE_A),
+      sessionId: asSessionId(summary.id),
+    });
+    await untilTask(() => sessionsOf(app.store.getState(), DEVICE_A)?.[0]?.files.length === 1);
+    assert.equal(detailCatalogRevision, null);
+  } finally {
+    app.dispose();
+  }
+});
+
+test("device switch invalidates late load-more and detail responses", async () => {
+  const backend = createMemoryBackend({ snapshot: { devices: [device(DEVICE_A)] } });
+  const allSessions = Array.from({ length: 80 }, (_unused, index) => session(`session-${index}`));
+  backend.setSessions(DEVICE_A, allSessions);
+  const app = createTransferApp({
+    backend,
+    clock: createFakeClock(),
+    toast: () => {},
+    view: () => createRecordedView().appView,
+  });
+
+  try {
+    await app.start();
+    await untilTask(() => (sessionsOf(app.store.getState(), DEVICE_A)?.length ?? 0) === 50);
+    const catalog = sessionCatalogOf(app.store.getState(), DEVICE_A);
+    assert.ok(catalog.nextCursor);
+
+    backend.hold("listSessions");
+    app.dispatch({ kind: "device/loadMoreSessions", deviceId: asDeviceId(DEVICE_A) });
+    await untilTask(() => backend.pending("listSessions") === 1);
+    app.dispatch({ kind: "library/open" });
+    backend.release("listSessions", {
+      items: allSessions.slice(50),
+      nextCursor: null,
+      hasMore: false,
+      catalogRevision: catalog.catalogRevision,
+      catalogAuthority: catalog.catalogAuthority,
+      paginationSupported: catalog.paginationSupported,
+      paginationUnavailableReason: catalog.paginationUnavailableReason,
+      capabilities: catalog.capabilities,
+      diagnostics: catalog.diagnostics,
+    });
+    await untilTask(() => backend.pending("listSessions") === 0);
+    assert.equal(sessionsOf(app.store.getState(), DEVICE_A)?.length, 50);
+
+    app.dispatch({ kind: "device/select", deviceId: asDeviceId(DEVICE_A) });
+    // The held mode remains active, so release the first-page focus request.
+    await untilTask(() => backend.pending("listSessions") === 1);
+    backend.release("listSessions", {
+      items: allSessions.slice(0, 50),
+      nextCursor: catalog.nextCursor,
+      hasMore: true,
+      catalogRevision: catalog.catalogRevision,
+      catalogAuthority: catalog.catalogAuthority,
+      paginationSupported: catalog.paginationSupported,
+      paginationUnavailableReason: catalog.paginationUnavailableReason,
+      capabilities: catalog.capabilities,
+      diagnostics: catalog.diagnostics,
+    });
+    await untilTask(() => backend.pending("listSessions") === 0);
+
+    backend.hold("getSessionDetail");
+    const sessionId = asSessionId("session-0");
+    const rowKey = deviceRowKey(DEVICE_A, "session-0");
+    // Use the actual action sequence emitted by DeviceScreen: open, then load.
+    app.dispatch({ kind: "list/toggleRow", scope: "device", rowKey });
+    app.dispatch({ kind: "session/loadDetail", deviceId: asDeviceId(DEVICE_A), sessionId });
+    await untilTask(() => backend.pending("getSessionDetail") === 1);
+    app.dispatch({ kind: "library/open" });
+    backend.release("getSessionDetail", {
+      ...allSessions[0],
+      files: [{ fileId: "late", displayPath: "late.mp4", bytes: 1, sha256: "a".repeat(64) }],
+    });
+    await untilTask(() => backend.pending("getSessionDetail") === 0);
+    assert.equal(sessionsOf(app.store.getState(), DEVICE_A)?.[0]?.files.length, 0);
+  } finally {
+    app.dispose();
+  }
+});
+
+test("catalog_changed load-more invalidates the old chain and reloads one fresh first page", async () => {
+  const backend = createMemoryBackend({ snapshot: { devices: [device(DEVICE_A)] } });
+  const allSessions = Array.from({ length: 80 }, (_unused, index) => ({
+    ...session(`session-${index}`),
+    dateLabel: new Date(Date.parse("2026-08-03T00:00:00Z") - index * 1_000).toISOString(),
+  }));
+  backend.setSessions(DEVICE_A, allSessions);
+  let sessionReadRevision = 0;
+  const appBackend = {
+    ...backend,
+    async listSessions(...args: Parameters<TransferBackend["listSessions"]>) {
+      const loaded = await backend.listSessions(...args);
+      return { ...loaded, revision: (sessionReadRevision += 1) };
+    },
+  } satisfies TransferBackend;
+  const app = createTransferApp({
+    backend: appBackend,
+    clock: createFakeClock(),
+    toast: () => {},
+    view: () => createRecordedView().appView,
+  });
+
+  try {
+    await app.start();
+    await untilTask(() => (sessionsOf(app.store.getState(), DEVICE_A)?.length ?? 0) === 50);
+    const oldCatalog = sessionCatalogOf(app.store.getState(), DEVICE_A);
+    assert.ok(oldCatalog.nextCursor);
+    assert.ok(oldCatalog.catalogRevision);
+
+    backend.hold("getSessionDetail");
+    const first = allSessions[0]!;
+    app.dispatch({ kind: "list/toggleRow", scope: "device", rowKey: deviceRowKey(DEVICE_A, first.id) });
+    app.dispatch({ kind: "session/loadDetail", deviceId: asDeviceId(DEVICE_A), sessionId: asSessionId(first.id) });
+    await untilTask(() => backend.pending("getSessionDetail") === 1);
+
+    backend.hold("listSessions");
+    app.dispatch({ kind: "device/loadMoreSessions", deviceId: asDeviceId(DEVICE_A) });
+    await untilTask(() => backend.pending("listSessions") === 1);
+    const newCatalogRevision = `sha256:${"d".repeat(64)}`;
+    backend.rejectHeld(
+      "listSessions",
+      new BackendError("listSessions", "The cursor belongs to an older catalog revision.", {
+        rpcError: {
+          code: "session_catalog_changed",
+          message: "The cursor belongs to an older catalog revision.",
+          retryable: true,
+          details: { catalogRevision: newCatalogRevision },
+        } as unknown as RpcError,
+      }),
+    );
+
+    await untilTask(() => backend.pending("listSessions") === 1);
+    const listCalls = backend.calls.filter((call) => call.name === "listSessions");
+    assert.equal(listCalls.length, 3, "initial page, stale load-more, then one fresh first page");
+    assert.deepEqual(listCalls[listCalls.length - 1]?.args, [DEVICE_A, null, null]);
+    assert.equal(sessionCatalogOf(app.store.getState(), DEVICE_A).catalogRevision, null);
+    assert.equal(sessionCatalogOf(app.store.getState(), DEVICE_A).nextCursor, null);
+
+    backend.release("getSessionDetail", {
+      ...first,
+      files: [{ fileId: "late", displayPath: "late.mp4", bytes: 1, sha256: "a".repeat(64) }],
+    });
+    await untilTask(() => backend.pending("getSessionDetail") === 0);
+    assert.equal(sessionsOf(app.store.getState(), DEVICE_A)?.[0]?.files.length, 0);
+
+    backend.release("listSessions", {
+      items: allSessions.slice(0, 50),
+      nextCursor: "fresh-cursor",
+      hasMore: true,
+      catalogRevision: newCatalogRevision,
+      catalogAuthority: oldCatalog.catalogAuthority,
+      paginationSupported: oldCatalog.paginationSupported,
+      paginationUnavailableReason: oldCatalog.paginationUnavailableReason,
+      capabilities: oldCatalog.capabilities,
+      diagnostics: oldCatalog.diagnostics,
+    });
+    await untilTask(() => backend.pending("listSessions") === 0);
+    await untilTask(() => sessionCatalogOf(app.store.getState(), DEVICE_A).catalogRevision === newCatalogRevision);
+    assert.equal(sessionCatalogOf(app.store.getState(), DEVICE_A).catalogRevision, newCatalogRevision);
+    assert.equal(sessionsOf(app.store.getState(), DEVICE_A)?.length, 50);
+    assert.equal(sessionsOf(app.store.getState(), DEVICE_A)?.[0]?.files.length, 0);
+    assert.equal(backend.calls.filter((call) => call.name === "listSessions").length, 3);
+  } finally {
+    app.dispose();
+  }
+});
+
+test("catalog_changed on the automatic first-page reload does not create a retry loop", async () => {
+  const backend = createMemoryBackend({ snapshot: { devices: [device(DEVICE_A)] } });
+  backend.setSessions(
+    DEVICE_A,
+    Array.from({ length: 80 }, (_unused, index) => session(`session-${index}`)),
+  );
+  const app = createTransferApp({
+    backend,
+    clock: createFakeClock(),
+    toast: () => {},
+    view: () => createRecordedView().appView,
+  });
+  const catalogChanged = new BackendError("listSessions", "catalog changed", {
+    rpcError: {
+      code: "session_catalog_changed",
+      message: "catalog changed",
+      retryable: true,
+      details: { catalogRevision: `sha256:${"e".repeat(64)}` },
+    } as unknown as RpcError,
+  });
+
+  try {
+    await app.start();
+    await untilTask(() => (sessionsOf(app.store.getState(), DEVICE_A)?.length ?? 0) === 50);
+    backend.hold("listSessions");
+    app.dispatch({ kind: "device/loadMoreSessions", deviceId: asDeviceId(DEVICE_A) });
+    await untilTask(() => backend.pending("listSessions") === 1);
+    backend.rejectHeld("listSessions", catalogChanged);
+    await untilTask(() => backend.pending("listSessions") === 1);
+    backend.rejectHeld("listSessions", catalogChanged);
+    await untilTask(() => backend.pending("listSessions") === 0);
+    await Promise.resolve();
+
+    assert.equal(backend.calls.filter((call) => call.name === "listSessions").length, 3);
+    assert.equal(sessionCatalogOf(app.store.getState(), DEVICE_A).catalogRevision, null);
+    assert.equal(app.store.getState().sessions.get(DEVICE_A)?.rpcError?.code, "session_catalog_changed");
+  } finally {
+    app.dispose();
+  }
+});
+
+test("ordinary load-more failures keep the current catalog and do not auto-refresh", async () => {
+  const backend = createMemoryBackend({ snapshot: { devices: [device(DEVICE_A)] } });
+  backend.setSessions(
+    DEVICE_A,
+    Array.from({ length: 80 }, (_unused, index) => session(`session-${index}`)),
+  );
+  const app = createTransferApp({
+    backend,
+    clock: createFakeClock(),
+    toast: () => {},
+    view: () => createRecordedView().appView,
+  });
+
+  try {
+    await app.start();
+    await untilTask(() => (sessionsOf(app.store.getState(), DEVICE_A)?.length ?? 0) === 50);
+    const before = sessionCatalogOf(app.store.getState(), DEVICE_A);
+    backend.hold("listSessions");
+    app.dispatch({ kind: "device/loadMoreSessions", deviceId: asDeviceId(DEVICE_A) });
+    await untilTask(() => backend.pending("listSessions") === 1);
+    backend.rejectHeld("listSessions", new BackendError("listSessions", "temporary network failure"));
+    await untilTask(() => sessionCatalogOf(app.store.getState(), DEVICE_A).loadingMore === false);
+    await Promise.resolve();
+
+    const after = sessionCatalogOf(app.store.getState(), DEVICE_A);
+    assert.equal(after.catalogRevision, before.catalogRevision);
+    assert.equal(after.nextCursor, before.nextCursor);
+    assert.equal(after.loadMoreError, "temporary network failure");
+    assert.equal(backend.calls.filter((call) => call.name === "listSessions").length, 2);
+  } finally {
+    app.dispose();
+  }
+});
+
+test("a rejected load-more page clears its spinner without replacing the catalog", async () => {
+  const backend = createMemoryBackend({ snapshot: { devices: [device(DEVICE_A)] } });
+  const allSessions = Array.from({ length: 80 }, (_unused, index) => ({
+    ...session(`session-${index}`),
+    dateLabel: new Date(Date.parse("2026-08-03T00:00:00Z") - index * 1_000).toISOString(),
+  }));
+  backend.setSessions(DEVICE_A, allSessions);
+  let listCalls = 0;
+  let sessionReadRevision = 0;
+  const appBackend = {
+    ...backend,
+    async listSessions(...args: Parameters<TransferBackend["listSessions"]>) {
+      const loaded = await backend.listSessions(...args);
+      listCalls += 1;
+      const revision = ++sessionReadRevision;
+      if (listCalls === 2) {
+        const first = loaded.value.items[0];
+        return {
+          ...loaded,
+          revision,
+          value: {
+            ...loaded.value,
+            items: first === undefined ? [] : [first, first],
+          },
+        };
+      }
+      return { ...loaded, revision };
+    },
+  } satisfies TransferBackend;
+  const toasts: string[] = [];
+  const app = createTransferApp({
+    backend: appBackend,
+    clock: createFakeClock(),
+    toast: (message) => toasts.push(message),
+    view: () => createRecordedView().appView,
+  });
+
+  try {
+    await app.start();
+    await untilTask(() => (sessionsOf(app.store.getState(), DEVICE_A)?.length ?? 0) === 50);
+    const beforeSessions = sessionsOf(app.store.getState(), DEVICE_A) ?? [];
+    const beforeCatalog = sessionCatalogOf(app.store.getState(), DEVICE_A);
+    assert.ok(beforeCatalog.nextCursor);
+
+    app.dispatch({ kind: "device/loadMoreSessions", deviceId: asDeviceId(DEVICE_A) });
+    await untilTask(() => sessionCatalogOf(app.store.getState(), DEVICE_A).loadingMore === false);
+
+    const afterSessions = sessionsOf(app.store.getState(), DEVICE_A) ?? [];
+    const afterCatalog = sessionCatalogOf(app.store.getState(), DEVICE_A);
+    assert.deepEqual(afterSessions, beforeSessions);
+    assert.equal(afterCatalog.catalogRevision, beforeCatalog.catalogRevision);
+    assert.equal(afterCatalog.nextCursor, beforeCatalog.nextCursor);
+    assert.equal(afterCatalog.loadMoreError, "设备返回了无效的会话分页，已保留当前目录，请重试");
+    assert.ok(toasts.some((message) => message.includes("无效的会话分页")));
+    assert.equal(listCalls, 2);
+  } finally {
+    app.dispose();
+  }
+});
+
+test("manual refresh invalidates late pagination and detail without leaving a stuck loading row", async () => {
+  const backend = createMemoryBackend({ snapshot: { devices: [device(DEVICE_A)] } });
+  const allSessions = Array.from({ length: 80 }, (_unused, index) => ({
+    ...session(`session-${index}`),
+    dateLabel: new Date(Date.parse("2026-08-03T00:00:00Z") - index * 1_000).toISOString(),
+  }));
+  backend.setSessions(DEVICE_A, allSessions);
+  let sessionReadRevision = 0;
+  const appBackend = {
+    ...backend,
+    async listSessions(...args: Parameters<TransferBackend["listSessions"]>) {
+      const loaded = await backend.listSessions(...args);
+      return { ...loaded, revision: (sessionReadRevision += 1) };
+    },
+    async getSessionDetail(...args: Parameters<TransferBackend["getSessionDetail"]>) {
+      const loaded = await backend.getSessionDetail(...args);
+      return { ...loaded, revision: (sessionReadRevision += 1) };
+    },
+  } satisfies TransferBackend;
+  const app = createTransferApp({
+    backend: appBackend,
+    clock: createFakeClock(),
+    toast: () => {},
+    view: () => createRecordedView().appView,
+  });
+
+  try {
+    await app.start();
+    await untilTask(() => (sessionsOf(app.store.getState(), DEVICE_A)?.length ?? 0) === 50);
+
+    backend.hold("listSessions");
+    app.dispatch({ kind: "device/loadMoreSessions", deviceId: asDeviceId(DEVICE_A) });
+    await untilTask(() => backend.pending("listSessions") === 1);
+    app.dispatch({ kind: "device/refreshSessions", deviceId: asDeviceId(DEVICE_A) });
+    await untilTask(() => backend.pending("listSessions") === 2);
+
+    // The refresh completes first and starts a new catalog generation.
+    backend.releaseLast("listSessions");
+    await untilTask(() => app.store.getState().sessions.get(DEVICE_A)?.loading === false);
+    backend.release("listSessions");
+    await untilTask(() => backend.pending("listSessions") === 0);
+    assert.equal(sessionsOf(app.store.getState(), DEVICE_A)?.length, 50);
+    assert.equal(sessionCatalogOf(app.store.getState(), DEVICE_A).loadingMore, false);
+
+    backend.hold("getSessionDetail");
+    const sessionId = asSessionId("session-0");
+    app.dispatch({ kind: "list/toggleRow", scope: "device", rowKey: deviceRowKey(DEVICE_A, sessionId) });
+    app.dispatch({ kind: "session/loadDetail", deviceId: asDeviceId(DEVICE_A), sessionId });
+    await untilTask(() => backend.pending("getSessionDetail") === 1);
+
+    app.dispatch({ kind: "device/refreshSessions", deviceId: asDeviceId(DEVICE_A) });
+    await untilTask(() => backend.pending("listSessions") === 1);
+    backend.release("listSessions");
+    await untilTask(() => app.store.getState().sessions.get(DEVICE_A)?.loading === false);
+    backend.release("getSessionDetail", {
+      ...allSessions[0],
+      files: [{ fileId: "late", displayPath: "late.mp4", bytes: 1, sha256: "a".repeat(64) }],
+    });
+    await untilTask(() => backend.pending("getSessionDetail") === 0);
+    assert.equal(sessionsOf(app.store.getState(), DEVICE_A)?.[0]?.files.length, 0);
+    assert.equal(sessionDetailStateOf(app.store.getState(), DEVICE_A, sessionId), undefined);
+
+    // The same still-open row can immediately issue a fresh detail request.
+    app.dispatch({ kind: "session/loadDetail", deviceId: asDeviceId(DEVICE_A), sessionId });
+    await untilTask(() => backend.pending("getSessionDetail") === 1);
+    backend.release("getSessionDetail", {
+      ...allSessions[0],
+      files: [{ fileId: "fresh", displayPath: "fresh.mp4", bytes: 1, sha256: "b".repeat(64) }],
+    });
+    await untilTask(() => sessionsOf(app.store.getState(), DEVICE_A)?.[0]?.files.length === 1);
+    assert.equal(sessionsOf(app.store.getState(), DEVICE_A)?.[0]?.files[0]?.fileId, "fresh");
   } finally {
     app.dispose();
   }

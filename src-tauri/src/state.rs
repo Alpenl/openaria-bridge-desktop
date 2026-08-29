@@ -177,6 +177,7 @@ impl AppData {
                     session,
                     download_status,
                     backed_up,
+                    verification: None,
                 }
             })
             .collect()
@@ -404,18 +405,30 @@ impl AppState {
         // -- after the library is loaded, before it becomes visible state --
         // is the only point where "still uploading" can be distinguished
         // from "was uploading in a previous life".
-        let reconciled = crate::composition::reconcile_interrupted_uploads(
+        let mut reconciled = crate::composition::reconcile_interrupted_uploads(
             &composition,
             &mut library,
             &storage,
         )?;
 
-        // Resolve every durable local-library delete only after interrupted
-        // uploads have been durably cancelled and their multipart rows have
-        // been claimed. Recovery now sees terminal upload jobs and can
-        // release stale upload leases without letting a crashed worker block
-        // deletion or a new upload indefinitely.
-        crate::library_delete::recover_pending_deletes(&store, &composition.library_root())?;
+        // A legacy row is complete only after its processed MP4 has passed
+        // the current manifest-timeline probe and a derived-media receipt has
+        // been committed beside it. The migration is deliberately before
+        // delete recovery and before the library becomes visible: failures
+        // preserve the full source directory and project the row incomplete,
+        // while success atomically replaces it with the canonical MP4/receipt
+        // pair and resets any stale upload proof.
+        reconciled |=
+            crate::composition::reconcile_existing_derived_media(&composition, &mut library)?;
+
+        // Delete intents are intentionally *not* replayed at startup. A
+        // previous process may have committed metadata while its filesystem
+        // trash cleanup was incomplete; rolling that state back or finishing
+        // it here would be an implicit cross-process mutation. The owning
+        // process must perform an explicit retry through the delete boundary.
+        // Upload leases are independent: terminal transfer rows are durable
+        // evidence, so stale upload claims may still be reconciled safely.
+        crate::library_delete::reconcile_upload_leases(&store)?;
         // One shared connection from here on: the media completion projector
         // gets this same handle rather than opening a second writer.
         let store = Arc::new(store);
@@ -637,6 +650,9 @@ mod tests {
 
     use crate::models::PublicationEvidence;
     use rusqlite::Connection;
+    use ylx_transfer_core::persistence::app_store::{
+        LibraryDeleteIntent, LibraryDeleteIntentState,
+    };
     use ylx_transfer_core::persistence::{JobStateTag, TransferStore, UploadJobSpec};
 
     #[cfg(feature = "demo")]
@@ -807,6 +823,7 @@ mod tests {
             processed_files: Vec::new(),
             files: Vec::new(),
             complete: true,
+            download_projection_sequence: 0,
             publication: Some(PublicationEvidence {
                 revision: "revision-startup".to_string(),
                 payload: Vec::new(),
@@ -938,6 +955,143 @@ mod tests {
         drop(transfer_store);
         drop(state);
         drop(composition);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// D-049 startup policy: pending local deletes belong to the process that
+    /// staged them. A fresh process must not roll back a staged intent or
+    /// finalize a committed one merely because it opened the app. Both the
+    /// durable rows and their filesystem payloads stay exactly where the
+    /// previous process left them until an explicit in-process retry owns the
+    /// operation.
+    #[test]
+    fn startup_leaves_pending_delete_intents_and_payloads_untouched() {
+        let dir = std::env::temp_dir().join(format!(
+            "ylx-state-pending-delete-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app_store_path = dir.join("app-state.sqlite3");
+        let library_root = dir.join("library");
+        std::fs::create_dir_all(&library_root).unwrap();
+
+        let store = AppStore::open(&app_store_path).expect("open app store");
+        let storage_payload =
+            serde_json::to_vec(&StorageConfig::default()).expect("serialize storage profile");
+        store
+            .save(&[], &storage_payload)
+            .expect("seed authoritative app store");
+        let expected_revision = store.revision().expect("read seeded revision");
+
+        let staged_source = library_root.join("staged-device").join("staged-session");
+        let committed_source = library_root
+            .join("committed-device")
+            .join("committed-session");
+        std::fs::create_dir_all(staged_source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(committed_source.parent().unwrap()).unwrap();
+
+        let trash_root = library_root.join(".ylx-library-trash");
+        let staged_payload = trash_root.join("delete-boot-staged").join("payload-0");
+        let committed_payload = trash_root.join("delete-boot-committed").join("payload-0");
+        std::fs::create_dir_all(&staged_payload).unwrap();
+        std::fs::create_dir_all(&committed_payload).unwrap();
+        std::fs::write(staged_payload.join("staged.mp4"), b"staged-bytes").unwrap();
+        std::fs::write(committed_payload.join("committed.mp4"), b"committed-bytes").unwrap();
+
+        let staged_operation = "delete-boot-staged";
+        let committed_operation = "delete-boot-committed";
+        let staged_key = "staged-device|staged-session";
+        let committed_key = "committed-device|committed-session";
+        store
+            .acquire_operation_leases(
+                staged_operation,
+                &[staged_key.to_string()],
+                "delete",
+                "boot",
+            )
+            .expect("seed staged delete lease");
+        store
+            .acquire_operation_leases(
+                committed_operation,
+                &[committed_key.to_string()],
+                "delete",
+                "boot",
+            )
+            .expect("seed committed delete lease");
+        store
+            .record_library_delete_intents(&[
+                LibraryDeleteIntent {
+                    operation_id: staged_operation.to_string(),
+                    entry_key: staged_key.to_string(),
+                    source_path: staged_source.clone(),
+                    trash_path: staged_payload.clone(),
+                    expected_revision,
+                    state: LibraryDeleteIntentState::Staged,
+                    created_at: "boot-staged".to_string(),
+                },
+                LibraryDeleteIntent {
+                    operation_id: committed_operation.to_string(),
+                    entry_key: committed_key.to_string(),
+                    source_path: committed_source.clone(),
+                    trash_path: committed_payload.clone(),
+                    expected_revision,
+                    state: LibraryDeleteIntentState::Committed,
+                    created_at: "boot-committed".to_string(),
+                },
+            ])
+            .expect("seed pending delete intents");
+
+        let snapshot_before = store.load().expect("snapshot before boot");
+        let intents_before = store
+            .list_library_delete_intents()
+            .expect("intents before boot");
+        let leases_before = store.list_operation_leases().expect("leases before boot");
+        let staged_bytes_before = std::fs::read(staged_payload.join("staged.mp4")).unwrap();
+        let committed_bytes_before =
+            std::fs::read(committed_payload.join("committed.mp4")).unwrap();
+        drop(store);
+
+        let boot = BootConfig::load(app_store_path.clone()).expect("load boot config");
+        let composition = Composition::new(dir.clone(), library_root.clone())
+            .expect("construct inert composition");
+        let state = AppState::from_boot_config(boot, composition.clone())
+            .expect("boot must not replay pending deletes");
+        {
+            let data = state.0.lock().unwrap();
+            assert!(data.library.is_empty());
+            assert_eq!(data.store_revision(), expected_revision);
+        }
+        drop(state);
+        drop(composition);
+
+        let store_after = AppStore::open(&app_store_path).expect("reopen app store");
+        assert_eq!(
+            store_after.load().expect("snapshot after boot"),
+            snapshot_before
+        );
+        assert_eq!(
+            store_after
+                .list_library_delete_intents()
+                .expect("intents after boot"),
+            intents_before
+        );
+        assert_eq!(
+            store_after
+                .list_operation_leases()
+                .expect("leases after boot"),
+            leases_before
+        );
+        assert_eq!(
+            std::fs::read(staged_payload.join("staged.mp4")).unwrap(),
+            staged_bytes_before
+        );
+        assert_eq!(
+            std::fs::read(committed_payload.join("committed.mp4")).unwrap(),
+            committed_bytes_before
+        );
+        assert!(!staged_source.exists());
+        assert!(!committed_source.exists());
+
         std::fs::remove_dir_all(dir).ok();
     }
 }

@@ -1501,6 +1501,8 @@ mod tests {
             publication_signature: vec![0xab; ED25519_SIGNATURE_LENGTH],
             publication_public_key: vec![0xcd; ED25519_PUBLIC_KEY_LENGTH],
             publication_key_fingerprint: test_fingerprint(),
+            gateway_verification: None,
+            publication_origin: crate::device::PublicationEnvelopeOriginView::DeviceSigned,
         };
         let envelope = PublicationEnvelope::try_from(&detail).expect("UTF-8 payload converts");
         assert_eq!(envelope.publication_payload, r#"{"signed":true}"#);
@@ -1530,6 +1532,8 @@ mod tests {
             publication_signature: Vec::new(),
             publication_public_key: Vec::new(),
             publication_key_fingerprint: String::new(),
+            gateway_verification: None,
+            publication_origin: crate::device::PublicationEnvelopeOriginView::DeviceSigned,
         };
         assert!(PublicationEnvelope::try_from(&detail).is_err());
     }

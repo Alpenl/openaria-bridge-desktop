@@ -92,10 +92,9 @@ use std::time::{Duration, Instant};
 use crate::device::{CaptureActivityState, ConnectionState};
 use crate::domain::{DeviceId, FileId, PublicationScope, SessionId};
 use crate::library::download::{
-    commit_staged_session, DownloadError, DownloadSource, FilePlan, PublicationMaterial,
-    PublicationVerifier, VerifiedFile, VerifyError,
+    DownloadError, DownloadSource, FilePlan, PublicationVerifier, VerifiedFile, VerifyError,
 };
-use crate::library::staging::{published_revision, RevisionState, SessionManifest, SessionStaging};
+use crate::library::staging::{published_revision, RevisionState, SessionStaging};
 use crate::persistence::transfer_store::RetryJobError;
 use crate::persistence::{
     CompleteJobError, CreateJobError, JobStateTag, PersistenceError, TerminalOutcome, TransferStore,
@@ -104,6 +103,12 @@ use crate::persistence::{
 use super::aggregate::{
     CommandOutcome, DesiredRunState, DeviceReadiness, DeviceSnapshot, Effect, JobAggregate,
     JobCommand, JobSnapshot, RejectReason, TargetKey, TargetLeases, WorkerReport,
+};
+#[cfg(test)]
+use super::commit::DownloadCommitOutcome;
+use super::commit::{
+    DownloadCommitCancelOutcome, DownloadCommitControl, DownloadCommitPort, DownloadCommitRequest,
+    RawSessionCommitter,
 };
 use super::fault::{classify_download_failure, CoordinatorFault, FailureClass, FaultKind};
 use super::progress::{disk_baseline, JobProgress, JobProgressTracker};
@@ -194,6 +199,8 @@ pub enum CoordinatorError {
     NotFailed(String),
     #[error("timed out waiting for job {0} to settle")]
     Timeout(String),
+    #[error("job {0} has crossed the irreversible canonical publication point")]
+    CommitIrreversible(String),
     /// Commit 39: an expected-version CAS lost. The caller decided against
     /// `expected`, but another command had already committed `actual` —
     /// nothing was overwritten, and this is an explicit result rather than
@@ -298,12 +305,41 @@ impl StopSignal {
     }
 }
 
+#[cfg(test)]
+struct RetryRuntimeInstallHook {
+    durable_outcome_barrier: crate::testing::Rendezvous,
+    retry_arrivals: AtomicU64,
+    late_retry_waiting: Option<crate::testing::RecordingSink<()>>,
+    release_late_retry: Option<crate::testing::Deferred<()>>,
+    runtime_installed: crate::testing::RecordingSink<()>,
+    release_installer: crate::testing::Deferred<()>,
+}
+
+#[cfg(test)]
+struct EnqueueExistingRuntimeHook {
+    existing_observed: crate::testing::RecordingSink<()>,
+    enqueue_arrivals: AtomicU64,
+    release: crate::testing::Deferred<()>,
+    late_enqueue_waiting: Option<crate::testing::RecordingSink<()>>,
+    release_late_enqueue: Option<crate::testing::Deferred<()>>,
+}
+
 pub(super) struct Inner {
     /// The sole durable authority for job identity, spec, state, desired
     /// intent, file ledger and retry lineage.
     pub(super) transfer_store: Arc<Mutex<TransferStore>>,
+    /// Serializes the whole runtime lifecycle for a durable job. Durable
+    /// retry is idempotent, so concurrent callers may receive the same child;
+    /// install and removal must share one boundary or a late installer can
+    /// resurrect a runtime that dismissal already retired.
+    runtime_lifecycle: Mutex<()>,
+    #[cfg(test)]
+    retry_runtime_install_hook: Mutex<Option<Arc<RetryRuntimeInstallHook>>>,
+    #[cfg(test)]
+    enqueue_existing_runtime_hook: Mutex<Option<Arc<EnqueueExistingRuntimeHook>>>,
     pub(super) jobs: Mutex<HashMap<JobId, ManagedJob>>,
     pub(super) controls: Mutex<HashMap<JobId, Arc<JobControl>>>,
+    commit_controls: Mutex<HashMap<JobId, Arc<DownloadCommitControl>>>,
     /// One serialized owner per job — see [`JobCell`].
     pub(super) cells: Mutex<HashMap<JobId, Arc<JobCell>>>,
     /// At most one writer per (device, session) target directory.
@@ -320,6 +356,7 @@ pub(super) struct Inner {
     device_status: Arc<dyn DeviceStatusPort>,
     source_factory: Arc<dyn DownloadSourceFactory>,
     verifier: Arc<dyn PublicationVerifier>,
+    commit_port: Arc<dyn DownloadCommitPort>,
     library_root: Mutex<PathBuf>,
     checkpoint_threshold_bytes: u64,
     shutdown: AtomicBool,
@@ -353,12 +390,38 @@ impl TransferCoordinator {
         verifier: Arc<dyn PublicationVerifier>,
         config: CoordinatorConfig,
     ) -> Self {
+        let commit_port: Arc<dyn DownloadCommitPort> =
+            Arc::new(RawSessionCommitter::new(verifier.clone()));
+        Self::build_with_commit_port(
+            transfer_store,
+            device_status,
+            source_factory,
+            verifier,
+            commit_port,
+            config,
+        )
+    }
+
+    fn build_with_commit_port(
+        transfer_store: Arc<Mutex<TransferStore>>,
+        device_status: Arc<dyn DeviceStatusPort>,
+        source_factory: Arc<dyn DownloadSourceFactory>,
+        verifier: Arc<dyn PublicationVerifier>,
+        commit_port: Arc<dyn DownloadCommitPort>,
+        config: CoordinatorConfig,
+    ) -> Self {
         let work_queue = Arc::new(WorkQueue::new(config.num_workers.max(1) * 2));
         let stop_signal = Arc::new(StopSignal::new());
         let inner = Arc::new(Inner {
             transfer_store,
+            runtime_lifecycle: Mutex::new(()),
+            #[cfg(test)]
+            retry_runtime_install_hook: Mutex::new(None),
+            #[cfg(test)]
+            enqueue_existing_runtime_hook: Mutex::new(None),
             jobs: Mutex::new(HashMap::new()),
             controls: Mutex::new(HashMap::new()),
+            commit_controls: Mutex::new(HashMap::new()),
             cells: Mutex::new(HashMap::new()),
             target_leases: TargetLeases::new(),
             work_queue: work_queue.clone(),
@@ -367,6 +430,7 @@ impl TransferCoordinator {
             device_status,
             source_factory,
             verifier,
+            commit_port,
             library_root: Mutex::new(config.library_root.clone()),
             checkpoint_threshold_bytes: config.checkpoint_threshold_bytes,
             shutdown: AtomicBool::new(false),
@@ -432,6 +496,30 @@ impl TransferCoordinator {
             device_status,
             source_factory,
             verifier,
+            config,
+        )
+    }
+
+    /// Production constructor for applications whose usable local artifact
+    /// requires work beyond raw-session publication. The injected port runs
+    /// inside the coordinator's `committing` state; its failure therefore
+    /// becomes a durable, ordinarily retryable job failure rather than a
+    /// post-terminal projection error.
+    #[cfg(not(test))]
+    pub fn new_with_commit_port(
+        transfer_store: Arc<Mutex<TransferStore>>,
+        device_status: Arc<dyn DeviceStatusPort>,
+        source_factory: Arc<dyn DownloadSourceFactory>,
+        verifier: Arc<dyn PublicationVerifier>,
+        commit_port: Arc<dyn DownloadCommitPort>,
+        config: CoordinatorConfig,
+    ) -> Self {
+        Self::build_with_commit_port(
+            transfer_store,
+            device_status,
+            source_factory,
+            verifier,
+            commit_port,
             config,
         )
     }
@@ -792,7 +880,7 @@ impl Inner {
         self.faults.lock().unwrap().clone()
     }
 
-    fn library_root(&self) -> PathBuf {
+    pub(super) fn library_root(&self) -> PathBuf {
         self.library_root.lock().unwrap().clone()
     }
 
@@ -886,50 +974,101 @@ impl Inner {
             })?;
 
         let stored = outcome.job().clone();
-        if matches!(outcome, crate::persistence::CreateJobOutcome::Existing(_)) {
-            if self
-                .jobs
-                .lock()
-                .unwrap()
-                .contains_key(&JobId(stored.job_id.clone()))
-            {
-                return Ok(JobId(stored.job_id));
+        let existing = matches!(outcome, crate::persistence::CreateJobOutcome::Existing(_));
+        #[cfg(test)]
+        if existing {
+            let hook = self.enqueue_existing_runtime_hook.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                let arrival = hook.enqueue_arrivals.fetch_add(1, Ordering::SeqCst);
+                hook.existing_observed.emit(());
+                match (
+                    arrival > 0,
+                    hook.late_enqueue_waiting.as_ref(),
+                    hook.release_late_enqueue.as_ref(),
+                ) {
+                    (true, Some(waiting), Some(release)) => {
+                        waiting.emit(());
+                        release.get();
+                    }
+                    _ => {
+                        hook.release.get();
+                    }
+                }
             }
-            if !stored.state.is_terminal() || stored.state == JobStateTag::Failed {
-                let request = request_from_spec(&spec);
-                self.rehydrate(
-                    JobId(stored.job_id.clone()),
-                    request,
-                    tag_to_state(stored.state, stored.error),
-                    spec.publication_scope(),
-                    stored.desired_run_state,
-                    stored.state_version,
-                );
-            }
-            return Ok(JobId(stored.job_id));
+        }
+        if existing {
+            return self.resolve_existing_enqueue(JobId(stored.job_id), &request);
         }
 
         let job_id = JobId(stored.job_id);
-        self.install_progress(&job_id, &request);
-        let managed = ManagedJob {
-            job_id: job_id.clone(),
-            request,
-            state: TransferJobState::Queued,
-            publication_scope: spec.publication_scope(),
-            desired_run_state: DesiredRunState::Run,
-            verified_files: Vec::new(),
-        };
-        self.jobs.lock().unwrap().insert(job_id.clone(), managed);
-        self.controls
-            .lock()
-            .unwrap()
-            .insert(job_id.clone(), Arc::new(JobControl::default()));
-        self.cells
-            .lock()
-            .unwrap()
-            .insert(job_id.clone(), Arc::new(JobCell::new()));
-        self.schedule(&job_id);
+        self.install_runtime_if_current(&job_id, false)?;
         Ok(job_id)
+    }
+
+    /// Resolve an idempotent natural-key hit from current durable facts.
+    ///
+    /// A `CreateJobOutcome::Existing` snapshot can become stale before the
+    /// runtime is installed. In particular, the user may acknowledge and
+    /// dismiss a failed transfer in that gap. The lifecycle guard makes that
+    /// decision atomic with runtime retirement/installation; the store's
+    /// IMMEDIATE retry transaction supplies the matching durable/staging
+    /// boundary for a fresh enqueue attempt.
+    fn resolve_existing_enqueue(
+        &self,
+        parent_job_id: JobId,
+        request: &TransferRequest,
+    ) -> Result<JobId, CoordinatorError> {
+        let _runtime_lifecycle = self.runtime_lifecycle.lock().unwrap();
+        let parent = {
+            let transfer_store = self.transfer_store.lock().unwrap();
+            transfer_store.get_job(parent_job_id.as_str())?
+        }
+        .ok_or_else(|| CoordinatorError::NotFound(parent_job_id.to_string()))?;
+
+        if parent.dismissed_at.is_none() {
+            self.install_runtime_from_current_locked(&parent_job_id, true)?;
+            return Ok(parent_job_id);
+        }
+        if parent.state != JobStateTag::Failed {
+            return Err(CoordinatorError::Persistence(PersistenceError::Conflict {
+                detail: format!(
+                    "existing transfer {parent_job_id} is dismissed and cannot be enqueued again"
+                ),
+            }));
+        }
+
+        let staging = SessionStaging::for_publication(
+            self.library_root(),
+            request.device_id.as_str(),
+            request.session_id.as_str(),
+            &request.manifest_bytes,
+        )
+        .map_err(|error| {
+            CoordinatorError::Persistence(PersistenceError::Conflict {
+                detail: format!("cannot derive fresh enqueue staging for {parent_job_id}: {error}"),
+            })
+        })?;
+        let child_candidate = self.next_job_id();
+        let outcome = self
+            .transfer_store
+            .lock()
+            .unwrap()
+            .spawn_fresh_download_enqueue_repeat(
+                parent_job_id.as_str(),
+                child_candidate.as_str(),
+                &now_string(),
+                || {
+                    staging.discard().map_err(|error| PersistenceError::Conflict {
+                        detail: format!(
+                            "cannot discard dismissed staging before re-enqueueing {parent_job_id}: {error}"
+                        ),
+                    })
+                },
+            )
+            .map_err(retry_error)?;
+        let child = JobId(outcome.job().job_id.clone());
+        self.install_runtime_from_current_locked(&child, false)?;
+        Ok(child)
     }
 
     /// Offer one job to the bounded ready set and make refusal observable.
@@ -1252,7 +1391,22 @@ impl Inner {
                     job.desired_run_state = desired;
                 }
             }
-            Effect::RequestInterrupt(reason) => control.request_interrupt(reason),
+            Effect::RequestInterrupt(reason) => {
+                if reason == InterruptReason::Cancel {
+                    let commit_control = self
+                        .commit_controls
+                        .lock()
+                        .unwrap()
+                        .get(job_id)
+                        .cloned()
+                        .ok_or_else(|| CoordinatorError::NotFound(job_id.to_string()))?;
+                    if commit_control.request_cancel() == DownloadCommitCancelOutcome::Irreversible
+                    {
+                        return Err(CoordinatorError::CommitIrreversible(job_id.to_string()));
+                    }
+                }
+                control.request_interrupt(reason);
+            }
             Effect::ClearInterrupt => control.clear_interrupt(),
             Effect::Dispatch => {
                 self.schedule(job_id);
@@ -1668,19 +1822,42 @@ impl Inner {
                     continue;
                 }
                 TransferJobState::Committing => {
-                    let commit_result = {
+                    let (commit_request, commit_control) = {
                         let jobs = self.jobs.lock().unwrap();
                         let job = jobs.get(job_id).expect("job present while committing");
-                        self.do_commit(job)
+                        let commit_control = self
+                            .commit_controls
+                            .lock()
+                            .unwrap()
+                            .get(job_id)
+                            .cloned()
+                            .expect("commit control present while committing");
+                        (
+                            DownloadCommitRequest {
+                                job_id: job.job_id.clone(),
+                                request: job.request.clone(),
+                                publication_scope: job.publication_scope,
+                                verified_files: job.verified_files.clone(),
+                                library_root: self.library_root(),
+                            },
+                            commit_control,
+                        )
                     };
-                    match commit_result {
-                        Ok(()) => {
-                            let _ = self.worker_report(job_id, WorkerReport::CommitComplete);
+                    match self
+                        .commit_port
+                        .commit_cancellable(&commit_request, &commit_control)
+                    {
+                        Ok(outcome) => {
+                            let _ =
+                                self.worker_report(job_id, WorkerReport::CommitComplete(outcome));
                         }
-                        Err((code, retryable)) => {
+                        Err(failure) => {
                             let _ = self.worker_report(
                                 job_id,
-                                WorkerReport::CommitFailed { code, retryable },
+                                WorkerReport::CommitFailed {
+                                    code: failure.code,
+                                    retryable: failure.retryable,
+                                },
                             );
                         }
                     }
@@ -1857,61 +2034,6 @@ impl Inner {
         }
     }
 
-    fn do_commit(&self, job: &ManagedJob) -> Result<(), (FailureCode, bool)> {
-        let library_root = self.library_root();
-        let staging = match SessionStaging::for_publication(
-            &library_root,
-            job.request.device_id.as_str(),
-            job.request.session_id.as_str(),
-            &job.request.manifest_bytes,
-        ) {
-            Ok(staging) => staging,
-            Err(error) => {
-                let error = DownloadError::from(error);
-                return Err(classify_download_error(&error));
-            }
-        };
-        let plans: Vec<FilePlan> = job
-            .request
-            .files
-            .iter()
-            .map(|file| FilePlan {
-                device_id: job.request.device_id.as_str().to_string(),
-                session_id: job.request.session_id.as_str().to_string(),
-                file_id: file.file_id.as_str().to_string(),
-                target_relative_path: file.target_relative_path.clone(),
-                expected_size: file.expected_size,
-                expected_sha256_hex: file.expected_sha256_hex.clone(),
-            })
-            .collect();
-        let manifest = SessionManifest::from_plans(
-            job.request.device_id.as_str(),
-            job.request.session_id.as_str(),
-            &plans,
-        );
-        match commit_staged_session(
-            &staging,
-            job.request.device_id.as_str().to_string(),
-            job.request.session_id.as_str().to_string(),
-            job.verified_files.clone(),
-            &manifest,
-            PublicationMaterial {
-                payload: &job.request.manifest_bytes,
-                signature: &job.request.signature,
-                public_key: &job.request.publication_public_key,
-            },
-            self.verifier.as_ref(),
-            job.publication_scope,
-        ) {
-            Ok(_entry) => Ok(()),
-            Err(DownloadError::Verification(VerifyError::Rejected(msg))) => Err((
-                FailureCode::Other(format!("publication verification failed: {msg}")),
-                false,
-            )),
-            Err(e) => Err(classify_download_error(&e)),
-        }
-    }
-
     fn verify_request_publication(&self, request: &TransferRequest) -> Result<(), VerifyError> {
         self.verifier.verify(
             &request.manifest_bytes,
@@ -1972,49 +2094,103 @@ impl Inner {
     }
 
     fn retry(&self, job_id: &JobId) -> Result<JobId, CoordinatorError> {
-        let request = self
+        let (request, starts_from_zero) = self
             .jobs
             .lock()
             .unwrap()
             .get(job_id)
-            .map(|job| job.request.clone());
+            .map(|job| {
+                let (_, failure) = state_to_tag(&job.state);
+                let starts_from_zero = failure.is_some_and(|(code, retryable)| {
+                    retryable
+                        && (code == "network"
+                            || code == super::recovery::INTERRUPTED_DOWNLOAD_FAILURE_CODE)
+                });
+                (job.request.clone(), starts_from_zero)
+            })
+            .map_or((None, false), |(request, starts_from_zero)| {
+                (Some(request), starts_from_zero)
+            });
         // The reducer owns "may this job be retried at all" (only a failed
         // job may); performing `Effect::SpawnRetryJob` is this method's
         // job, because it creates a different job.
         self.apply(job_id, JobCommand::Retry)?;
         let child_id = self.next_job_id();
-        let outcome = self
-            .transfer_store
-            .lock()
-            .unwrap()
-            .spawn_retry_job(job_id.as_str(), child_id.as_str(), &now_string())
-            .map_err(retry_error)?;
-        let child = JobId(outcome.job().job_id.clone());
-        if !self.jobs.lock().unwrap().contains_key(&child) {
-            let spec = self
-                .transfer_store
-                .lock()
-                .unwrap()
-                .job_spec(child.as_str())
+        let fresh_staging = if starts_from_zero {
+            let request = request
+                .as_ref()
+                .ok_or_else(|| CoordinatorError::NotFound(job_id.to_string()))?;
+            Some(
+                SessionStaging::for_publication(
+                    self.library_root(),
+                    request.device_id.as_str(),
+                    request.session_id.as_str(),
+                    &request.manifest_bytes,
+                )
                 .map_err(|error| {
                     CoordinatorError::Persistence(PersistenceError::Conflict {
-                        detail: format!("retry child has no usable durable spec: {error}"),
+                        detail: format!("cannot derive fresh retry staging for {job_id}: {error}"),
                     })
-                })?;
-            let request = request.unwrap_or_else(|| request_from_spec(&spec));
-            self.rehydrate(
-                child.clone(),
-                request,
-                tag_to_state(outcome.job().state, outcome.job().error.clone()),
-                spec.publication_scope(),
-                outcome.job().desired_run_state,
-                outcome.job().state_version,
-            );
+                })?,
+            )
+        } else {
+            None
+        };
+        let outcome = {
+            let mut transfer_store = self.transfer_store.lock().unwrap();
+            if let Some(staging) = fresh_staging.as_ref() {
+                transfer_store.spawn_fresh_download_retry_job(
+                    job_id.as_str(),
+                    child_id.as_str(),
+                    &now_string(),
+                    || {
+                        staging.discard().map_err(|error| PersistenceError::Conflict {
+                            detail: format!(
+                                "cannot discard interrupted staging before retrying {job_id}: {error}"
+                            ),
+                        })
+                    },
+                )
+            } else {
+                transfer_store.spawn_retry_job(job_id.as_str(), child_id.as_str(), &now_string())
+            }
         }
+        .map_err(retry_error)?;
+        let child = JobId(outcome.job().job_id.clone());
+        #[cfg(test)]
+        let retry_runtime_install_hook =
+            { self.retry_runtime_install_hook.lock().unwrap().clone() };
+        #[cfg(test)]
+        if let Some(hook) = retry_runtime_install_hook {
+            let arrival = hook.retry_arrivals.fetch_add(1, Ordering::SeqCst);
+            hook.durable_outcome_barrier.wait();
+            if arrival > 0 {
+                if let Some(waiting) = hook.late_retry_waiting.as_ref() {
+                    waiting.emit(());
+                }
+                if let Some(release) = hook.release_late_retry.as_ref() {
+                    release.get();
+                }
+            }
+        }
+        self.install_retry_runtime_if_current(&child)?;
         Ok(child)
     }
 
+    /// Install a retry child only from its current durable facts. The spawn
+    /// outcome may be arbitrarily old by the time a concurrent caller reaches
+    /// this point, so it is never an authority for runtime state/version.
+    fn install_retry_runtime_if_current(&self, job_id: &JobId) -> Result<(), CoordinatorError> {
+        // Lock order for lifecycle operations is always lifecycle first,
+        // then store/maps. Durable spawn releases the store before entering
+        // here, so no store -> lifecycle cycle exists.
+        let _runtime_lifecycle = self.runtime_lifecycle.lock().unwrap();
+        self.install_runtime_from_current_locked(job_id, false)?;
+        Ok(())
+    }
+
     fn dismiss(&self, job_id: &JobId) -> Result<(), CoordinatorError> {
+        let _runtime_lifecycle = self.runtime_lifecycle.lock().unwrap();
         if !self.jobs.lock().unwrap().contains_key(job_id) {
             return Err(CoordinatorError::NotFound(job_id.to_string()));
         }
@@ -2031,6 +2207,7 @@ impl Inner {
 
         self.jobs.lock().unwrap().remove(job_id);
         self.controls.lock().unwrap().remove(job_id);
+        self.commit_controls.lock().unwrap().remove(job_id);
         self.cells.lock().unwrap().remove(job_id);
         self.progress.lock().unwrap().remove(job_id);
         Ok(())
@@ -2068,6 +2245,7 @@ impl Inner {
     }
 
     fn dismiss_runtime(&self, job_id: &JobId) -> Result<(), CoordinatorError> {
+        let _runtime_lifecycle = self.runtime_lifecycle.lock().unwrap();
         // Re-check immediately before mutating the runtime.  This protects a
         // caller that validated, wrote the tombstone, and then raced another
         // runtime command in between those two boundaries.
@@ -2081,6 +2259,7 @@ impl Inner {
 
         self.jobs.lock().unwrap().remove(job_id);
         self.controls.lock().unwrap().remove(job_id);
+        self.commit_controls.lock().unwrap().remove(job_id);
         self.cells.lock().unwrap().remove(job_id);
         self.progress.lock().unwrap().remove(job_id);
         Ok(())
@@ -2091,7 +2270,75 @@ impl Inner {
     // which calls this)
     // -------------------------------------------------------------
 
-    pub(super) fn rehydrate(
+    pub(super) fn install_runtime_if_current(
+        &self,
+        job_id: &JobId,
+        include_failed: bool,
+    ) -> Result<bool, CoordinatorError> {
+        let _runtime_lifecycle = self.runtime_lifecycle.lock().unwrap();
+        self.install_runtime_from_current_locked(job_id, include_failed)
+    }
+
+    /// Read and install one runtime while `runtime_lifecycle` is held.
+    /// Caller-provided create/retry/recovery snapshots are intentionally not
+    /// accepted: a missing or dismissed row is a tombstone, and a terminal
+    /// row is installable only when it is an undismissed failure that must
+    /// remain visible for explicit retry.
+    fn install_runtime_from_current_locked(
+        &self,
+        job_id: &JobId,
+        include_failed: bool,
+    ) -> Result<bool, CoordinatorError> {
+        {
+            let transfer_store = self.transfer_store.lock().unwrap();
+            let Some(stored) = transfer_store.get_job(job_id.as_str())? else {
+                return Ok(false);
+            };
+            let failed_visible = include_failed && stored.state == JobStateTag::Failed;
+            if stored.dismissed_at.is_some() || (stored.state.is_terminal() && !failed_visible) {
+                return Ok(false);
+            }
+            let spec = transfer_store.job_spec(job_id.as_str()).map_err(|error| {
+                CoordinatorError::Persistence(PersistenceError::Conflict {
+                    detail: format!("runtime job {job_id} has no usable durable spec: {error}"),
+                })
+            })?;
+            if self.jobs.lock().unwrap().contains_key(job_id) {
+                return Ok(true);
+            }
+
+            // Keep the store guard through publication and scheduling. A
+            // direct durable tombstone writer must therefore happen wholly
+            // before this decision (and be rejected above) or wholly after
+            // the runtime is visible for lifecycle retirement.
+            self.rehydrate_locked(
+                job_id.clone(),
+                request_from_spec(&spec),
+                tag_to_state(stored.state, stored.error),
+                spec.publication_scope(),
+                stored.desired_run_state,
+                stored.state_version,
+            );
+        }
+
+        // Test rendezvous may deliberately block. It must observe the
+        // completed install without pinning the durable store and preventing
+        // the competing transition the test is meant to coordinate.
+        #[cfg(test)]
+        let retry_runtime_install_hook =
+            { self.retry_runtime_install_hook.lock().unwrap().clone() };
+        #[cfg(test)]
+        if let Some(hook) = retry_runtime_install_hook {
+            hook.runtime_installed.emit(());
+            hook.release_installer.get();
+        }
+        Ok(true)
+    }
+
+    /// Install one fully-initialized runtime while `runtime_lifecycle` is
+    /// held. Callers that need a durable freshness check must perform that
+    /// check under the same guard before entering this helper.
+    fn rehydrate_locked(
         &self,
         job_id: JobId,
         request: TransferRequest,
@@ -2100,6 +2347,9 @@ impl Inner {
         desired: DesiredRunState,
         version: u64,
     ) {
+        if self.jobs.lock().unwrap().contains_key(&job_id) {
+            return;
+        }
         let should_dispatch = !state.is_terminal();
         self.install_progress(&job_id, &request);
         let managed = ManagedJob {
@@ -2110,12 +2360,16 @@ impl Inner {
             desired_run_state: desired,
             verified_files: Vec::new(),
         };
-        self.jobs.lock().unwrap().insert(job_id.clone(), managed);
         self.controls
             .lock()
             .unwrap()
             .entry(job_id.clone())
             .or_insert_with(|| Arc::new(JobControl::default()));
+        self.commit_controls
+            .lock()
+            .unwrap()
+            .entry(job_id.clone())
+            .or_insert_with(|| Arc::new(DownloadCommitControl::default()));
         self.cells
             .lock()
             .unwrap()
@@ -2125,6 +2379,9 @@ impl Inner {
                 cell.version.store(version, Ordering::SeqCst);
                 cell
             });
+        // Publish the job map entry last so readers can never observe a job
+        // whose progress/control/version cell has not been initialized yet.
+        self.jobs.lock().unwrap().insert(job_id.clone(), managed);
         if should_dispatch && desired == DesiredRunState::Run {
             self.schedule(&job_id);
         }
@@ -2199,7 +2456,7 @@ fn retry_error(error: RetryJobError) -> CoordinatorError {
     }
 }
 
-fn map_complete_job_error(error: CompleteJobError) -> CoordinatorError {
+pub(super) fn map_complete_job_error(error: CompleteJobError) -> CoordinatorError {
     match error {
         CompleteJobError::Persistence(error) => CoordinatorError::Persistence(error),
         other => CoordinatorError::Persistence(PersistenceError::Conflict {
@@ -2267,7 +2524,7 @@ fn validate_request_against_spec(
     Ok(())
 }
 
-fn classify_download_error(e: &DownloadError) -> (FailureCode, bool) {
+pub(crate) fn classify_download_error(e: &DownloadError) -> (FailureCode, bool) {
     match e {
         DownloadError::HashMismatch { .. } | DownloadError::SizeMismatch { .. } => {
             (FailureCode::HashMismatch, true)
@@ -2313,11 +2570,13 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::library::download::{
-        AlwaysFailVerifierStub, AlwaysPassVerifierStub, RequestedRange, SourceResponse,
+        journal_path, part_path, AlwaysFailVerifierStub, AlwaysPassVerifierStub, DownloadJournal,
+        RequestedRange, SourceResponse,
     };
     use crate::library::staging::{REVISION_MARKER_NAME, SELECTED_MARKER_NAME};
     use crate::persistence::JobStateTag;
     use crate::testing::{Deferred, RecordingSink, Rendezvous, DEFAULT_TEST_TIMEOUT};
+    use crate::transfer::commit::DownloadCommitFailure;
     use crate::transfer::queue::JobFile;
 
     // -----------------------------------------------------------------
@@ -2525,6 +2784,47 @@ mod tests {
         closed: Arc<AtomicUsize>,
     }
 
+    struct RecordingTestFactory {
+        data: Vec<u8>,
+        chunk_size: usize,
+        delay: Duration,
+        opened: Arc<AtomicUsize>,
+        closed: Arc<AtomicUsize>,
+        requested_starts: Arc<StdMutex<Vec<u64>>>,
+    }
+
+    impl DownloadSourceFactory for RecordingTestFactory {
+        fn make_source(
+            &self,
+            _device_id: &DeviceId,
+            _session_id: &SessionId,
+            _file_id: &FileId,
+        ) -> Result<Box<dyn DownloadSource>, DownloadError> {
+            Ok(Box::new(RecordingSlowSource {
+                inner: SlowSource {
+                    data: self.data.clone(),
+                    chunk_size: self.chunk_size,
+                    delay: self.delay,
+                    opened: self.opened.clone(),
+                    closed: self.closed.clone(),
+                },
+                requested_starts: self.requested_starts.clone(),
+            }))
+        }
+    }
+
+    struct RecordingSlowSource {
+        inner: SlowSource,
+        requested_starts: Arc<StdMutex<Vec<u64>>>,
+    }
+
+    impl DownloadSource for RecordingSlowSource {
+        fn fetch_range(&self, request: RequestedRange) -> Result<SourceResponse, DownloadError> {
+            self.requested_starts.lock().unwrap().push(request.start);
+            self.inner.fetch_range(request)
+        }
+    }
+
     impl DownloadSourceFactory for TestFactory {
         fn make_source(
             &self,
@@ -2650,6 +2950,105 @@ mod tests {
             verifier,
             config,
         )
+    }
+
+    fn coordinator_with_commit_port(
+        transfer_store: Arc<Mutex<TransferStore>>,
+        device_status: Arc<dyn DeviceStatusPort>,
+        source_factory: Arc<dyn DownloadSourceFactory>,
+        verifier: Arc<dyn PublicationVerifier>,
+        commit_port: Arc<dyn DownloadCommitPort>,
+        config: CoordinatorConfig,
+    ) -> TransferCoordinator {
+        TransferCoordinator::build_with_commit_port(
+            transfer_store,
+            device_status,
+            source_factory,
+            verifier,
+            commit_port,
+            config,
+        )
+    }
+
+    struct FailOnceCommitter {
+        calls: AtomicUsize,
+        delegate: RawSessionCommitter,
+    }
+
+    impl DownloadCommitPort for FailOnceCommitter {
+        fn commit(
+            &self,
+            request: &DownloadCommitRequest,
+        ) -> Result<DownloadCommitOutcome, DownloadCommitFailure> {
+            if self.calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                return Err(DownloadCommitFailure::retryable(
+                    "injected derived media commit failure",
+                ));
+            }
+            self.delegate.commit(request)
+        }
+    }
+
+    struct CancellableBlockingCommitter {
+        entered: Arc<AtomicBool>,
+        exited: Arc<AtomicBool>,
+    }
+
+    struct IrreversibleBlockingCommitter {
+        entered: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        canonical_marker: PathBuf,
+    }
+
+    impl DownloadCommitPort for IrreversibleBlockingCommitter {
+        fn commit(
+            &self,
+            _request: &DownloadCommitRequest,
+        ) -> Result<DownloadCommitOutcome, DownloadCommitFailure> {
+            panic!("test must use the cancellable commit entry point")
+        }
+
+        fn commit_cancellable(
+            &self,
+            _request: &DownloadCommitRequest,
+            control: &DownloadCommitControl,
+        ) -> Result<DownloadCommitOutcome, DownloadCommitFailure> {
+            control.begin_irreversible()?;
+            self.entered.store(true, AtomicOrdering::SeqCst);
+            while !self.release.load(AtomicOrdering::SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            fs::create_dir_all(
+                self.canonical_marker
+                    .parent()
+                    .expect("test marker has a parent"),
+            )
+            .and_then(|()| fs::write(&self.canonical_marker, b"canonical"))
+            .map_err(|error| DownloadCommitFailure::retryable(error.to_string()))?;
+            Ok(DownloadCommitOutcome::clean())
+        }
+    }
+
+    impl DownloadCommitPort for CancellableBlockingCommitter {
+        fn commit(
+            &self,
+            _request: &DownloadCommitRequest,
+        ) -> Result<DownloadCommitOutcome, DownloadCommitFailure> {
+            panic!("test must use the cancellable commit entry point")
+        }
+
+        fn commit_cancellable(
+            &self,
+            _request: &DownloadCommitRequest,
+            control: &DownloadCommitControl,
+        ) -> Result<DownloadCommitOutcome, DownloadCommitFailure> {
+            self.entered.store(true, AtomicOrdering::SeqCst);
+            while !control.is_cancel_requested() {
+                thread::sleep(Duration::from_millis(1));
+            }
+            self.exited.store(true, AtomicOrdering::SeqCst);
+            Err(DownloadCommitFailure::cancelled())
+        }
     }
 
     fn test_config(dir: &Path) -> CoordinatorConfig {
@@ -2800,6 +3199,82 @@ mod tests {
         );
         assert_eq!(opened.load(Ordering::SeqCst), closed.load(Ordering::SeqCst));
         assert!(opened.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn commit_failure_is_retryable_and_retry_revalidates_complete_staged_input() {
+        let dir = tempdir().unwrap();
+        let device_id = DeviceId("dev-1".to_string());
+        let status = Arc::new(FakeDeviceStatus::new());
+        connected_device(&device_id, &status);
+
+        let data = b"source bytes needed by the derived commit".to_vec();
+        let opened = Arc::new(AtomicUsize::new(0));
+        let factory = Arc::new(TestFactory {
+            data: data.clone(),
+            chunk_size: data.len(),
+            delay: Duration::ZERO,
+            opened: opened.clone(),
+            closed: Arc::new(AtomicUsize::new(0)),
+        });
+        let verifier: Arc<dyn PublicationVerifier> = Arc::new(AlwaysPassVerifierStub);
+        let commit_port = Arc::new(FailOnceCommitter {
+            calls: AtomicUsize::new(0),
+            delegate: RawSessionCommitter::new(verifier.clone()),
+        });
+        let transfer_store = open_transfer_store(&dir.path().join("transfer.sqlite3"));
+        let config = test_config(dir.path());
+        let library_root = config.library_root.clone();
+        let coordinator = coordinator_with_commit_port(
+            transfer_store.clone(),
+            status,
+            factory,
+            verifier,
+            commit_port.clone(),
+            config,
+        );
+        let request = one_file_request(&device_id, "sess-1", "commit-retry", &data);
+        let staging = SessionStaging::for_publication(
+            &library_root,
+            device_id.as_str(),
+            request.session_id.as_str(),
+            &request.manifest_bytes,
+        )
+        .expect("staging path");
+        let parent = coordinator.enqueue(request).expect("enqueue parent");
+
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+            coordinator.job_state(&parent),
+            Some(TransferJobState::Failed {
+                retryable: true,
+                ..
+            })
+        )));
+        assert_eq!(commit_port.calls.load(AtomicOrdering::SeqCst), 1);
+        assert!(
+            !staging.published_dir().exists(),
+            "failed final commit must not make a local session visible"
+        );
+        assert_eq!(fs::read(staging.revision_dir().join("f1")).unwrap(), data);
+
+        // Ordinary retry must not trust a copied verified ledger. Corrupting
+        // the retained source forces ArtifactInspector to reject and fetch it
+        // again before the commit port sees the child attempt.
+        fs::write(staging.revision_dir().join("f1"), b"corrupt").unwrap();
+        transfer_store
+            .lock()
+            .unwrap()
+            .acknowledge_completion(parent.as_str(), "t-ack")
+            .expect("ack failed parent completion");
+        let child = coordinator.retry(&parent).expect("ordinary retry child");
+
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+            coordinator.job_state(&child),
+            Some(TransferJobState::Succeeded)
+        )));
+        assert_eq!(commit_port.calls.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(opened.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(fs::read(staging.published_dir().join("f1")).unwrap(), data);
     }
 
     // -----------------------------------------------------------------
@@ -3295,6 +3770,120 @@ mod tests {
         assert!(opened.load(Ordering::SeqCst) >= 1);
     }
 
+    #[test]
+    fn cancel_during_blocked_commit_stops_before_canonical_publication() {
+        let dir = tempdir().unwrap();
+        let device_id = DeviceId("dev-commit-cancel".to_string());
+        let status = Arc::new(FakeDeviceStatus::new());
+        connected_device(&device_id, &status);
+        let data = b"verified source awaiting derived export".to_vec();
+        let entered = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let config = test_config(dir.path());
+        let library_root = config.library_root.clone();
+        let coordinator = coordinator_with_commit_port(
+            open_transfer_store(&dir.path().join("transfer.sqlite3")),
+            status,
+            instant_factory(data.clone()),
+            Arc::new(AlwaysPassVerifierStub),
+            Arc::new(CancellableBlockingCommitter {
+                entered: entered.clone(),
+                exited: exited.clone(),
+            }),
+            config,
+        );
+        let request = one_file_request(
+            &device_id,
+            "session-commit-cancel",
+            "job-commit-cancel",
+            &data,
+        );
+        let staging = SessionStaging::for_publication(
+            &library_root,
+            device_id.as_str(),
+            request.session_id.as_str(),
+            &request.manifest_bytes,
+        )
+        .expect("staging path");
+        let job_id = coordinator.enqueue(request).expect("enqueue");
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || {
+            entered.load(AtomicOrdering::SeqCst)
+                && coordinator.job_state(&job_id) == Some(TransferJobState::Committing)
+        }));
+
+        let started = Instant::now();
+        coordinator.cancel(&job_id).expect("cancel blocked commit");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancellable commit did not settle promptly"
+        );
+        assert!(exited.load(AtomicOrdering::SeqCst));
+        assert_eq!(
+            coordinator.job_state(&job_id),
+            Some(TransferJobState::Cancelled)
+        );
+        assert!(
+            !staging.published_dir().exists(),
+            "a cancelled pre-publication commit must not expose canonical assets"
+        );
+    }
+
+    #[test]
+    fn cancel_after_irreversible_commit_point_is_rejected_and_success_remains_truthful() {
+        let dir = tempdir().unwrap();
+        let device_id = DeviceId("dev-irreversible-commit".to_string());
+        let status = Arc::new(FakeDeviceStatus::new());
+        connected_device(&device_id, &status);
+        let data = b"verified source crossing canonical point".to_vec();
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let canonical_marker = dir.path().join("library/canonical/marker");
+        let coordinator = coordinator_with_commit_port(
+            open_transfer_store(&dir.path().join("transfer.sqlite3")),
+            status,
+            instant_factory(data.clone()),
+            Arc::new(AlwaysPassVerifierStub),
+            Arc::new(IrreversibleBlockingCommitter {
+                entered: entered.clone(),
+                release: release.clone(),
+                canonical_marker: canonical_marker.clone(),
+            }),
+            test_config(dir.path()),
+        );
+        let job_id = coordinator
+            .enqueue(one_file_request(
+                &device_id,
+                "session-irreversible",
+                "job-irreversible",
+                &data,
+            ))
+            .expect("enqueue");
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || {
+            entered.load(AtomicOrdering::SeqCst)
+                && coordinator.job_state(&job_id) == Some(TransferJobState::Committing)
+        }));
+
+        let error = coordinator
+            .cancel(&job_id)
+            .expect_err("cancel must lose after canonical publication becomes irreversible");
+        assert!(matches!(error, CoordinatorError::CommitIrreversible(_)));
+        assert_eq!(
+            coordinator.job_state(&job_id),
+            Some(TransferJobState::Committing)
+        );
+
+        release.store(true, AtomicOrdering::SeqCst);
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || {
+            coordinator.job_state(&job_id) == Some(TransferJobState::Succeeded)
+        }));
+        assert!(canonical_marker.exists());
+        assert_ne!(
+            coordinator.job_state(&job_id),
+            Some(TransferJobState::Cancelled)
+        );
+    }
+
     // -----------------------------------------------------------------
     // Capture-active pause: stream closes before the state transition is
     // observable, and the job resumes once activity returns to idle.
@@ -3392,6 +3981,1322 @@ mod tests {
             coordinator.job_state(&job_id)
         );
         assert_eq!(opened.load(Ordering::SeqCst), closed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn device_loss_never_restarts_old_attempt_and_explicit_retry_starts_from_zero() {
+        let dir = tempdir().unwrap();
+        let device_id = DeviceId("dev-network-loss".to_string());
+        let status = Arc::new(FakeDeviceStatus::new());
+        connected_device(&device_id, &status);
+
+        let data = vec![11_u8; 2_048];
+        let opened = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let requested_starts = Arc::new(StdMutex::new(Vec::new()));
+        let factory = Arc::new(RecordingTestFactory {
+            data: data.clone(),
+            chunk_size: 8,
+            delay: Duration::from_millis(5),
+            opened: opened.clone(),
+            closed: closed.clone(),
+            requested_starts: requested_starts.clone(),
+        });
+        let transfer_store = open_transfer_store(&dir.path().join("transfer.sqlite3"));
+        let config = CoordinatorConfig {
+            num_workers: 1,
+            ..test_config(dir.path())
+        };
+        let library_root = config.library_root.clone();
+        let coordinator = coordinator_with_store(
+            transfer_store.clone(),
+            status.clone(),
+            factory,
+            Arc::new(AlwaysPassVerifierStub),
+            config,
+        );
+        let request = one_file_request(
+            &device_id,
+            "session-network-loss",
+            "network-loss-attempt",
+            &data,
+        );
+        let staging = SessionStaging::for_publication(
+            &library_root,
+            device_id.as_str(),
+            request.session_id.as_str(),
+            &request.manifest_bytes,
+        )
+        .expect("derive revision staging");
+        let parent = coordinator
+            .enqueue(request)
+            .expect("enqueue parent attempt");
+
+        assert!(wait_until(Duration::from_secs(2), || {
+            matches!(
+                coordinator.job_state(&parent),
+                Some(TransferJobState::Transferring)
+            ) && coordinator
+                .job_progress(&parent)
+                .is_some_and(|progress| progress.transferred_bytes > 0)
+        }));
+        status.set(
+            &device_id,
+            ConnectionState::Disconnected,
+            CaptureActivityState::Idle,
+        );
+        coordinator.tick();
+
+        assert!(wait_until(Duration::from_secs(2), || matches!(
+            coordinator.job_state(&parent),
+            Some(TransferJobState::Failed {
+                code: FailureCode::Network,
+                retryable: true,
+            })
+        )));
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            closed.load(Ordering::SeqCst),
+            "the failed attempt must release its source before becoming terminal"
+        );
+
+        let opens_after_failure = opened.load(Ordering::SeqCst);
+        connected_device(&device_id, &status);
+        coordinator.tick();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            coordinator.job_state(&parent),
+            Some(TransferJobState::Failed {
+                code: FailureCode::Network,
+                retryable: true,
+            }),
+            "reconnection must not resurrect the interrupted attempt"
+        );
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            opens_after_failure,
+            "reconnection must not schedule another request for the old attempt"
+        );
+
+        let target = staging.revision_dir().join("f1");
+        fs::create_dir_all(target.parent().unwrap()).expect("create staged target parent");
+        let partial = part_path(&target);
+        fs::write(&partial, &data[..64]).expect("seed old attempt partial bytes");
+        DownloadJournal::advance(
+            &journal_path(&target),
+            &partial,
+            &DownloadJournal {
+                confirmed_offset: 64,
+                expected_size: data.len() as u64,
+                expected_sha256_hex: sha256_hex(&data),
+                etag: Some("old-attempt-etag".to_string()),
+            },
+        )
+        .expect("seed old attempt resume journal");
+
+        status.set(
+            &device_id,
+            ConnectionState::Disconnected,
+            CaptureActivityState::Idle,
+        );
+        transfer_store
+            .lock()
+            .unwrap()
+            .acknowledge_completion(parent.as_str(), "t-network-loss-ack")
+            .expect("acknowledge network failure");
+        let child = coordinator
+            .retry(&parent)
+            .expect("explicit retry creates a new attempt");
+        assert_ne!(child, parent);
+        let lineage = transfer_store
+            .lock()
+            .unwrap()
+            .retry_parent(child.as_str())
+            .expect("read retry lineage")
+            .expect("retry child has a parent");
+        assert_eq!(lineage.parent_job_id, parent.as_str());
+        assert_eq!(lineage.attempt, 1);
+        let child_ledger = transfer_store
+            .lock()
+            .unwrap()
+            .file_ledger(child.as_str())
+            .expect("read retry ledger");
+        assert_eq!(child_ledger.len(), 1);
+        assert_eq!(
+            child_ledger[0].status,
+            crate::persistence::FileLedgerStatus::Missing
+        );
+        assert_eq!(child_ledger[0].bytes_confirmed, 0);
+
+        connected_device(&device_id, &status);
+        coordinator.tick();
+        assert!(wait_until(Duration::from_secs(2), || {
+            requested_starts.lock().unwrap().len() >= 2
+        }));
+        assert_eq!(
+            requested_starts.lock().unwrap()[1],
+            0,
+            "the explicit retry must discard the old journal before its first request"
+        );
+    }
+
+    #[test]
+    fn enqueueing_a_dismissed_failed_session_creates_a_fresh_byte_zero_child() {
+        let dir = tempdir().unwrap();
+        let device_id = DeviceId("dev-dismissed-enqueue".to_string());
+        let status = Arc::new(FakeDeviceStatus::new());
+        connected_device(&device_id, &status);
+
+        let data = vec![23_u8; 2_048];
+        let requested_starts = Arc::new(StdMutex::new(Vec::new()));
+        let transfer_store = open_transfer_store(&dir.path().join("transfer.sqlite3"));
+        let config = CoordinatorConfig {
+            num_workers: 1,
+            checkpoint_threshold_bytes: data.len() as u64,
+            ..test_config(dir.path())
+        };
+        let library_root = config.library_root.clone();
+        let coordinator = coordinator_with_store(
+            transfer_store.clone(),
+            status.clone(),
+            Arc::new(RecordingTestFactory {
+                data: data.clone(),
+                chunk_size: 8,
+                delay: Duration::from_millis(2),
+                opened: Arc::new(AtomicUsize::new(0)),
+                closed: Arc::new(AtomicUsize::new(0)),
+                requested_starts: requested_starts.clone(),
+            }),
+            Arc::new(AlwaysPassVerifierStub),
+            config,
+        );
+        let request = one_file_request(
+            &device_id,
+            "session-dismissed-enqueue",
+            "dismissed-enqueue-parent",
+            &data,
+        );
+        let staging = SessionStaging::for_publication(
+            &library_root,
+            device_id.as_str(),
+            request.session_id.as_str(),
+            &request.manifest_bytes,
+        )
+        .expect("derive shared staging");
+        let parent = coordinator
+            .enqueue(request.clone())
+            .expect("enqueue parent");
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || coordinator
+            .job_progress(&parent)
+            .is_some_and(|progress| progress.transferred_bytes > 0)));
+        status.set(
+            &device_id,
+            ConnectionState::Disconnected,
+            CaptureActivityState::Idle,
+        );
+        coordinator.tick();
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+            coordinator.job_state(&parent),
+            Some(TransferJobState::Failed {
+                code: FailureCode::Network,
+                retryable: true,
+            })
+        )));
+        {
+            let mut store = transfer_store.lock().unwrap();
+            store
+                .acknowledge_completion(parent.as_str(), "t-dismissed-parent-ack")
+                .expect("ack parent failure");
+            assert!(store
+                .dismiss_job(parent.as_str(), "t-dismissed-parent")
+                .expect("durably dismiss parent"));
+            assert!(matches!(
+                store.spawn_fresh_download_retry_job(
+                    parent.as_str(),
+                    "tray-retry-must-stay-rejected",
+                    "t-tray-retry",
+                    || Ok(()),
+                ),
+                Err(RetryJobError::DismissedParent { .. })
+            ));
+        }
+        coordinator
+            .dismiss_runtime(&parent)
+            .expect("retire dismissed parent runtime");
+        assert!(coordinator.job_snapshot(&parent).is_none());
+
+        let target = staging.revision_dir().join("f1");
+        fs::create_dir_all(target.parent().unwrap()).expect("create stale staging");
+        let partial = part_path(&target);
+        fs::write(&partial, &data[..64]).expect("seed stale partial");
+        DownloadJournal::advance(
+            &journal_path(&target),
+            &partial,
+            &DownloadJournal {
+                confirmed_offset: 64,
+                expected_size: data.len() as u64,
+                expected_sha256_hex: sha256_hex(&data),
+                etag: Some("dismissed-parent-etag".to_string()),
+            },
+        )
+        .expect("seed stale journal");
+
+        let child = coordinator
+            .enqueue(request.clone())
+            .expect("re-enqueue dismissed transfer");
+        assert_ne!(child, parent);
+        assert!(coordinator.job_snapshot(&parent).is_none());
+        assert_eq!(
+            coordinator
+                .enqueue(request)
+                .expect("duplicate re-enqueue reuses active child"),
+            child
+        );
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+            coordinator.job_state(&child),
+            Some(TransferJobState::WaitingForDevice)
+        )));
+        assert!(!partial.exists());
+        assert!(!journal_path(&target).exists());
+
+        let (parent_row, child_ledger, lineage) = {
+            let store = transfer_store.lock().unwrap();
+            (
+                store
+                    .get_job(parent.as_str())
+                    .expect("read parent")
+                    .expect("parent remains for audit"),
+                store
+                    .file_ledger(child.as_str())
+                    .expect("read child ledger"),
+                store
+                    .retry_parent(child.as_str())
+                    .expect("read child lineage")
+                    .expect("child lineage exists"),
+            )
+        };
+        assert_eq!(parent_row.state, JobStateTag::Failed);
+        assert_eq!(
+            parent_row.dismissed_at.as_deref(),
+            Some("t-dismissed-parent")
+        );
+        assert_eq!(lineage.parent_job_id, parent.as_str());
+        assert_eq!(lineage.attempt, 1);
+        assert_eq!(child_ledger.len(), 1);
+        assert_eq!(
+            child_ledger[0].status,
+            crate::persistence::FileLedgerStatus::Missing
+        );
+        assert_eq!(child_ledger[0].bytes_confirmed, 0);
+
+        connected_device(&device_id, &status);
+        coordinator.tick();
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || {
+            requested_starts.lock().unwrap().len() >= 2
+        }));
+        assert_eq!(requested_starts.lock().unwrap()[1], 0);
+    }
+
+    #[test]
+    fn an_existing_enqueue_snapshot_cannot_resurrect_a_parent_dismissed_before_install() {
+        let dir = tempdir().unwrap();
+        let device_id = DeviceId("dev-existing-dismiss-race".to_string());
+        let status = Arc::new(FakeDeviceStatus::new());
+        connected_device(&device_id, &status);
+
+        let data = vec![29_u8; 1_024];
+        let transfer_store = open_transfer_store(&dir.path().join("transfer.sqlite3"));
+        let coordinator = coordinator_with_store(
+            transfer_store.clone(),
+            status.clone(),
+            Arc::new(TestFactory {
+                data: data.clone(),
+                chunk_size: 8,
+                delay: Duration::from_millis(1),
+                opened: Arc::new(AtomicUsize::new(0)),
+                closed: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(AlwaysPassVerifierStub),
+            CoordinatorConfig {
+                num_workers: 1,
+                checkpoint_threshold_bytes: data.len() as u64,
+                ..test_config(dir.path())
+            },
+        );
+        let request = one_file_request(
+            &device_id,
+            "session-existing-dismiss-race",
+            "existing-dismiss-race-parent",
+            &data,
+        );
+        let parent = coordinator
+            .enqueue(request.clone())
+            .expect("enqueue parent");
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || coordinator
+            .job_progress(&parent)
+            .is_some_and(|progress| progress.transferred_bytes > 0)));
+        status.set(
+            &device_id,
+            ConnectionState::Disconnected,
+            CaptureActivityState::Idle,
+        );
+        coordinator.tick();
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+            coordinator.job_state(&parent),
+            Some(TransferJobState::Failed {
+                code: FailureCode::Network,
+                retryable: true,
+            })
+        )));
+        transfer_store
+            .lock()
+            .unwrap()
+            .acknowledge_completion(parent.as_str(), "t-race-parent-ack")
+            .expect("ack parent failure");
+
+        let hook = Arc::new(EnqueueExistingRuntimeHook {
+            existing_observed: RecordingSink::new(),
+            enqueue_arrivals: AtomicU64::new(0),
+            release: Deferred::new(),
+            late_enqueue_waiting: None,
+            release_late_enqueue: None,
+        });
+        *coordinator
+            .inner
+            .enqueue_existing_runtime_hook
+            .lock()
+            .unwrap() = Some(hook.clone());
+        let child = thread::scope(|scope| {
+            let enqueue = scope.spawn(|| coordinator.enqueue(request));
+            assert!(hook.existing_observed.wait_for(1, DEFAULT_TEST_TIMEOUT));
+            {
+                let mut store = transfer_store.lock().unwrap();
+                assert!(store
+                    .dismiss_job(parent.as_str(), "t-race-parent-dismiss")
+                    .expect("durably dismiss parent"));
+            }
+            coordinator
+                .dismiss_runtime(&parent)
+                .expect("retire parent runtime");
+            assert!(coordinator.job_snapshot(&parent).is_none());
+            assert!(hook.release.release(()));
+            enqueue
+                .join()
+                .expect("enqueue thread")
+                .expect("enqueue result")
+        });
+        *coordinator
+            .inner
+            .enqueue_existing_runtime_hook
+            .lock()
+            .unwrap() = None;
+
+        assert_ne!(child, parent);
+        assert!(coordinator.job_snapshot(&parent).is_none());
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+            coordinator.job_state(&child),
+            Some(TransferJobState::WaitingForDevice)
+        )));
+        let store = transfer_store.lock().unwrap();
+        let parent_row = store
+            .get_job(parent.as_str())
+            .expect("read parent")
+            .expect("parent remains durable");
+        assert_eq!(parent_row.state, JobStateTag::Failed);
+        assert_eq!(
+            parent_row.dismissed_at.as_deref(),
+            Some("t-race-parent-dismiss")
+        );
+        assert_eq!(
+            store
+                .retry_parent(child.as_str())
+                .expect("read lineage")
+                .expect("child lineage")
+                .parent_job_id,
+            parent.as_str()
+        );
+    }
+
+    #[test]
+    fn stale_same_parent_enqueue_reuses_the_first_child_after_it_terminalizes() {
+        let dir = tempdir().unwrap();
+        let device_id = DeviceId("dev-terminal-enqueue-replay".to_string());
+        let status = Arc::new(FakeDeviceStatus::new());
+        connected_device(&device_id, &status);
+
+        let data = vec![31_u8; 4_096];
+        let opened = Arc::new(AtomicUsize::new(0));
+        let requested_starts = Arc::new(StdMutex::new(Vec::new()));
+        let transfer_store = open_transfer_store(&dir.path().join("transfer.sqlite3"));
+        let coordinator = coordinator_with_store(
+            transfer_store.clone(),
+            status.clone(),
+            Arc::new(RecordingTestFactory {
+                data: data.clone(),
+                chunk_size: 8,
+                delay: Duration::from_millis(2),
+                opened: opened.clone(),
+                closed: Arc::new(AtomicUsize::new(0)),
+                requested_starts: requested_starts.clone(),
+            }),
+            Arc::new(AlwaysPassVerifierStub),
+            CoordinatorConfig {
+                num_workers: 2,
+                checkpoint_threshold_bytes: data.len() as u64,
+                ..test_config(dir.path())
+            },
+        );
+        let request = one_file_request(
+            &device_id,
+            "session-terminal-enqueue-replay",
+            "terminal-enqueue-replay-parent",
+            &data,
+        );
+        let parent = coordinator
+            .enqueue(request.clone())
+            .expect("enqueue parent");
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || coordinator
+            .job_progress(&parent)
+            .is_some_and(|progress| progress.transferred_bytes > 0)));
+        status.set(
+            &device_id,
+            ConnectionState::Disconnected,
+            CaptureActivityState::Idle,
+        );
+        coordinator.tick();
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+            coordinator.job_state(&parent),
+            Some(TransferJobState::Failed {
+                code: FailureCode::Network,
+                retryable: true,
+            })
+        )));
+        let opens_after_parent = opened.load(Ordering::SeqCst);
+        assert_eq!(opens_after_parent, 1);
+        {
+            let mut store = transfer_store.lock().unwrap();
+            store
+                .acknowledge_completion(parent.as_str(), "t-terminal-replay-parent-ack")
+                .expect("ack parent failure");
+            assert!(store
+                .dismiss_job(parent.as_str(), "t-terminal-replay-parent-dismiss")
+                .expect("durably dismiss parent"));
+        }
+        coordinator
+            .dismiss_runtime(&parent)
+            .expect("retire dismissed parent runtime");
+        connected_device(&device_id, &status);
+
+        let late_enqueue_waiting = RecordingSink::new();
+        let release_late_enqueue = Deferred::new();
+        let hook = Arc::new(EnqueueExistingRuntimeHook {
+            existing_observed: RecordingSink::new(),
+            enqueue_arrivals: AtomicU64::new(0),
+            release: Deferred::new(),
+            late_enqueue_waiting: Some(late_enqueue_waiting.clone()),
+            release_late_enqueue: Some(release_late_enqueue.clone()),
+        });
+        *coordinator
+            .inner
+            .enqueue_existing_runtime_hook
+            .lock()
+            .unwrap() = Some(hook.clone());
+
+        let (first_child, replayed_child) = thread::scope(|scope| {
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let result_tx = result_tx.clone();
+                    let request = request.clone();
+                    let coordinator = &coordinator;
+                    scope.spawn(move || {
+                        let result = coordinator.enqueue(request);
+                        result_tx
+                            .send(
+                                result
+                                    .as_ref()
+                                    .map(Clone::clone)
+                                    .map_err(ToString::to_string),
+                            )
+                            .expect("send enqueue result");
+                        result
+                    })
+                })
+                .collect();
+            drop(result_tx);
+
+            assert!(hook.existing_observed.wait_for(2, DEFAULT_TEST_TIMEOUT));
+            assert!(late_enqueue_waiting.wait_for(1, DEFAULT_TEST_TIMEOUT));
+            assert!(hook.release.release(()));
+            let first_child = result_rx
+                .recv_timeout(DEFAULT_TEST_TIMEOUT)
+                .expect("first enqueue returned")
+                .expect("first enqueue succeeded");
+            assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+                coordinator.job_state(&first_child),
+                Some(TransferJobState::Succeeded)
+            )));
+
+            assert!(release_late_enqueue.release(()));
+            let replayed_child = result_rx
+                .recv_timeout(DEFAULT_TEST_TIMEOUT)
+                .expect("late enqueue returned")
+                .expect("late enqueue succeeded");
+            for handle in handles {
+                handle
+                    .join()
+                    .expect("enqueue thread")
+                    .expect("enqueue result");
+            }
+            (first_child, replayed_child)
+        });
+        *coordinator
+            .inner
+            .enqueue_existing_runtime_hook
+            .lock()
+            .unwrap() = None;
+
+        assert_eq!(replayed_child, first_child);
+        coordinator.tick();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(opened.load(Ordering::SeqCst), opens_after_parent + 1);
+        assert_eq!(requested_starts.lock().unwrap().as_slice(), &[0, 0]);
+        assert!(matches!(
+            coordinator.job_state(&first_child),
+            Some(TransferJobState::Succeeded)
+        ));
+
+        let store = transfer_store.lock().unwrap();
+        assert_eq!(store.list_jobs().expect("list attempts").len(), 2);
+        assert_eq!(
+            store
+                .latest_retry_child(parent.as_str())
+                .expect("read latest child")
+                .expect("latest child exists")
+                .job_id,
+            first_child.as_str()
+        );
+        let lineage = store
+            .retry_parent(first_child.as_str())
+            .expect("read child lineage")
+            .expect("child lineage exists");
+        assert_eq!(lineage.parent_job_id, parent.as_str());
+        assert_eq!(lineage.attempt, 1);
+    }
+
+    #[test]
+    fn stale_dismissed_parent_enqueue_prefers_an_active_grandchild() {
+        let dir = tempdir().unwrap();
+        let device_id = DeviceId("dev-enqueue-active-grandchild".to_string());
+        let status = Arc::new(FakeDeviceStatus::new());
+        connected_device(&device_id, &status);
+
+        let data = vec![37_u8; 4_096];
+        let opened = Arc::new(AtomicUsize::new(0));
+        let requested_starts = Arc::new(StdMutex::new(Vec::new()));
+        let transfer_store = open_transfer_store(&dir.path().join("transfer.sqlite3"));
+        let config = CoordinatorConfig {
+            num_workers: 1,
+            checkpoint_threshold_bytes: data.len() as u64,
+            ..test_config(dir.path())
+        };
+        let library_root = config.library_root.clone();
+        let coordinator = coordinator_with_store(
+            transfer_store.clone(),
+            status.clone(),
+            Arc::new(RecordingTestFactory {
+                data: data.clone(),
+                chunk_size: 8,
+                delay: Duration::from_millis(2),
+                opened: opened.clone(),
+                closed: Arc::new(AtomicUsize::new(0)),
+                requested_starts: requested_starts.clone(),
+            }),
+            Arc::new(AlwaysPassVerifierStub),
+            config,
+        );
+        let request = one_file_request(
+            &device_id,
+            "session-enqueue-active-grandchild",
+            "enqueue-active-grandchild-parent",
+            &data,
+        );
+        let staging = SessionStaging::for_publication(
+            &library_root,
+            device_id.as_str(),
+            request.session_id.as_str(),
+            &request.manifest_bytes,
+        )
+        .expect("derive shared staging");
+
+        let parent = coordinator
+            .enqueue(request.clone())
+            .expect("enqueue parent");
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || coordinator
+            .job_progress(&parent)
+            .is_some_and(|progress| progress.transferred_bytes > 0)));
+        status.set(
+            &device_id,
+            ConnectionState::Disconnected,
+            CaptureActivityState::Idle,
+        );
+        coordinator.tick();
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+            coordinator.job_state(&parent),
+            Some(TransferJobState::Failed {
+                code: FailureCode::Network,
+                retryable: true,
+            })
+        )));
+        {
+            let mut store = transfer_store.lock().unwrap();
+            store
+                .acknowledge_completion(parent.as_str(), "t-enqueue-grandchild-parent-ack")
+                .expect("ack parent failure");
+            assert!(store
+                .dismiss_job(parent.as_str(), "t-enqueue-grandchild-parent-dismiss")
+                .expect("durably dismiss parent"));
+        }
+        coordinator
+            .dismiss_runtime(&parent)
+            .expect("retire dismissed parent runtime");
+
+        let hook = Arc::new(EnqueueExistingRuntimeHook {
+            existing_observed: RecordingSink::new(),
+            enqueue_arrivals: AtomicU64::new(0),
+            release: Deferred::new(),
+            late_enqueue_waiting: None,
+            release_late_enqueue: None,
+        });
+        *coordinator
+            .inner
+            .enqueue_existing_runtime_hook
+            .lock()
+            .unwrap() = Some(hook.clone());
+
+        let (
+            child,
+            grandchild,
+            replayed,
+            sentinel,
+            opens_before_replay,
+            runtime_count_before,
+            durable_count_before,
+        ) = thread::scope(|scope| {
+            let stale_request = request.clone();
+            let stale_enqueue = scope.spawn(|| coordinator.enqueue(stale_request));
+            assert!(hook.existing_observed.wait_for(1, DEFAULT_TEST_TIMEOUT));
+            assert!(transfer_store
+                .lock()
+                .unwrap()
+                .latest_retry_child(parent.as_str())
+                .expect("read lineage before creating child")
+                .is_none());
+            *coordinator
+                .inner
+                .enqueue_existing_runtime_hook
+                .lock()
+                .unwrap() = None;
+
+            let child = coordinator
+                .enqueue(request.clone())
+                .expect("create direct enqueue child");
+            assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+                coordinator.job_state(&child),
+                Some(TransferJobState::WaitingForDevice)
+            )));
+            connected_device(&device_id, &status);
+            coordinator.tick();
+            assert!(wait_until(DEFAULT_TEST_TIMEOUT, || coordinator
+                .job_progress(&child)
+                .is_some_and(|progress| progress.transferred_bytes > 0)));
+            status.set(
+                &device_id,
+                ConnectionState::Disconnected,
+                CaptureActivityState::Idle,
+            );
+            coordinator.tick();
+            assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+                coordinator.job_state(&child),
+                Some(TransferJobState::Failed {
+                    code: FailureCode::Network,
+                    retryable: true,
+                })
+            )));
+            transfer_store
+                .lock()
+                .unwrap()
+                .acknowledge_completion(child.as_str(), "t-enqueue-grandchild-child-ack")
+                .expect("ack child failure");
+
+            let grandchild = coordinator
+                .retry(&child)
+                .expect("create explicit retry grandchild");
+            assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+                coordinator.job_state(&grandchild),
+                Some(TransferJobState::WaitingForDevice)
+            )));
+            let sentinel = staging.revision_dir().join("active-grandchild-sentinel");
+            fs::create_dir_all(staging.revision_dir()).expect("create active staging root");
+            fs::write(&sentinel, b"owned by explicit retry grandchild")
+                .expect("seed active staging sentinel");
+            let opens_before_replay = opened.load(Ordering::SeqCst);
+            let runtime_count_before = coordinator.job_ids().len();
+            let durable_count_before = transfer_store
+                .lock()
+                .unwrap()
+                .list_jobs()
+                .expect("list attempts before replay")
+                .len();
+
+            assert!(hook.release.release(()));
+            let replayed = stale_enqueue
+                .join()
+                .expect("stale enqueue thread")
+                .expect("stale dismissed-parent enqueue");
+            (
+                child,
+                grandchild,
+                replayed,
+                sentinel,
+                opens_before_replay,
+                runtime_count_before,
+                durable_count_before,
+            )
+        });
+        assert_eq!(replayed, grandchild);
+        coordinator.tick();
+        thread::sleep(Duration::from_millis(50));
+        assert!(sentinel.exists());
+        assert_eq!(opened.load(Ordering::SeqCst), opens_before_replay);
+        assert_eq!(coordinator.job_ids().len(), runtime_count_before);
+        assert_eq!(requested_starts.lock().unwrap().as_slice(), &[0, 0]);
+
+        let store = transfer_store.lock().unwrap();
+        assert_eq!(
+            store.list_jobs().expect("list attempts after replay").len(),
+            durable_count_before
+        );
+        assert_eq!(
+            store
+                .latest_retry_child(parent.as_str())
+                .expect("read direct child")
+                .expect("direct child exists")
+                .job_id,
+            child.as_str()
+        );
+        assert_eq!(
+            store
+                .latest_retry_child(child.as_str())
+                .expect("read grandchild")
+                .expect("grandchild exists")
+                .job_id,
+            grandchild.as_str()
+        );
+    }
+
+    #[test]
+    fn retrying_an_ancestor_reuses_an_active_grandchild_without_discarding_its_staging() {
+        let dir = tempdir().unwrap();
+        let device_id = DeviceId("dev-active-grandchild".to_string());
+        let status = Arc::new(FakeDeviceStatus::new());
+        connected_device(&device_id, &status);
+
+        let data = vec![13_u8; 2_048];
+        let transfer_store = open_transfer_store(&dir.path().join("transfer.sqlite3"));
+        let config = CoordinatorConfig {
+            num_workers: 1,
+            ..test_config(dir.path())
+        };
+        let library_root = config.library_root.clone();
+        let coordinator = coordinator_with_store(
+            transfer_store.clone(),
+            status.clone(),
+            Arc::new(TestFactory {
+                data: data.clone(),
+                chunk_size: 8,
+                delay: Duration::from_millis(5),
+                opened: Arc::new(AtomicUsize::new(0)),
+                closed: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(AlwaysPassVerifierStub),
+            config,
+        );
+        let request = one_file_request(
+            &device_id,
+            "session-active-grandchild",
+            "active-grandchild-parent",
+            &data,
+        );
+        let staging = SessionStaging::for_publication(
+            &library_root,
+            device_id.as_str(),
+            request.session_id.as_str(),
+            &request.manifest_bytes,
+        )
+        .expect("derive shared revision staging");
+        let parent = coordinator.enqueue(request).expect("enqueue parent");
+
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || coordinator
+            .job_progress(&parent)
+            .is_some_and(|progress| progress.transferred_bytes > 0)));
+        status.set(
+            &device_id,
+            ConnectionState::Disconnected,
+            CaptureActivityState::Idle,
+        );
+        coordinator.tick();
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+            coordinator.job_state(&parent),
+            Some(TransferJobState::Failed {
+                code: FailureCode::Network,
+                retryable: true,
+            })
+        )));
+        transfer_store
+            .lock()
+            .unwrap()
+            .acknowledge_completion(parent.as_str(), "t-parent-ack")
+            .expect("ack parent failure");
+
+        let child = coordinator
+            .retry(&parent)
+            .expect("create first retry child");
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+            coordinator.job_state(&child),
+            Some(TransferJobState::WaitingForDevice)
+        )));
+        connected_device(&device_id, &status);
+        coordinator.tick();
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || coordinator
+            .job_progress(&child)
+            .is_some_and(|progress| progress.transferred_bytes > 0)));
+        status.set(
+            &device_id,
+            ConnectionState::Disconnected,
+            CaptureActivityState::Idle,
+        );
+        coordinator.tick();
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+            coordinator.job_state(&child),
+            Some(TransferJobState::Failed {
+                code: FailureCode::Network,
+                retryable: true,
+            })
+        )));
+        transfer_store
+            .lock()
+            .unwrap()
+            .acknowledge_completion(child.as_str(), "t-child-ack")
+            .expect("ack child failure");
+
+        let grandchild = coordinator
+            .retry(&child)
+            .expect("create second retry generation");
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+            coordinator.job_state(&grandchild),
+            Some(TransferJobState::WaitingForDevice)
+        )));
+        let sentinel = staging.revision_dir().join("active-grandchild-sentinel");
+        fs::create_dir_all(staging.revision_dir()).expect("create active staging root");
+        fs::write(&sentinel, b"owned by active grandchild").expect("seed staging sentinel");
+        let job_count_before = coordinator.job_ids().len();
+
+        let replayed_from_parent = coordinator
+            .retry(&parent)
+            .expect("retrying the ancestor must be idempotent");
+        assert_eq!(replayed_from_parent, grandchild);
+        assert!(
+            sentinel.exists(),
+            "an active descendant's staging must never be discarded"
+        );
+        assert_eq!(
+            coordinator.job_ids().len(),
+            job_count_before,
+            "retrying an ancestor must not create a parallel sibling"
+        );
+        assert_eq!(
+            transfer_store
+                .lock()
+                .unwrap()
+                .latest_retry_child(parent.as_str())
+                .expect("read parent's direct child")
+                .expect("parent has direct child")
+                .job_id,
+            child.as_str(),
+            "the terminal direct child must not be replaced while its descendant is active"
+        );
+
+        let replayed_from_child = coordinator
+            .retry(&child)
+            .expect("repeating the direct retry is idempotent");
+        assert_eq!(replayed_from_child, grandchild);
+        assert!(sentinel.exists());
+    }
+
+    #[test]
+    fn concurrent_retry_installs_one_runtime_without_overwriting_live_progress() {
+        let dir = tempdir().unwrap();
+        let device_id = DeviceId("dev-concurrent-retry".to_string());
+        let status = Arc::new(FakeDeviceStatus::new());
+        connected_device(&device_id, &status);
+
+        let data = vec![17_u8; 4_096];
+        let opened = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let requested_starts = Arc::new(StdMutex::new(Vec::new()));
+        let transfer_store = open_transfer_store(&dir.path().join("transfer.sqlite3"));
+        let coordinator = coordinator_with_store(
+            transfer_store.clone(),
+            status.clone(),
+            Arc::new(RecordingTestFactory {
+                data: data.clone(),
+                chunk_size: 8,
+                delay: Duration::from_millis(2),
+                opened: opened.clone(),
+                closed,
+                requested_starts: requested_starts.clone(),
+            }),
+            Arc::new(AlwaysPassVerifierStub),
+            CoordinatorConfig {
+                num_workers: 2,
+                checkpoint_threshold_bytes: data.len() as u64,
+                ..test_config(dir.path())
+            },
+        );
+        let parent = coordinator
+            .enqueue(one_file_request(
+                &device_id,
+                "session-concurrent-retry",
+                "concurrent-retry-parent",
+                &data,
+            ))
+            .expect("enqueue parent");
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || coordinator
+            .job_progress(&parent)
+            .is_some_and(|progress| progress.transferred_bytes > 0)));
+        status.set(
+            &device_id,
+            ConnectionState::Disconnected,
+            CaptureActivityState::Idle,
+        );
+        coordinator.tick();
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+            coordinator.job_state(&parent),
+            Some(TransferJobState::Failed {
+                code: FailureCode::Network,
+                retryable: true,
+            })
+        )));
+        let opens_after_parent = opened.load(Ordering::SeqCst);
+        assert_eq!(opens_after_parent, 1);
+        transfer_store
+            .lock()
+            .unwrap()
+            .acknowledge_completion(parent.as_str(), "t-concurrent-parent-ack")
+            .expect("ack parent failure");
+        connected_device(&device_id, &status);
+
+        let hook = Arc::new(RetryRuntimeInstallHook {
+            durable_outcome_barrier: Rendezvous::new(2),
+            retry_arrivals: AtomicU64::new(0),
+            late_retry_waiting: None,
+            release_late_retry: None,
+            runtime_installed: RecordingSink::new(),
+            release_installer: Deferred::new(),
+        });
+        *coordinator.inner.retry_runtime_install_hook.lock().unwrap() = Some(hook.clone());
+
+        let (child, before_loser, retry_results) = thread::scope(|scope| {
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let result_tx = result_tx.clone();
+                    let parent = parent.clone();
+                    let coordinator = &coordinator;
+                    scope.spawn(move || {
+                        let result = coordinator.retry(&parent);
+                        result_tx
+                            .send(
+                                result
+                                    .as_ref()
+                                    .map(Clone::clone)
+                                    .map_err(ToString::to_string),
+                            )
+                            .expect("send retry result");
+                        result
+                    })
+                })
+                .collect();
+            drop(result_tx);
+
+            assert!(
+                hook.runtime_installed.wait_for(1, DEFAULT_TEST_TIMEOUT),
+                "neither retry installed the shared child runtime"
+            );
+            let child = JobId(
+                transfer_store
+                    .lock()
+                    .unwrap()
+                    .latest_retry_child(parent.as_str())
+                    .expect("read retry child")
+                    .expect("retry child exists")
+                    .job_id,
+            );
+            let progressed = wait_until(DEFAULT_TEST_TIMEOUT, || {
+                coordinator
+                    .job_progress(&child)
+                    .is_some_and(|progress| progress.transferred_bytes > 0)
+            });
+            let before_loser = coordinator
+                .job_snapshot(&child)
+                .expect("winner published a complete runtime");
+            hook.release_installer.release(());
+            assert!(progressed, "the installed child never advanced");
+
+            let retry_results: Vec<_> = (0..2)
+                .map(|_| {
+                    result_rx
+                        .recv_timeout(DEFAULT_TEST_TIMEOUT)
+                        .expect("retry caller returned")
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("retry thread").expect("retry result");
+            }
+            (child, before_loser, retry_results)
+        });
+        *coordinator.inner.retry_runtime_install_hook.lock().unwrap() = None;
+
+        assert!(retry_results
+            .iter()
+            .all(|result| result.as_ref() == Ok(&child)));
+        let after_loser = coordinator
+            .job_snapshot(&child)
+            .expect("child remains installed");
+        assert!(
+            after_loser.version >= before_loser.version,
+            "the losing retry replaced the winner's version cell"
+        );
+        assert!(
+            after_loser.progress.transferred_bytes >= before_loser.progress.transferred_bytes,
+            "the losing retry reset live progress"
+        );
+
+        let highest_version = AtomicU64::new(after_loser.version);
+        let highest_bytes = AtomicU64::new(after_loser.progress.transferred_bytes);
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || {
+            let Some(snapshot) = coordinator.job_snapshot(&child) else {
+                return false;
+            };
+            let prior_version = highest_version.fetch_max(snapshot.version, Ordering::SeqCst);
+            let prior_bytes =
+                highest_bytes.fetch_max(snapshot.progress.transferred_bytes, Ordering::SeqCst);
+            assert!(snapshot.version >= prior_version, "version regressed");
+            assert!(
+                snapshot.progress.transferred_bytes >= prior_bytes,
+                "progress regressed"
+            );
+            snapshot.state == TransferJobState::Succeeded
+        }));
+
+        let runtime = coordinator
+            .job_snapshot(&child)
+            .expect("terminal runtime snapshot");
+        let stored = transfer_store
+            .lock()
+            .unwrap()
+            .get_job(child.as_str())
+            .expect("read durable child")
+            .expect("durable child exists");
+        assert_eq!(stored.state, state_to_tag(&runtime.state).0);
+        assert_eq!(stored.state_version, runtime.version);
+        assert_eq!(opened.load(Ordering::SeqCst), opens_after_parent + 1);
+        assert_eq!(
+            requested_starts.lock().unwrap().as_slice(),
+            &[0, 0],
+            "the child source must be opened exactly once from byte zero"
+        );
+    }
+
+    #[test]
+    fn late_retry_cannot_resurrect_a_succeeded_dismissed_child_runtime() {
+        let dir = tempdir().unwrap();
+        let device_id = DeviceId("dev-late-retry-dismissal".to_string());
+        let status = Arc::new(FakeDeviceStatus::new());
+        connected_device(&device_id, &status);
+
+        let data = vec![19_u8; 1_024];
+        let opened = Arc::new(AtomicUsize::new(0));
+        let requested_starts = Arc::new(StdMutex::new(Vec::new()));
+        let transfer_store = open_transfer_store(&dir.path().join("transfer.sqlite3"));
+        let coordinator = coordinator_with_store(
+            transfer_store.clone(),
+            status.clone(),
+            Arc::new(RecordingTestFactory {
+                data: data.clone(),
+                chunk_size: 8,
+                delay: Duration::from_millis(1),
+                opened: opened.clone(),
+                closed: Arc::new(AtomicUsize::new(0)),
+                requested_starts: requested_starts.clone(),
+            }),
+            Arc::new(AlwaysPassVerifierStub),
+            CoordinatorConfig {
+                num_workers: 2,
+                checkpoint_threshold_bytes: data.len() as u64,
+                ..test_config(dir.path())
+            },
+        );
+        let parent = coordinator
+            .enqueue(one_file_request(
+                &device_id,
+                "session-late-retry-dismissal",
+                "late-retry-dismissal-parent",
+                &data,
+            ))
+            .expect("enqueue parent");
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || coordinator
+            .job_progress(&parent)
+            .is_some_and(|progress| progress.transferred_bytes > 0)));
+        status.set(
+            &device_id,
+            ConnectionState::Disconnected,
+            CaptureActivityState::Idle,
+        );
+        coordinator.tick();
+        assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+            coordinator.job_state(&parent),
+            Some(TransferJobState::Failed {
+                code: FailureCode::Network,
+                retryable: true,
+            })
+        )));
+        let opens_after_parent = opened.load(Ordering::SeqCst);
+        assert_eq!(opens_after_parent, 1);
+        transfer_store
+            .lock()
+            .unwrap()
+            .acknowledge_completion(parent.as_str(), "t-late-parent-ack")
+            .expect("ack parent failure");
+        connected_device(&device_id, &status);
+
+        let release_installer = Deferred::new();
+        assert!(release_installer.release(()));
+        let late_retry_waiting = RecordingSink::new();
+        let release_late_retry = Deferred::new();
+        let hook = Arc::new(RetryRuntimeInstallHook {
+            durable_outcome_barrier: Rendezvous::new(2),
+            retry_arrivals: AtomicU64::new(0),
+            late_retry_waiting: Some(late_retry_waiting.clone()),
+            release_late_retry: Some(release_late_retry.clone()),
+            runtime_installed: RecordingSink::new(),
+            release_installer,
+        });
+        *coordinator.inner.retry_runtime_install_hook.lock().unwrap() = Some(hook.clone());
+
+        let (child, durable_after_dismissal, retry_results) = thread::scope(|scope| {
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let result_tx = result_tx.clone();
+                    let parent = parent.clone();
+                    let coordinator = &coordinator;
+                    scope.spawn(move || {
+                        let result = coordinator.retry(&parent);
+                        result_tx
+                            .send(
+                                result
+                                    .as_ref()
+                                    .map(Clone::clone)
+                                    .map_err(ToString::to_string),
+                            )
+                            .expect("send retry result");
+                        result
+                    })
+                })
+                .collect();
+            drop(result_tx);
+
+            assert!(hook.runtime_installed.wait_for(1, DEFAULT_TEST_TIMEOUT));
+            assert!(late_retry_waiting.wait_for(1, DEFAULT_TEST_TIMEOUT));
+            let child = JobId(
+                transfer_store
+                    .lock()
+                    .unwrap()
+                    .latest_retry_child(parent.as_str())
+                    .expect("read retry child")
+                    .expect("retry child exists")
+                    .job_id,
+            );
+            assert!(wait_until(DEFAULT_TEST_TIMEOUT, || matches!(
+                coordinator.job_state(&child),
+                Some(TransferJobState::Succeeded)
+            )));
+            assert_eq!(opened.load(Ordering::SeqCst), opens_after_parent + 1);
+
+            let durable_after_dismissal = {
+                let mut store = transfer_store.lock().unwrap();
+                store
+                    .acknowledge_completion(child.as_str(), "t-late-child-ack")
+                    .expect("ack child success");
+                assert!(store
+                    .dismiss_job(child.as_str(), "t-late-child-dismiss")
+                    .expect("durably dismiss child"));
+                store
+                    .get_job(child.as_str())
+                    .expect("read dismissed child")
+                    .expect("dismissed child remains durable")
+            };
+            coordinator
+                .dismiss_runtime(&child)
+                .expect("retire child runtime");
+            assert!(coordinator.job_snapshot(&child).is_none());
+
+            assert!(release_late_retry.release(()));
+            let retry_results: Vec<_> = (0..2)
+                .map(|_| {
+                    result_rx
+                        .recv_timeout(DEFAULT_TEST_TIMEOUT)
+                        .expect("retry caller returned")
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("retry thread").expect("retry result");
+            }
+            (child, durable_after_dismissal, retry_results)
+        });
+        *coordinator.inner.retry_runtime_install_hook.lock().unwrap() = None;
+
+        assert!(retry_results
+            .iter()
+            .all(|result| result.as_ref() == Ok(&child)));
+        coordinator.tick();
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            coordinator.job_snapshot(&child).is_none(),
+            "the late retry resurrected a retired runtime"
+        );
+        assert!(!coordinator.job_ids().contains(&child));
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            opens_after_parent + 1,
+            "the late retry scheduled another source open"
+        );
+        assert_eq!(requested_starts.lock().unwrap().as_slice(), &[0, 0]);
+
+        let durable = transfer_store
+            .lock()
+            .unwrap()
+            .get_job(child.as_str())
+            .expect("read final durable child")
+            .expect("durable child remains");
+        assert_eq!(durable.state, JobStateTag::Succeeded);
+        assert_eq!(
+            durable.dismissed_at.as_deref(),
+            Some("t-late-child-dismiss")
+        );
+        assert_eq!(durable.state_version, durable_after_dismissal.state_version);
     }
 
     #[test]

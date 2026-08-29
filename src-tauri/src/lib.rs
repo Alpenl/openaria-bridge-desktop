@@ -504,7 +504,8 @@ pub fn run() {
         // Startup runs in four ordered stages, and the order is the point:
         //   1. load and migrate the persisted configuration (once),
         //   2. build the runtime, inert -- no threads, no timers,
-        //   3. register it as managed state, then let recovery run,
+        //   3. fail downloads interrupted by a previous process, publish the
+        //      initial state, and register the runtime as managed state,
         //   4. only now start the background loops.
         // Stage 4 used to happen inside stage 2, so a loop could tick
         // before `app.manage` and observe or emit against application
@@ -584,9 +585,9 @@ pub fn run() {
             projection_bridge.attach(&media_application);
             app.manage(media_application.clone());
 
-            // Stage 4: the application facade binds the event sink before
-            // recovery and starts background loops only after both managed
-            // states are available.
+            // Stage 4: the application facade binds the event sink and starts
+            // background loops only after both managed states are available.
+            // No previous-process transfer is replayed here.
             application.start(handle.clone());
             media_application.start(handle);
             Ok(())
@@ -599,6 +600,7 @@ pub fn run() {
             commands::add_manual_device,
             commands::disconnect_device,
             commands::list_sessions,
+            commands::get_session_detail,
             commands::delete_sessions,
             commands::cleanup_backed_up,
             commands::preview_downloaded_cleanup,
@@ -608,7 +610,6 @@ pub fn run() {
             commands::list_transfers,
             commands::download_session,
             commands::download_sessions,
-            commands::download_file,
             commands::upload_entry,
             commands::upload_entries,
             commands::retry_transfer,

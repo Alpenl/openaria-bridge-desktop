@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "name": "FFmpeg Windows essentials build",
+  "version": "8.0.1",
+  "target": "windows-x86_64",
+  "archive": "ffmpeg-8.0.1-essentials_build.zip",
+  "url": "https://github.com/GyanD/codexffmpeg/releases/download/8.0.1/ffmpeg-8.0.1-essentials_build.zip",
+  "sha256": "e2aaeaa0fdbc397d4794828086424d4aaa2102cef1fb6874f6ffd29c0b88b673",
+  "bytes": 106259850,
+  "executables": {
+    "ffmpeg": {
+      "archive_name": "ffmpeg.exe",
+      "tauri_source": "binaries/ffmpeg-x86_64-pc-windows-msvc.exe",
+      "installed_name": "ffmpeg.exe"
+    },
+    "ffprobe": {
+      "archive_name": "ffprobe.exe",
+      "tauri_source": "binaries/ffprobe-x86_64-pc-windows-msvc.exe",
+      "installed_name": "ffprobe.exe"
+    }
+  },
+  "license": "GPL-3.0-or-later",
+  "build_provider": "https://github.com/GyanD/codexffmpeg/releases/tag/8.0.1",
+  "source": "https://github.com/FFmpeg/FFmpeg/tree/n8.0.1"
+}

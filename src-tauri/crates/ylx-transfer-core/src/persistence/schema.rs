@@ -647,6 +647,18 @@ pub const MIGRATIONS: &[(u32, &str)] = &[
             ON transfer_derived_upload_jobs (upload_bundle_revision, storage_profile_identity);
         "#,
     ),
+    (
+        21,
+        r#"
+        -- Ordinary session navigation asks only for the visible page and one
+        -- canonical device identity (plus its uniquely resolvable legacy
+        -- alias). Keep that bounded lookup on the download lane and in the
+        -- deterministic order consumed by the in-memory projection.
+        CREATE INDEX transfer_jobs_download_device_session_idx
+            ON transfer_jobs (device_id, session_id, created_at, job_id)
+            WHERE operation_kind = 'download';
+        "#,
+    ),
 ];
 
 /// The highest migration version this build knows how to apply. A store
@@ -1057,6 +1069,7 @@ pub fn is_valid_transition(from: JobStateTag, to: JobStateTag) -> bool {
             | (Committing, Succeeded)
             | (Committing, RetryWait)
             | (Committing, Failed)
+            | (Committing, Cancelling)
             | (RetryWait, Queued)
             | (RetryWait, Preparing)
             | (RetryWait, Cancelling)

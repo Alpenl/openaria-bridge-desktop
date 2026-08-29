@@ -16,23 +16,28 @@
 //!
 //! Download context is persisted in the shared transfer store so a terminal
 //! job can be reconciled after restart. A successful job is not
-//! exposed as a library entry until every requested file is present at its
-//! validated target path and the application store is durably committed.
-//! Selected-artifact downloads remain partial entries; only a complete
-//! immutable inventory may be uploaded as an entire-session backup.
+//! exposed as a library entry until the complete signed inventory is present
+//! at validated staging paths, transformed into the canonical derived bundle,
+//! and the application store is durably committed. Raw selected-artifact
+//! downloads are not a desktop product surface.
 //!
 //! Synthetic devices and timer-driven transfers live in `demo.rs`/`sim.rs`
 //! and compile only with the explicit `demo` feature. No production command
 //! falls back to them.
+
+mod derived_media;
+mod derived_publication;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -43,17 +48,17 @@ use tauri::{AppHandle, Manager, Runtime};
 use ylx_transfer_adapters::credential_keyring::InMemoryCredentialVault;
 #[cfg(not(test))]
 use ylx_transfer_adapters::credential_keyring::OsKeyringCredentialVault;
-use ylx_transfer_adapters::discovery_mdns::{MdnsCandidate, MdnsDiscovery};
+use ylx_transfer_adapters::discovery_mdns::{
+    MdnsCandidate, MdnsChange, MdnsDiscovery, MdnsEventCursor, MdnsServiceId,
+};
 use ylx_transfer_adapters::object_store_s3::{S3ObjectStore, S3ObjectStoreConfig, UrlStyle};
 use ylx_transfer_adapters::pi_client_port::{AuthenticatedPiClient, PiPairingClient};
 use ylx_transfer_adapters::pi_download_source::PiDownloadSource;
 use ylx_transfer_adapters::pi_http::{
-    probe_lab_v4_device, PiHttpClient, PiHttpClientConfig, PiHttpError, PiTlsPin,
+    probe_lab_v4_device, LabV4DeviceProbe, PiHttpClient, PiHttpClientConfig, PiHttpError, PiTlsPin,
 };
 use ylx_transfer_adapters::publication_verifier::Ed25519PublicationVerifier;
-use ylx_transfer_adapters::session_export::{
-    FfmpegSessionExporter, SessionExportConfig, SessionExportPlan, SessionExportVideoInput,
-};
+use ylx_transfer_adapters::session_export::SessionExportConfig;
 
 use ylx_transfer_core::credential_vault::{
     CredentialKey, CredentialVaultError, CredentialVaultPort, Secret, SecretStatus,
@@ -64,11 +69,17 @@ use ylx_transfer_core::device::{
     SessionsPageView,
 };
 use ylx_transfer_core::device::{
-    CaptureActivityState, ConnectionState, DeleteApplyOutcome, Device as CoreDevice,
+    CapabilitySourceView, CaptureActivityState, CatalogRevisionAuthorityView, ConnectionState,
+    DeleteApplyOutcome, Device as CoreDevice, DeviceApiProfileView, DeviceCapabilitiesView,
     DeviceFingerprint, DeviceFleet, DeviceHandle, DeviceIdentity, DeviceIdentityResolutionError,
-    DeviceIdentityResolver, DiscoveryState, HeartbeatApplyOutcome, PairingPhase, PairingPort,
-    PairingStatusView, PiClientError, PiClientErrorKind, PollPairingOutcome, RefreshApplyOutcome,
-    SessionDetailOutcome, SessionDetailView, SessionSummaryView, StoredDeviceIdentity,
+    DeviceIdentityResolver, DiscoveryState, GatewayVerificationDiagnosticView,
+    GatewayVerificationVerdictView, GatewayVerificationView, HeartbeatApplyOutcome,
+    NegotiatedCapabilityView, PaginationUnavailableReasonView, PairingPhase, PairingPort,
+    PairingStatusView, PiClientError, PiClientErrorKind, PollPairingOutcome,
+    PublicationEnvelopeOriginView, RefreshApplyOutcome, SessionDetailOutcome, SessionDetailView,
+    SessionDiscoveryDiagnosticCodeView,
+    SessionDiscoveryDiagnosticView as CoreSessionDiscoveryDiagnosticView, SessionSummaryView,
+    StoredDeviceIdentity,
 };
 use ylx_transfer_core::domain::{DeviceId, FileId, JobFileSpec, JobSpec, SessionId};
 use ylx_transfer_core::library::download::{
@@ -76,17 +87,18 @@ use ylx_transfer_core::library::download::{
     PublicationVerifier,
 };
 use ylx_transfer_core::library::object_store_port::{
-    CompletedUpload, ExpectedObject, InitiateUploadRequest, MultipartUploadHandle, ObjectKey,
-    ObjectStoreError, ObjectStorePort, PartETag, PartNumber, SourceSha256, UploadId,
-    VerifiedObjectReceipt,
+    CompletedUpload, ExpectedObject, ImmutableObjectRequest, InitiateUploadRequest,
+    MultipartUploadHandle, ObjectKey, ObjectStoreError, ObjectStorePort, PartETag, PartNumber,
+    SourceSha256, UploadId, VerifiedObjectReceipt,
 };
 #[cfg(test)]
 use ylx_transfer_core::library::object_store_port::{FaultPoint, MemoryObjectStore};
 use ylx_transfer_core::media_store::MediaStore;
 use ylx_transfer_core::persistence::completion_consumer::ProjectionOutcome;
 use ylx_transfer_core::persistence::transfer_store::{
-    AckOutcome, CompleteJobError, CompletionRecord, CreateJobError, JobSpecLoadError,
-    LegacyImportOutcome, OperationKind, RetryJobOutcome, StoredJob, TerminalOutcome, TransferStore,
+    AckOutcome, CompleteJobError, CompletionDeliveryState, CompletionRecord, CreateJobError,
+    DownloadSessionJobState, JobSpecLoadError, LegacyImportOutcome, OperationKind, RetryJobOutcome,
+    StoredJob, TerminalOutcome, TransferStore,
 };
 use ylx_transfer_core::persistence::upload_store::{
     LegacyUploadImportOutcome, NewUpload, RepeatUploadJobError, StoredUpload, StoredUploadReceipt,
@@ -105,15 +117,28 @@ use ylx_transfer_core::transfer::queue::{JobFile, TransferRequest};
 use ylx_transfer_core::transfer::DeviceSnapshot as TransferDeviceSnapshot;
 use ylx_transfer_core::transfer::{DesiredRunState, FailureCode, JobId, TransferJobState};
 
+use self::derived_media::DerivedMediaCommitter;
+#[cfg(test)]
+use self::derived_publication::admission_object_key;
+use self::derived_publication::{
+    admission_key_belongs_to_marker, AdmissionError, DerivedPublicationInput,
+    DerivedPublicationPlan, MAX_PUBLICATION_JSON_BYTES,
+};
+
 use crate::application::{
     emit_devices_event, emit_library_event, emit_pairing_event, emit_transfer_jobs_event,
     emit_transfers_event, TransferApplication,
 };
 use crate::models::{
     Device as FrontendDevice, DeviceState as FrontendDeviceState, DownloadStatus, LibraryEntry,
-    ObjectVerificationReceipt, PublicationEvidence, Session, SessionFile, SessionView,
-    StorageConfig, StorageUrlStyle, Transfer, TransferDirection, TransferState,
-    UploadProjectionMarker, UploadProjectionReceipt, UploadStatus,
+    ObjectVerificationReceipt, PublicationEvidence, Session, SessionApiProfile, SessionCapability,
+    SessionCapabilitySource, SessionCatalogAuthority, SessionDiscoveryDiagnosticCode,
+    SessionDiscoveryDiagnosticView, SessionFile, SessionPageCapabilities, SessionPageView,
+    SessionPaginationUnavailableReason, SessionVerificationDiagnosticCode,
+    SessionVerificationDiagnosticView, SessionVerificationValidatorView,
+    SessionVerificationVerdict, SessionVerificationView, SessionView, StorageConfig,
+    StorageUrlStyle, Transfer, TransferDirection, TransferState, UploadProjectionMarker,
+    UploadProjectionReceipt, UploadStatus,
 };
 use crate::state::AppState;
 
@@ -134,12 +159,14 @@ const HEARTBEAT_CONCURRENCY: usize = 4;
 /// immutable export proof. Keep the first paint bounded and fetch full detail
 /// only for an explicit download/delete-capable legacy mutation.
 const LAB_V4_SESSION_LIST_LIMIT: u32 = 50;
+const LAB_V4_MANUAL_PORT: u16 = 8080;
+const MAX_SESSION_CURSOR_BYTES: usize = 4096;
+const MAX_FULL_SESSION_CATALOG_PAGES: usize = 200;
+const MAX_FULL_SESSION_CATALOG_ITEMS: usize = 10_000;
+const FULL_SESSION_CATALOG_DEADLINE: Duration = Duration::from_secs(30);
 
 const LAB_V4_SESSION_DELETE_UNSUPPORTED_MESSAGE: &str =
     "当前 Device API v4 契约不支持删除设备端会话；请在设备端存储管理中处理，或等待固件暴露明确的 destructive mutation 接口。";
-
-const PROCESSED_SESSION_FILE_ID: &str = "processed-sbs-mp4";
-const PROCESSED_SESSION_DISPLAY_PATH: &str = "processed/sbs.mp4";
 
 /// Which Device API transport contract one endpoint speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +222,47 @@ pub struct DownloadedCleanupPlan {
     pub sessions: Vec<SessionView>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DownloadSessionLocalJobStatus {
+    active: bool,
+    failed: bool,
+}
+
+/// Internal page read evidence. The epoch is not a frontend concept; it lets
+/// the application reject a cursor issued by a prior authenticated connection
+/// even when the remote catalog revision happens to be unchanged.
+pub struct SessionCatalogPageRead {
+    pub page: SessionPageView,
+    pub connection_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionCatalogPageError {
+    CatalogChanged {
+        catalog_revision: String,
+        message: String,
+    },
+    Other(String),
+}
+
+impl From<String> for SessionCatalogPageError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl std::fmt::Display for SessionCatalogPageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CatalogChanged { message, .. } | Self::Other(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionCatalogPageError {}
+
 #[cfg(test)]
 fn fallback_device(id: &str) -> CoreDevice {
     CoreDevice {
@@ -222,6 +290,13 @@ fn build_client(endpoint: &DeviceEndpoint) -> Result<PiHttpClient, PiHttpError> 
             Duration::from_secs(6),
         ),
     }
+}
+
+fn transport_origin_matches(left: &DeviceEndpoint, right: &DeviceEndpoint) -> bool {
+    left.host == right.host
+        && left.port == right.port
+        && left.tls_fingerprint == right.tls_fingerprint
+        && left.api_profile == right.api_profile
 }
 
 /// Binds the current actor session to its already-pinned transport. The
@@ -341,6 +416,13 @@ struct DeviceBinding {
     handle: DeviceHandle,
 }
 
+#[derive(Clone)]
+struct DevicePollBinding {
+    device_id: String,
+    client: Arc<PiHttpClient>,
+    api_profile: DeviceApiProfile,
+}
+
 /// Full-fingerprint device registry plus the only legacy-id compatibility
 /// resolver in production composition.
 ///
@@ -357,9 +439,380 @@ struct DeviceBindings {
 struct EndpointRegistration {
     identity: DeviceIdentity,
     is_new: bool,
+    endpoint_changed: bool,
+    discovery_changed: bool,
+    handle: DeviceHandle,
+}
+
+impl EndpointRegistration {
+    fn changed(&self) -> bool {
+        self.is_new || self.endpoint_changed || self.discovery_changed
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeviceProbeTarget {
+    host: String,
+    port: u16,
+}
+
+impl DeviceProbeTarget {
+    fn authority(&self) -> String {
+        if self.host.contains(':') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+
+    fn lab_v4_origin(&self) -> String {
+        format!("http://{}", self.authority())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceProbeFailureClass {
+    ConnectionRefused,
+    Timeout,
+    Network,
+    ApiContract,
+    InvalidCandidate,
+    Tls,
+}
+
+impl DeviceProbeFailureClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectionRefused => "connection_refused",
+            Self::Timeout => "timeout",
+            Self::Network => "network",
+            Self::ApiContract => "api_contract",
+            Self::InvalidCandidate => "invalid_candidate",
+            Self::Tls => "tls",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeviceProbeFailure {
+    target: DeviceProbeTarget,
+    class: DeviceProbeFailureClass,
+    detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeviceProbeFailures(Vec<DeviceProbeFailure>);
+
+impl std::fmt::Display for DeviceProbeFailures {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return formatter.write_str("没有可探测的地址");
+        }
+        formatter.write_str("已尝试 ")?;
+        write!(formatter, "{} 个地址：", self.0.len())?;
+        for (index, failure) in self.0.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str("；")?;
+            }
+            write!(
+                formatter,
+                "{} [{}]: {}",
+                failure.target.lab_v4_origin(),
+                failure.class.as_str(),
+                failure.detail
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct DeviceProbeSuccess<T> {
+    target: DeviceProbeTarget,
+    value: T,
+}
+
+#[derive(Debug, Clone)]
+struct MdnsServiceState {
+    latest_cursor: MdnsEventCursor,
+    advertised: bool,
+    verified_cursor: Option<MdnsEventCursor>,
+    canonical_fingerprint: Option<DeviceFingerprint>,
+    verified_endpoint: Option<DeviceEndpoint>,
+}
+
+#[derive(Debug, Default)]
+struct MdnsServiceRegistry {
+    services: HashMap<MdnsServiceId, MdnsServiceState>,
+    manual_endpoints: HashMap<DeviceFingerprint, DeviceEndpoint>,
+}
+
+#[derive(Debug)]
+struct MdnsProbeAssociation {
+    previous_fingerprint: Option<DeviceFingerprint>,
+    fingerprint: DeviceFingerprint,
+}
+
+#[derive(Debug)]
+struct MdnsResolvedObservation {
+    previous_fingerprint: Option<DeviceFingerprint>,
+}
+
+impl MdnsServiceRegistry {
+    fn observe_resolved(&mut self, candidate: &MdnsCandidate) -> Option<MdnsResolvedObservation> {
+        if self
+            .services
+            .get(&candidate.service_id)
+            .is_some_and(|state| state.latest_cursor >= candidate.cursor)
+        {
+            return None;
+        }
+        let previous_fingerprint = match self.services.get_mut(&candidate.service_id) {
+            Some(state) => {
+                state.latest_cursor = candidate.cursor;
+                state.advertised = true;
+                state.verified_cursor = None;
+                state.verified_endpoint = None;
+                state.canonical_fingerprint.clone()
+            }
+            None => {
+                self.services.insert(
+                    candidate.service_id.clone(),
+                    MdnsServiceState {
+                        latest_cursor: candidate.cursor,
+                        advertised: true,
+                        verified_cursor: None,
+                        canonical_fingerprint: None,
+                        verified_endpoint: None,
+                    },
+                );
+                None
+            }
+        };
+        Some(MdnsResolvedObservation {
+            previous_fingerprint,
+        })
+    }
+
+    fn observe_lost(
+        &mut self,
+        service_id: &MdnsServiceId,
+        cursor: MdnsEventCursor,
+    ) -> Option<DeviceFingerprint> {
+        if self
+            .services
+            .get(service_id)
+            .is_some_and(|state| state.latest_cursor >= cursor)
+        {
+            return None;
+        }
+        let state = self
+            .services
+            .entry(service_id.clone())
+            .or_insert_with(|| MdnsServiceState {
+                latest_cursor: cursor,
+                advertised: false,
+                verified_cursor: None,
+                canonical_fingerprint: None,
+                verified_endpoint: None,
+            });
+        state.latest_cursor = cursor;
+        state.advertised = false;
+        state.verified_cursor = None;
+        state.verified_endpoint = None;
+        state.canonical_fingerprint.clone()
+    }
+
+    fn candidate_is_current(&self, candidate: &MdnsCandidate) -> bool {
+        self.services
+            .get(&candidate.service_id)
+            .is_some_and(|state| state.advertised && state.latest_cursor == candidate.cursor)
+    }
+
+    fn accept_probe(
+        &mut self,
+        service_id: &MdnsServiceId,
+        cursor: MdnsEventCursor,
+        fingerprint: DeviceFingerprint,
+        endpoint: DeviceEndpoint,
+    ) -> Option<MdnsProbeAssociation> {
+        let state = self.services.get_mut(service_id)?;
+        if !state.advertised || state.latest_cursor != cursor {
+            return None;
+        }
+        let previous_fingerprint = state.canonical_fingerprint.replace(fingerprint.clone());
+        state.verified_cursor = Some(cursor);
+        state.verified_endpoint = Some(endpoint);
+        Some(MdnsProbeAssociation {
+            previous_fingerprint,
+            fingerprint,
+        })
+    }
+
+    fn mark_manual(&mut self, fingerprint: DeviceFingerprint, endpoint: DeviceEndpoint) {
+        self.manual_endpoints.insert(fingerprint, endpoint);
+    }
+
+    fn selected_endpoint(&self, fingerprint: &DeviceFingerprint) -> Option<DeviceEndpoint> {
+        self.services
+            .iter()
+            .filter(|(_, state)| {
+                state.advertised
+                    && state.verified_cursor == Some(state.latest_cursor)
+                    && state.canonical_fingerprint.as_ref() == Some(fingerprint)
+                    && state.verified_endpoint.is_some()
+            })
+            .max_by(|(left_id, left), (right_id, right)| {
+                left.verified_cursor
+                    .cmp(&right.verified_cursor)
+                    .then_with(|| left_id.cmp(right_id))
+            })
+            .and_then(|(_, state)| state.verified_endpoint.clone())
+            .or_else(|| self.manual_endpoints.get(fingerprint).cloned())
+    }
+
+    fn should_be_online(&self, fingerprint: &DeviceFingerprint) -> bool {
+        self.manual_endpoints.contains_key(fingerprint)
+            || self.services.values().any(|state| {
+                state.advertised
+                    && state.verified_cursor == Some(state.latest_cursor)
+                    && state.canonical_fingerprint.as_ref() == Some(fingerprint)
+            })
+    }
+}
+
+fn classify_device_probe_error(error: &PiHttpError) -> DeviceProbeFailureClass {
+    match error {
+        PiHttpError::Network(detail) => {
+            let normalized = detail.to_ascii_lowercase();
+            if normalized.contains("connection refused")
+                || normalized.contains("actively refused")
+                || normalized.contains("os error 10061")
+            {
+                DeviceProbeFailureClass::ConnectionRefused
+            } else if normalized.contains("timed out")
+                || normalized.contains("timeout")
+                || normalized.contains("deadline has elapsed")
+                || normalized.contains("os error 10060")
+            {
+                DeviceProbeFailureClass::Timeout
+            } else {
+                DeviceProbeFailureClass::Network
+            }
+        }
+        PiHttpError::InvalidArgument(_) => DeviceProbeFailureClass::InvalidCandidate,
+        PiHttpError::Tls(_) => DeviceProbeFailureClass::Tls,
+        PiHttpError::Api(_)
+        | PiHttpError::CatalogChanged { .. }
+        | PiHttpError::UnexpectedStatus { .. }
+        | PiHttpError::PreconditionFailed { .. }
+        | PiHttpError::RangeNotSatisfiable { .. }
+        | PiHttpError::SessionVerificationRequired { .. }
+        | PiHttpError::SessionRevisionMismatch { .. }
+        | PiHttpError::Decode(_)
+        | PiHttpError::InvalidResponse(_) => DeviceProbeFailureClass::ApiContract,
+    }
+}
+
+fn probe_v4_targets_with<T>(
+    targets: Vec<DeviceProbeTarget>,
+    mut failures: Vec<DeviceProbeFailure>,
+    timeout: Duration,
+    mut probe: impl FnMut(&str, u16, Duration) -> Result<T, PiHttpError>,
+) -> Result<DeviceProbeSuccess<T>, DeviceProbeFailures> {
+    for target in targets {
+        match probe(&target.host, target.port, timeout) {
+            Ok(value) => return Ok(DeviceProbeSuccess { target, value }),
+            Err(error) => failures.push(DeviceProbeFailure {
+                target,
+                class: classify_device_probe_error(&error),
+                detail: error.to_string(),
+            }),
+        }
+    }
+    Err(DeviceProbeFailures(failures))
+}
+
+fn manual_lab_v4_probe_target(address: IpAddr) -> DeviceProbeTarget {
+    DeviceProbeTarget {
+        host: address.to_string(),
+        port: LAB_V4_MANUAL_PORT,
+    }
+}
+
+fn probe_mdns_candidate_with(
+    candidate: &MdnsCandidate,
+    timeout: Duration,
+    probe: impl FnMut(&str, u16, Duration) -> Result<LabV4DeviceProbe, PiHttpError>,
+) -> Result<DeviceProbeSuccess<LabV4DeviceProbe>, DeviceProbeFailures> {
+    let mut targets = Vec::new();
+    let mut failures = Vec::new();
+    let mut seen = HashSet::new();
+    for endpoint in candidate.ordered_endpoints(None) {
+        let raw_host = endpoint.address.to_string();
+        let invalid = |detail: String| DeviceProbeFailure {
+            target: DeviceProbeTarget {
+                host: raw_host.clone(),
+                port: candidate.port,
+            },
+            class: DeviceProbeFailureClass::InvalidCandidate,
+            detail,
+        };
+        if !endpoint.is_connectable() {
+            failures.push(invalid("地址不可连接或缺少 IPv6 scope".to_string()));
+            continue;
+        }
+        let host = match endpoint.host() {
+            Ok(host) => host,
+            Err(error) => {
+                failures.push(invalid(error.to_string()));
+                continue;
+            }
+        };
+        if seen.insert((host.clone(), candidate.port)) {
+            targets.push(DeviceProbeTarget {
+                host,
+                port: candidate.port,
+            });
+        }
+    }
+    probe_v4_targets_with(targets, failures, timeout, probe)
+}
+
+fn lab_v4_endpoint_from_probe(success: DeviceProbeSuccess<LabV4DeviceProbe>) -> DeviceEndpoint {
+    DeviceEndpoint {
+        host: success.target.host,
+        port: success.target.port,
+        tls_fingerprint: success.value.synthetic_identity_pin.0,
+        name: success.value.device_label.clone(),
+        display_label: Some(success.value.device_label),
+        api_profile: DeviceApiProfile::LabHttpV4,
+    }
 }
 
 impl DeviceBindings {
+    fn endpoint_differs(&self, fingerprint: &DeviceFingerprint, endpoint: &DeviceEndpoint) -> bool {
+        let Some(current) = self.by_fingerprint.get(fingerprint) else {
+            return true;
+        };
+        current.endpoint.host != endpoint.host
+            || current.endpoint.port != endpoint.port
+            || current.endpoint.tls_fingerprint != endpoint.tls_fingerprint
+            || current.endpoint.name != endpoint.name
+            || current.endpoint.display_label != endpoint.display_label
+            || current.endpoint.api_profile != endpoint.api_profile
+    }
+
+    fn origin_differs(&self, fingerprint: &DeviceFingerprint, endpoint: &DeviceEndpoint) -> bool {
+        let Some(current) = self.by_fingerprint.get(fingerprint) else {
+            return false;
+        };
+        current.endpoint.host != endpoint.host
+            || current.endpoint.port != endpoint.port
+            || current.endpoint.tls_fingerprint != endpoint.tls_fingerprint
+            || current.endpoint.api_profile != endpoint.api_profile
+    }
+
     fn bind(
         &mut self,
         identity: DeviceIdentity,
@@ -398,10 +851,19 @@ impl DeviceBindings {
         self.by_fingerprint.values().cloned().collect()
     }
 
-    fn clients_by_fingerprint(&self) -> HashMap<DeviceFingerprint, Arc<PiHttpClient>> {
+    fn clients_by_fingerprint(&self) -> HashMap<DeviceFingerprint, DevicePollBinding> {
         self.by_fingerprint
             .iter()
-            .map(|(fingerprint, binding)| (fingerprint.clone(), binding.client.clone()))
+            .map(|(fingerprint, binding)| {
+                (
+                    fingerprint.clone(),
+                    DevicePollBinding {
+                        device_id: binding.identity.device_id().as_str().to_string(),
+                        client: binding.client.clone(),
+                        api_profile: binding.endpoint.api_profile,
+                    },
+                )
+            })
             .collect()
     }
 
@@ -412,6 +874,22 @@ impl DeviceBindings {
         let left = self.resolve(&DeviceId(left.to_string()));
         let right = self.resolve(&DeviceId(right.to_string()));
         matches!((left, right), (Ok(left), Ok(right)) if left.identity.fingerprint() == right.identity.fingerprint())
+    }
+
+    /// Exact durable keys that may belong to this physical device. New jobs
+    /// use the canonical id. The retained display id is admitted only while
+    /// the resolver proves it names this one fingerprint unambiguously.
+    fn download_job_lookup_ids(&self, identity: &DeviceIdentity) -> Vec<String> {
+        let canonical = identity.device_id().as_str().to_string();
+        let legacy = identity.display_id().to_string();
+        let legacy_is_unique = self
+            .resolve(&DeviceId(legacy.clone()))
+            .is_ok_and(|binding| binding.identity.fingerprint() == identity.fingerprint());
+        if legacy != canonical && legacy_is_unique {
+            vec![canonical, legacy]
+        } else {
+            vec![canonical]
+        }
     }
 
     /// Projects a durable identity for a read boundary. A uniquely
@@ -540,6 +1018,16 @@ fn authenticated_request_error(context: &str, error: PiClientError) -> String {
     } else {
         format!("{context}：{error}")
     }
+}
+
+fn session_catalog_request_error(context: &str, error: PiClientError) -> SessionCatalogPageError {
+    if let PiClientErrorKind::CatalogChanged { catalog_revision } = &error.kind {
+        return SessionCatalogPageError::CatalogChanged {
+            catalog_revision: catalog_revision.clone(),
+            message: authenticated_request_error(context, error),
+        };
+    }
+    SessionCatalogPageError::Other(authenticated_request_error(context, error))
 }
 
 /// One transfer job's state and durable run intent, as pushed out over the
@@ -1150,6 +1638,9 @@ pub struct Composition {
     bindings: Arc<Mutex<DeviceBindings>>,
     pub coordinator: Arc<TransferCoordinator>,
     mdns_available: AtomicBool,
+    /// Latest lifecycle cursor and verified canonical identity for every
+    /// DNS-SD service, plus identities explicitly added by address.
+    mdns_services: Mutex<MdnsServiceRegistry>,
     pairing_tasks: Mutex<HashMap<String, tauri::async_runtime::JoinHandle<()>>>,
     /// Secrets needed only for polling/cancelling a live pairing attempt.
     /// They are never serialized, logged, or emitted to the frontend.
@@ -1311,11 +1802,13 @@ impl Composition {
             checkpoint_threshold_bytes: 256 * 1024,
             library_root: library_root.clone(),
         };
-        let coordinator = Arc::new(TransferCoordinator::new(
+        let commit_port = Arc::new(DerivedMediaCommitter::new(ffmpeg_export_config()?));
+        let coordinator = Arc::new(TransferCoordinator::new_with_commit_port(
             transfer_store.clone(),
             device_status,
             source_factory,
             verifier,
+            commit_port,
             config,
         ));
 
@@ -1326,6 +1819,7 @@ impl Composition {
             bindings,
             coordinator,
             mdns_available: AtomicBool::new(false),
+            mdns_services: Mutex::new(MdnsServiceRegistry::default()),
             pairing_tasks: Mutex::new(HashMap::new()),
             active_pairings: Mutex::new(HashMap::new()),
             vault,
@@ -1349,21 +1843,16 @@ impl Composition {
         Ok(comp)
     }
 
-    /// Boot stage 3 (runtime half): rehydrates durable transfer-store jobs so
-    /// interrupted jobs exist again.
-    ///
-    /// Deliberately *after* `app.manage`: recovery re-creates jobs whose
-    /// very next observed transition is turned into application state by
-    /// [`spawn_transfer_poll_loop`], so recovering before the state is
-    /// registered would leave that first transition with nowhere to land.
-    /// Never fatal -- a recovery error costs recovered jobs, not the launch.
-    pub fn recover_on_startup(&self) {
-        if let Err(e) = self.coordinator.recover_on_startup() {
-            eprintln!(
-                "[composition] transfer coordinator startup recovery failed (continuing with \
-                 no recovered jobs): {e}"
-            );
-        }
+    /// Boot stage 3 (runtime half): closes downloads left non-terminal by a
+    /// previous process as explicit failures. Only terminal projections are
+    /// installed; no source is opened and no work is scheduled. This runs
+    /// before the initial application snapshot is published so the UI never
+    /// observes an old `running` row that this process cannot own.
+    pub fn fail_interrupted_downloads_on_startup(&self) -> Result<usize, String> {
+        self.coordinator
+            .fail_interrupted_jobs_on_startup()
+            .map(|jobs| jobs.len())
+            .map_err(|error| format!("无法收敛上次应用退出时中断的下载任务：{error}"))
     }
 
     /// Boot stage 4: starts the background loops (mDNS discovery,
@@ -1577,7 +2066,7 @@ impl Composition {
                 )
             })
             .collect();
-        self.enqueue_download_with_context(request, date_label, files.clone(), files, true)
+        self.enqueue_download_with_context(request, date_label, files.clone(), files)
     }
 
     fn enqueue_download_with_context(
@@ -1586,7 +2075,6 @@ impl Composition {
         date_label: String,
         files: Vec<SessionFile>,
         session_files: Vec<SessionFile>,
-        full_session: bool,
     ) -> Result<JobId, String> {
         if request.files.is_empty() || files.is_empty() || session_files.is_empty() {
             return Err("下载请求缺少真实文件清单".to_string());
@@ -1623,7 +2111,7 @@ impl Composition {
                         && inventory.sha256 == file.sha256
                 })
             })
-            || (full_session && files.len() != session_files.len())
+            || files.len() != session_files.len()
         {
             return Err("会话文件清单包含重复项或下载范围不一致".to_string());
         }
@@ -1658,7 +2146,7 @@ impl Composition {
             &files,
             &session_files,
             &publication,
-            full_session,
+            true,
         )?;
         let device_id = request.device_id.as_str().to_string();
         let session_id = request.session_id.as_str().to_string();
@@ -2232,6 +2720,18 @@ impl Composition {
             .map(|binding| binding.identity.device_id().as_str().to_string())
     }
 
+    /// Exact current and retained-legacy library keys for one physical
+    /// device. Application paging uses this before borrowing `AppData` so it
+    /// can clone only page-relevant entries without reimplementing identity
+    /// alias rules or holding the global application mutex during resolution.
+    pub(crate) fn local_library_device_keys(&self, device_id: &str) -> Result<Vec<String>, String> {
+        let bindings = self.bindings.lock().unwrap();
+        let binding = bindings
+            .resolve(&DeviceId(device_id.to_string()))
+            .map_err(|error| format!("设备身份解析失败：{error}"))?;
+        Ok(bindings.download_job_lookup_ids(&binding.identity))
+    }
+
     #[cfg(test)]
     pub(crate) fn register_session_gate_device_for_test(
         &self,
@@ -2277,8 +2777,17 @@ impl Composition {
     /// One heartbeat sweep's worth of "which client talks to which
     /// device", snapshotted up front so the sweep itself needs neither the
     /// binding registry nor the fleet map while it is doing network I/O.
-    fn clients_by_fingerprint(&self) -> HashMap<DeviceFingerprint, Arc<PiHttpClient>> {
-        self.bindings.lock().unwrap().clients_by_fingerprint()
+    fn clients_by_fingerprint(&self) -> HashMap<DeviceFingerprint, DevicePollBinding> {
+        let active_device_ids = self
+            .active_pairings
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut clients = self.bindings.lock().unwrap().clients_by_fingerprint();
+        clients.retain(|_, binding| !active_device_ids.contains(&binding.device_id));
+        clients
     }
 
     /// Registers (or refreshes) a known network endpoint from its complete
@@ -2303,14 +2812,29 @@ impl Composition {
             connection: ConnectionState::Disconnected,
             capture_activity: CaptureActivityState::Unknown,
         });
-        let is_new = self.bindings.lock().unwrap().bind(
-            identity.clone(),
-            endpoint,
-            Arc::new(client),
-            handle,
-        );
+        let (is_new, endpoint_changed) = {
+            let mut bindings = self.bindings.lock().unwrap();
+            let endpoint_changed = bindings.endpoint_differs(identity.fingerprint(), &endpoint);
+            if bindings.origin_differs(identity.fingerprint(), &endpoint) {
+                // An authenticated capability is valid only for the origin
+                // on which it was established. Fence in-flight work and
+                // discard the local token before publishing the replacement
+                // client under the same stable physical-device identity.
+                handle.disconnect_local();
+            }
+            let is_new =
+                bindings.bind(identity.clone(), endpoint, Arc::new(client), handle.clone());
+            (is_new, endpoint_changed)
+        };
+        let discovery_changed = handle.set_discovery_state(DiscoveryState::Online);
 
-        Ok(EndpointRegistration { identity, is_new })
+        Ok(EndpointRegistration {
+            identity,
+            is_new,
+            endpoint_changed,
+            discovery_changed,
+            handle,
+        })
     }
 
     /// Registers a manual current-contract candidate by address. The current
@@ -2322,17 +2846,30 @@ impl Composition {
             .trim()
             .parse()
             .map_err(|_| "请输入有效的 IPv4 或 IPv6 地址".to_string())?;
-        let probe = probe_lab_v4_device(&address.to_string(), 8080, Duration::from_secs(6))
-            .map_err(|error| format!("无法探测设备 Device API v4 身份（HTTP 8080）：{error}"))?;
-        let endpoint = DeviceEndpoint {
-            host: address.to_string(),
-            port: 8080,
-            tls_fingerprint: probe.synthetic_identity_pin.0,
-            name: probe.device_label.clone(),
-            display_label: Some(probe.device_label),
-            api_profile: DeviceApiProfile::LabHttpV4,
-        };
-        let registration = self.register_endpoint(endpoint)?;
+        self.add_manual_device_with(address, probe_lab_v4_device)
+    }
+
+    fn add_manual_device_with(
+        &self,
+        address: IpAddr,
+        probe: impl FnMut(&str, u16, Duration) -> Result<LabV4DeviceProbe, PiHttpError>,
+    ) -> Result<FrontendDevice, String> {
+        let target = manual_lab_v4_probe_target(address);
+        let success =
+            probe_v4_targets_with(vec![target], Vec::new(), Duration::from_secs(6), probe)
+                .map_err(|failures| {
+                    format!("无法探测设备 Device API v4 身份（HTTP）：{failures}")
+                })?;
+        let mut endpoint = lab_v4_endpoint_from_probe(success);
+        let registration = self.register_endpoint(endpoint.clone())?;
+        endpoint.tls_fingerprint = registration.identity.tls_pin();
+        self.mdns_services
+            .lock()
+            .unwrap()
+            .mark_manual(registration.identity.fingerprint().clone(), endpoint);
+        registration
+            .handle
+            .set_discovery_state(DiscoveryState::Online);
         let id = registration.identity.device_id().as_str();
         let binding = self.resolve_binding(id)?;
         Ok(to_frontend_device(
@@ -2348,15 +2885,23 @@ impl Composition {
     /// Each device is read through its own handle in one short lock
     /// acquisition; nothing here holds the fleet's map lock while doing so.
     pub fn frontend_devices(&self) -> Vec<FrontendDevice> {
+        let active_device_ids = self
+            .active_pairings
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
         let bindings = self.bindings.lock().unwrap().bindings();
         let mut out = Vec::with_capacity(bindings.len());
         for binding in bindings {
             let snapshot = binding.handle.snapshot();
-            out.push(to_frontend_device(
-                &binding.identity,
-                &snapshot.device,
-                Some(&binding.endpoint),
-            ));
+            let mut frontend =
+                to_frontend_device(&binding.identity, &snapshot.device, Some(&binding.endpoint));
+            if active_device_ids.contains(binding.identity.device_id().as_str()) {
+                frontend.state = FrontendDeviceState::Pending;
+            }
+            out.push(frontend);
         }
         out
     }
@@ -2433,122 +2978,335 @@ impl Composition {
     // `list_sessions_with_local_state`, which surfaces the error instead of
     // making a reachable device look like one with no recordings.
 
-    /// Reads every real catalog page and then fetches immutable detail for
-    /// every summary so the returned `files` are opaque Pi file ids plus
-    /// their real display paths and byte counts.  Pagination/catalog or
-    /// summary/detail revision drift fails the whole read rather than
-    /// returning a deceptively partial inventory.
-    fn try_list_sessions(&self, device_id: &str) -> Result<Vec<SessionView>, String> {
+    /// Reads exactly one bounded catalog page. The cursor remains opaque and
+    /// the caller-provided catalog revision fences load-more against a new
+    /// device snapshot. Current v4 list rows intentionally stay summary-only;
+    /// legacy rows retain their historical per-page detail verification.
+    fn try_list_session_page(
+        &self,
+        device_id: &str,
+        cursor: Option<&str>,
+        expected_catalog_revision: Option<&str>,
+        expected_connection_epoch: Option<u64>,
+    ) -> Result<SessionCatalogPageRead, SessionCatalogPageError> {
+        if cursor.is_some_and(str::is_empty) {
+            return Err("会话分页游标不能为空".to_string().into());
+        }
         let binding = self.resolve_binding(device_id)?;
         let api_profile = binding.endpoint.api_profile;
         let client = binding.client;
         let handle = binding.handle;
         let mut authenticated = authenticated_client_for(&handle, client.clone())?;
-        match handle.refresh_capture_activity_with(&authenticated) {
-            RefreshApplyOutcome::Refreshed => {}
-            RefreshApplyOutcome::NotConnected => {
-                return Err("该设备尚未连接或连接已失效".to_string())
-            }
-            RefreshApplyOutcome::Stale => {
-                return Err("设备连接在刷新期间已重建，请重试".to_string())
-            }
-            RefreshApplyOutcome::Failed(error) => {
-                return Err(authenticated_request_error(
-                    "刷新设备 publication 身份失败",
-                    error,
-                ))
-            }
-        }
-        // A legacy transcript-less session becomes publication-key-bound by
-        // the refresh above; rebuild the façade so the catalog request uses
-        // the actor's newly bound session identity.
-        authenticated = authenticated_client_for(&handle, client)?;
-
-        if api_profile == DeviceApiProfile::LabHttpV4 {
-            let page = handle
-                .list_sessions_with(&authenticated, None, Some(LAB_V4_SESSION_LIST_LIMIT))
-                .map_err(|error| authenticated_request_error("读取设备会话目录失败", error))?;
-            return Ok(page
-                .sessions
-                .into_iter()
-                .map(session_summary_to_view)
-                .collect());
-        }
-
-        let mut summaries = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut seen_cursors = HashSet::new();
-        let mut catalog_revision: Option<String> = None;
-        loop {
-            let page = handle
-                .list_sessions_with(&authenticated, cursor.as_deref(), Some(500))
-                .map_err(|error| authenticated_request_error("读取设备会话目录失败", error))?;
-            match &catalog_revision {
-                Some(expected) if expected != &page.catalog_revision => {
-                    return Err("读取期间设备会话目录发生变化，请重试".to_string());
+        if api_profile == DeviceApiProfile::LegacyPinnedTlsV1 {
+            match handle.refresh_capture_activity_with(&authenticated) {
+                RefreshApplyOutcome::Refreshed => {}
+                RefreshApplyOutcome::NotConnected => {
+                    return Err("该设备尚未连接或连接已失效".to_string().into())
                 }
-                None => catalog_revision = Some(page.catalog_revision.clone()),
-                _ => {}
+                RefreshApplyOutcome::Stale => {
+                    return Err("设备连接在刷新期间已重建，请重试".to_string().into())
+                }
+                RefreshApplyOutcome::Failed(error) => {
+                    return Err(
+                        authenticated_request_error("刷新设备 publication 身份失败", error).into(),
+                    )
+                }
             }
-            summaries.extend(page.sessions);
-            let Some(next) = page.next_cursor else {
-                break;
-            };
-            if next.is_empty() || !seen_cursors.insert(next.clone()) {
-                return Err("设备返回了无效的会话分页游标".to_string());
-            }
-            cursor = Some(next);
+            // A legacy transcript-less session becomes publication-key-bound
+            // by the refresh above; rebuild the façade around that identity.
+            authenticated = authenticated_client_for(&handle, client)?;
         }
+        let negotiated = handle
+            .negotiated_device_snapshot()
+            .ok_or_else(|| "设备能力协商结果不可用，请重新连接后重试".to_string())?;
+        let connection_epoch = negotiated.epoch;
+        if expected_connection_epoch.is_some_and(|expected| expected != connection_epoch) {
+            return Err("设备已重新连接，旧会话分页 cursor 已失效"
+                .to_string()
+                .into());
+        }
+        let capabilities = session_page_capabilities_from_negotiation(
+            api_profile,
+            negotiated.info.profile,
+            &negotiated.info.capabilities,
+        )?;
 
-        let mut sessions = Vec::with_capacity(summaries.len());
-        for summary in summaries {
+        let page = handle
+            .list_sessions_with(&authenticated, cursor, Some(LAB_V4_SESSION_LIST_LIMIT))
+            .map_err(|error| session_catalog_request_error("读取设备会话目录失败", error))?;
+        let (catalog_revision, catalog_authority, pagination_supported, pagination_reason) =
+            match page.catalog_authority {
+                CatalogRevisionAuthorityView::LegacyDevice
+                | CatalogRevisionAuthorityView::DeviceStable => {
+                    if !page.pagination_supported || page.pagination_unavailable_reason.is_some() {
+                        return Err("设备返回的会话目录 authority 与分页能力不一致"
+                            .to_string()
+                            .into());
+                    }
+                    let revision = page
+                        .catalog_revision
+                        .as_deref()
+                        .filter(|revision| !revision.is_empty())
+                        .ok_or_else(|| "设备返回了空的会话目录 revision".to_string())?;
+                    (
+                        Some(revision.to_string()),
+                        SessionCatalogAuthority::DeviceSnapshot,
+                        true,
+                        None,
+                    )
+                }
+                CatalogRevisionAuthorityView::LocalFirstPageCompatibility => {
+                    if page.catalog_revision.is_some()
+                        || page.pagination_supported
+                        || page.next_cursor.is_some()
+                        || page.pagination_unavailable_reason
+                            != Some(PaginationUnavailableReasonView::FirmwareUpgradeRequired)
+                    {
+                        return Err("设备返回的首屏兼容目录包含不安全的分页元数据"
+                            .to_string()
+                            .into());
+                    }
+                    (
+                        None,
+                        SessionCatalogAuthority::Unavailable,
+                        false,
+                        Some(SessionPaginationUnavailableReason::CatalogRevisionUnavailable),
+                    )
+                }
+            };
+        if expected_catalog_revision
+            .is_some_and(|expected| catalog_revision.as_deref() != Some(expected))
+        {
+            return Err("读取期间设备会话目录发生变化，请从第一页重新刷新"
+                .to_string()
+                .into());
+        }
+        if page.next_cursor.as_deref().is_some_and(|next| {
+            next.is_empty() || next.len() > MAX_SESSION_CURSOR_BYTES || Some(next) == cursor
+        }) {
+            return Err("设备返回了无效或重复的会话分页游标".to_string().into());
+        }
+        if page.sessions.len() > LAB_V4_SESSION_LIST_LIMIT as usize {
+            return Err(format!(
+                "设备返回的会话页超过客户端上限 {}",
+                LAB_V4_SESSION_LIST_LIMIT
+            )
+            .into());
+        }
+        let diagnostics = page
+            .diagnostics
+            .into_iter()
+            .map(session_discovery_diagnostic_to_view)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut items = Vec::with_capacity(page.sessions.len());
+        for summary in page.sessions {
+            if api_profile == DeviceApiProfile::LabHttpV4 {
+                items.push(session_summary_to_view(summary)?);
+                continue;
+            }
             let detail = match handle.get_session_with(&authenticated, &summary.session_id) {
                 SessionDetailOutcome::Fetched(detail) => *detail,
                 SessionDetailOutcome::NotConnected => {
-                    return Err("该设备尚未连接或连接已失效".to_string())
+                    return Err("该设备尚未连接或连接已失效".to_string().into())
                 }
                 SessionDetailOutcome::Stale => {
-                    return Err("设备连接在读取会话详情期间已重建，请重试".to_string())
+                    return Err("设备连接在读取会话详情期间已重建，请重试"
+                        .to_string()
+                        .into())
                 }
                 SessionDetailOutcome::Failed(error) => {
                     return Err(authenticated_request_error(
                         &format!("读取会话 {} 详情失败", summary.session_id),
                         error,
-                    ))
+                    )
+                    .into())
                 }
             };
             ensure_summary_matches_detail(&summary, &detail)?;
-            sessions.push(session_detail_to_view(detail));
+            items.push(session_detail_to_view(detail)?);
         }
-        Ok(sessions)
+
+        let next_cursor = page.next_cursor;
+        Ok(SessionCatalogPageRead {
+            page: SessionPageView {
+                items,
+                diagnostics,
+                has_more: next_cursor.is_some(),
+                next_cursor,
+                catalog_revision,
+                catalog_authority,
+                pagination_supported,
+                pagination_unavailable_reason: pagination_reason,
+                capabilities,
+            },
+            connection_epoch,
+        })
+    }
+
+    /// Compatibility full-catalog read for destructive workflows that must
+    /// evaluate every current row. Ordinary navigation uses
+    /// [`Self::read_session_page`] and never performs this loop.
+    fn try_list_sessions(&self, device_id: &str) -> Result<Vec<SessionView>, String> {
+        collect_full_session_catalog(|cursor, catalog_revision, connection_epoch| {
+            self.try_list_session_page(device_id, cursor, catalog_revision, connection_epoch)
+                .map_err(|error| error.to_string())
+        })
     }
 
     /// Real session catalog plus local state derived from persisted library
-    /// entries, durable jobs and their completion outbox. A complete verified
-    /// library inventory is `Done` after restart; a partial copy is not.
+    /// entries, durable jobs and their completion outbox. Startup and explicit
+    /// mutations strongly verify canonical media; ordinary navigation trusts
+    /// that durable projection and performs no media filesystem I/O.
     pub fn list_sessions_with_local_state(
         &self,
         device_id: &str,
         library: &[LibraryEntry],
     ) -> Result<Vec<SessionView>, String> {
-        let library_root = self.library_root();
-        let api_profile = self.resolve_binding(device_id)?.endpoint.api_profile;
         let mut sessions = self.try_list_sessions(device_id)?;
-        for view in &mut sessions {
-            let entry = library.iter().find(|entry| {
-                self.device_ids_match(&entry.device_id, device_id)
-                    && entry.session_id == view.session.id
-            });
+        self.apply_local_session_state(device_id, library, &mut sessions)?;
+        Ok(sessions)
+    }
+
+    pub(crate) fn read_session_page(
+        &self,
+        device_id: &str,
+        cursor: Option<&str>,
+        expected_catalog_revision: Option<&str>,
+        expected_connection_epoch: Option<u64>,
+    ) -> Result<SessionCatalogPageRead, SessionCatalogPageError> {
+        self.try_list_session_page(
+            device_id,
+            cursor,
+            expected_catalog_revision,
+            expected_connection_epoch,
+        )
+    }
+
+    /// Fetches immutable artifact descriptors only for an explicitly opened
+    /// row. The list revision supplied by the caller must match the detail;
+    /// a changed manifest is never attached to a stale summary. Local-library
+    /// state is projected by the application only after this network read.
+    pub(crate) fn read_session_detail(
+        &self,
+        device_id: &str,
+        session_id: &str,
+        expected_session_revision: &str,
+        expected_connection_epoch: u64,
+        expected_verification: Option<&SessionVerificationView>,
+    ) -> Result<SessionView, String> {
+        let binding = self.resolve_binding(device_id)?;
+        if binding.handle.current_epoch() != Some(expected_connection_epoch) {
+            return Err("设备已重新连接，旧会话详情请求已失效".to_string());
+        }
+        let detail = match binding.endpoint.api_profile {
+            DeviceApiProfile::LegacyPinnedTlsV1 => {
+                fetch_session_detail(&binding.handle, binding.client, session_id)?
+            }
+            DeviceApiProfile::LabHttpV4 => {
+                let verification = expected_verification
+                    .filter(|verification| {
+                        verification.permits_detail_for(expected_session_revision)
+                    })
+                    .ok_or_else(|| {
+                        "该会话缺少可用且与当前 revision 匹配的 gateway verification".to_string()
+                    })?;
+                let core_verification = gateway_verification_from_view(verification);
+                fetch_verified_session_detail(
+                    &binding.handle,
+                    binding.client,
+                    session_id,
+                    &core_verification,
+                )?
+            }
+        };
+        if binding.handle.current_epoch() != Some(expected_connection_epoch) {
+            return Err("设备已重新连接，旧会话详情请求已失效".to_string());
+        }
+        if detail.revision != expected_session_revision {
+            return Err(format!(
+                "会话 {session_id} 的 revision 已变化，请刷新列表后重试"
+            ));
+        }
+        session_detail_to_view(detail)
+    }
+
+    pub(crate) fn apply_local_session_state_to_items(
+        &self,
+        device_id: &str,
+        library: &[LibraryEntry],
+        sessions: &mut [SessionView],
+    ) -> Result<(), String> {
+        self.apply_local_session_state(device_id, library, sessions)
+    }
+
+    fn apply_local_session_state(
+        &self,
+        device_id: &str,
+        library: &[LibraryEntry],
+        sessions: &mut [SessionView],
+    ) -> Result<(), String> {
+        let (api_profile, device_keys) = {
+            let bindings = self.bindings.lock().unwrap();
+            let binding = bindings
+                .resolve(&DeviceId(device_id.to_string()))
+                .map_err(|error| format!("设备身份解析失败：{error}"))?;
+            (
+                binding.endpoint.api_profile,
+                bindings.download_job_lookup_ids(&binding.identity),
+            )
+        };
+        let session_ids = sessions
+            .iter()
+            .map(|view| view.session.id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let job_states = self
+            .transfer_store
+            .lock()
+            .unwrap()
+            .list_download_session_job_states_for_sessions(&device_keys, &session_ids)
+            .map_err(|error| format!("无法读取下载任务状态：{error}"))?;
+        let job_status_by_session = self.aggregate_download_session_job_states(job_states);
+        let device_keys = device_keys
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let session_ids = session_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let mut library_by_session = HashMap::with_capacity(session_ids.len());
+        for entry in library.iter().filter(|entry| {
+            device_keys.contains(entry.device_id.as_str())
+                && session_ids.contains(entry.session_id.as_str())
+        }) {
+            // Preserve the historical first-match behavior if corrupt history
+            // contains duplicate rows; destructive actions reject duplicates
+            // independently at their strong authorization boundary.
+            library_by_session
+                .entry(entry.session_id.as_str())
+                .or_insert(entry);
+        }
+
+        for view in sessions {
+            let entry = library_by_session.get(view.session.id.as_str()).copied();
             let complete_local = entry
                 .map(|entry| {
                     library_entry_covers_session_for_profile(entry, &view.session, api_profile)
-                        && entry_has_complete_local_files(&library_root, entry)
+                        && entry_has_durable_canonical_projection(entry)
                 })
                 .unwrap_or(false);
-            let (has_active_job, has_failed_job) =
-                self.pending_status(device_id, &view.session.id)?;
-            view.download_status =
-                download_status_for_local_state(complete_local, has_active_job, has_failed_job);
+            let job_status = job_status_by_session
+                .get(view.session.id.as_str())
+                .copied()
+                .unwrap_or_default();
+            view.download_status = download_status_for_local_state(
+                complete_local,
+                job_status.active,
+                job_status.failed,
+            );
             view.backed_up = complete_local
                 && entry
                     .map(|entry| {
@@ -2557,7 +3315,7 @@ impl Composition {
                     })
                     .unwrap_or(false);
         }
-        Ok(sessions)
+        Ok(())
     }
 
     /// Builds a deletion preview from the *current* authenticated Pi
@@ -2693,7 +3451,7 @@ impl Composition {
         }
         let binding = self.resolve_binding(device_id)?;
         let detail = fetch_session_detail(&binding.handle, binding.client, &candidate.session_id)?;
-        let current_session = session_detail_to_view(detail).session;
+        let current_session = session_detail_to_view(detail)?.session;
         let library_root = self.library_root();
         validate_backed_up_cleanup_candidate(
             &library_root,
@@ -2705,53 +3463,55 @@ impl Composition {
         )
     }
 
-    fn pending_status(&self, device_id: &str, session_id: &str) -> Result<(bool, bool), String> {
-        let (jobs, completions) = {
-            let store = self.transfer_store.lock().unwrap();
-            (
-                store
-                    .list_jobs()
-                    .map_err(|error| format!("无法读取下载任务状态：{error}"))?,
-                store
-                    .all_completions()
-                    .map_err(|error| format!("无法读取下载完成记录：{error}"))?,
-            )
-        };
-        let mut active = false;
-        let mut failed = false;
-        for job in jobs.into_iter().filter(|job| {
-            job.operation_kind == OperationKind::Download
-                && self.device_ids_match(job.identity.device_id().as_str(), device_id)
-                && job.identity.session_id().as_str() == session_id
-        }) {
+    fn aggregate_download_session_job_states(
+        &self,
+        job_states: impl IntoIterator<Item = DownloadSessionJobState>,
+    ) -> HashMap<String, DownloadSessionLocalJobStatus> {
+        let mut by_session = HashMap::new();
+        for state in job_states {
+            let job = &state.job;
+            let status = by_session
+                .entry(job.identity.session_id().as_str().to_string())
+                .or_insert_with(DownloadSessionLocalJobStatus::default);
             match job.state {
-                JobStateTag::Failed | JobStateTag::Cancelled => failed = true,
-                JobStateTag::Succeeded => {
-                    match completions.iter().find(|completion| {
-                        completion.operation_kind == OperationKind::Download
-                            && completion.job_id == job.job_id
-                    }) {
-                        // Ack means the library projection was durably
-                        // applied. A complete projection becomes `Done` via
-                        // `complete_local`; an applied partial projection has
-                        // no session-level status and is retired immediately.
-                        Some(completion) if completion.is_acknowledged() => {}
-                        // A succeeded job whose outcome is still pending is
-                        // not downloading: its files/library projection need
-                        // attention and the outbox will keep replaying it.
-                        Some(_) | None => failed = true,
+                JobStateTag::Failed | JobStateTag::Cancelled => status.failed = true,
+                JobStateTag::Succeeded => match state.completion {
+                    // Ack means the library projection was durably applied.
+                    CompletionDeliveryState::Acknowledged => {}
+                    // Pending is replayable; Missing is inconsistent. Both
+                    // need attention rather than appearing as in-progress.
+                    CompletionDeliveryState::Pending | CompletionDeliveryState::Missing => {
+                        status.failed = true
                     }
-                }
-                _ => match self.coordinator.job_state(&JobId(job.job_id)) {
+                },
+                _ => match self.coordinator.job_state(&JobId(job.job_id.clone())) {
                     Some(TransferJobState::Failed { .. }) | Some(TransferJobState::Cancelled) => {
-                        failed = true
+                        status.failed = true
                     }
-                    Some(_) => active = true,
-                    None => failed = true,
+                    Some(_) => status.active = true,
+                    None => status.failed = true,
                 },
             }
         }
-        Ok((active, failed))
+        by_session
+    }
+
+    #[cfg(test)]
+    fn pending_status(&self, device_id: &str, session_id: &str) -> Result<(bool, bool), String> {
+        let job_states = self
+            .transfer_store
+            .lock()
+            .unwrap()
+            .list_download_session_job_states_for_sessions(
+                &[device_id.to_string()],
+                &[session_id.to_string()],
+            )
+            .map_err(|error| format!("无法读取下载任务状态：{error}"))?;
+        let status = self
+            .aggregate_download_session_job_states(job_states)
+            .remove(session_id)
+            .unwrap_or_default();
+        Ok((status.active, status.failed))
     }
 
     /// PC-08b: real session delete (`DELETE /sessions/{id}`) -- fetches the
@@ -2810,8 +3570,291 @@ fn ensure_summary_matches_detail(
     Ok(())
 }
 
-fn session_detail_to_view(detail: SessionDetailView) -> SessionView {
-    SessionView {
+fn collect_full_session_catalog<F>(mut read_page: F) -> Result<Vec<SessionView>, String>
+where
+    F: FnMut(Option<&str>, Option<&str>, Option<u64>) -> Result<SessionCatalogPageRead, String>,
+{
+    let started = Instant::now();
+    let mut items = Vec::new();
+    let mut received_items = 0_usize;
+    let mut pages = 0_usize;
+    let mut cursor: Option<String> = None;
+    let mut catalog_revision: Option<String> = None;
+    let mut connection_epoch: Option<u64> = None;
+    let mut seen_cursors = HashSet::new();
+    let mut seen_session_ids = HashSet::new();
+    let mut seen_quarantine_ids = HashSet::new();
+    loop {
+        if pages >= MAX_FULL_SESSION_CATALOG_PAGES {
+            return Err(format!(
+                "设备会话目录超过客户端总页数上限 {}，已拒绝继续执行破坏性操作",
+                MAX_FULL_SESSION_CATALOG_PAGES
+            ));
+        }
+        if started.elapsed() >= FULL_SESSION_CATALOG_DEADLINE {
+            return Err("读取完整设备会话目录超时，已拒绝继续执行破坏性操作".to_string());
+        }
+        let read = read_page(
+            cursor.as_deref(),
+            catalog_revision.as_deref(),
+            connection_epoch,
+        )?;
+        pages += 1;
+        if started.elapsed() >= FULL_SESSION_CATALOG_DEADLINE {
+            return Err("读取完整设备会话目录超时，已拒绝继续执行破坏性操作".to_string());
+        }
+        connection_epoch = Some(read.connection_epoch);
+        let page = read.page;
+        if !page.pagination_supported {
+            return Err(
+                "设备会话目录不提供快照级 revision，已拒绝将首屏当作完整目录执行破坏性操作"
+                    .to_string(),
+            );
+        }
+        let page_revision = page
+            .catalog_revision
+            .as_deref()
+            .ok_or_else(|| "设备会话目录缺少快照级 revision".to_string())?;
+        if catalog_revision.is_none() {
+            catalog_revision = Some(page_revision.to_string());
+        } else if catalog_revision.as_deref() != Some(page_revision) {
+            return Err("读取期间设备会话目录 revision 发生变化".to_string());
+        }
+        let page_entry_count = page
+            .items
+            .len()
+            .checked_add(page.diagnostics.len())
+            .ok_or_else(|| "设备会话目录条目计数溢出".to_string())?;
+        received_items = received_items
+            .checked_add(page_entry_count)
+            .ok_or_else(|| "设备会话目录条目计数溢出".to_string())?;
+        if received_items > MAX_FULL_SESSION_CATALOG_ITEMS {
+            return Err(format!(
+                "设备会话目录超过客户端总条目上限 {}，已拒绝继续执行破坏性操作",
+                MAX_FULL_SESSION_CATALOG_ITEMS
+            ));
+        }
+        for session in &page.items {
+            if !seen_session_ids.insert(session.session.id.clone()) {
+                return Err(format!(
+                    "设备在完整会话目录中重复返回 sessionId {}",
+                    session.session.id
+                ));
+            }
+        }
+        for diagnostic in &page.diagnostics {
+            if !seen_quarantine_ids.insert(diagnostic.quarantine_id.clone()) {
+                return Err(format!(
+                    "设备在完整会话目录中重复返回 quarantineId {}",
+                    diagnostic.quarantine_id
+                ));
+            }
+        }
+        validate_full_catalog_order(&items, &page.items)?;
+        append_session_items(&mut items, page.items);
+        let Some(next) = page.next_cursor else {
+            return Ok(items);
+        };
+        if !seen_cursors.insert(next.clone()) {
+            return Err("设备返回了重复的会话分页游标".to_string());
+        }
+        cursor = Some(next);
+    }
+}
+
+/// Appends a page after `collect_full_session_catalog` has independently
+/// admitted every identity and newest-first boundary.
+fn append_session_items(existing: &mut Vec<SessionView>, incoming: Vec<SessionView>) {
+    existing.extend(incoming);
+}
+
+fn validate_full_catalog_order(
+    existing: &[SessionView],
+    incoming: &[SessionView],
+) -> Result<(), String> {
+    let validate_pair = |newer: &SessionView, older: &SessionView| {
+        let newer_timestamp = chrono::DateTime::parse_from_rfc3339(&newer.session.date_label)
+            .map_err(|_| "设备会话目录 started_at 不是有效的 RFC 3339 时间".to_string())?;
+        let older_timestamp = chrono::DateTime::parse_from_rfc3339(&older.session.date_label)
+            .map_err(|_| "设备会话目录 started_at 不是有效的 RFC 3339 时间".to_string())?;
+        if newer_timestamp > older_timestamp
+            || (newer_timestamp == older_timestamp && newer.session.id > older.session.id)
+        {
+            Ok(())
+        } else {
+            Err("设备会话目录没有按 (started_at, session_id) newest-first 严格排序".to_string())
+        }
+    };
+    for pair in incoming.windows(2) {
+        validate_pair(&pair[0], &pair[1])?;
+    }
+    if let (Some(previous), Some(next)) = (existing.last(), incoming.first()) {
+        validate_pair(previous, next)?;
+    }
+    Ok(())
+}
+
+fn session_capability_from_negotiation(capability: NegotiatedCapabilityView) -> SessionCapability {
+    let source = match capability.source {
+        CapabilitySourceView::DeviceDescriptor => SessionCapabilitySource::DeviceDescriptor,
+        CapabilitySourceView::ProfileContract => SessionCapabilitySource::ProfileContract,
+        CapabilitySourceView::Unavailable => SessionCapabilitySource::Unavailable,
+    };
+    SessionCapability {
+        supported: capability.supported && source != SessionCapabilitySource::Unavailable,
+        source,
+    }
+}
+
+fn session_page_capabilities_from_negotiation(
+    endpoint_profile: DeviceApiProfile,
+    negotiated_profile: DeviceApiProfileView,
+    capabilities: &DeviceCapabilitiesView,
+) -> Result<SessionPageCapabilities, String> {
+    let profile = match (endpoint_profile, negotiated_profile) {
+        (DeviceApiProfile::LegacyPinnedTlsV1, DeviceApiProfileView::LegacyPinnedHttpsV1) => {
+            SessionApiProfile::LegacyPinnedTlsV1
+        }
+        (DeviceApiProfile::LabHttpV4, DeviceApiProfileView::LabHttpV4) => {
+            SessionApiProfile::LabHttpV4
+        }
+        _ => return Err("连接端点与设备协商的 API profile 不一致".to_string()),
+    };
+    let session_list = session_capability_from_negotiation(capabilities.session_list);
+    if !session_list.supported {
+        return Err("设备能力协商结果未授权读取会话目录".to_string());
+    }
+    Ok(SessionPageCapabilities {
+        profile,
+        session_deletion: session_capability_from_negotiation(capabilities.session_deletion),
+        session_detail: session_capability_from_negotiation(capabilities.session_detail),
+        artifact_download: session_capability_from_negotiation(capabilities.artifact_download),
+        capture_status: session_capability_from_negotiation(capabilities.capture_status),
+    })
+}
+
+fn session_discovery_diagnostic_to_view(
+    diagnostic: CoreSessionDiscoveryDiagnosticView,
+) -> Result<SessionDiscoveryDiagnosticView, String> {
+    let code = match diagnostic.code {
+        SessionDiscoveryDiagnosticCodeView::ManifestUnreadable => {
+            SessionDiscoveryDiagnosticCode::ManifestUnreadable
+        }
+        SessionDiscoveryDiagnosticCodeView::UnsupportedSchema => {
+            SessionDiscoveryDiagnosticCode::UnsupportedSchema
+        }
+        SessionDiscoveryDiagnosticCodeView::ManifestInvalid => {
+            SessionDiscoveryDiagnosticCode::ManifestInvalid
+        }
+        SessionDiscoveryDiagnosticCodeView::ManifestNotSealed => {
+            SessionDiscoveryDiagnosticCode::ManifestNotSealed
+        }
+    };
+    Ok(SessionDiscoveryDiagnosticView {
+        quarantine_id: diagnostic.quarantine_id,
+        code,
+        observed_at: diagnostic.observed_at,
+        message: diagnostic.message,
+    })
+}
+
+fn session_verification_to_view(
+    verification: Option<GatewayVerificationView>,
+) -> Result<Option<SessionVerificationView>, String> {
+    let Some(verification) = verification else {
+        return Ok(None);
+    };
+    let verdict = match verification.verdict {
+        GatewayVerificationVerdictView::Usable => SessionVerificationVerdict::Usable,
+        GatewayVerificationVerdictView::Unusable => SessionVerificationVerdict::Unusable,
+    };
+    let diagnostics = verification
+        .diagnostics
+        .into_iter()
+        .map(|diagnostic| match diagnostic {
+            GatewayVerificationDiagnosticView::LegacyMessage(message) => {
+                Ok(SessionVerificationDiagnosticView::LegacyMessage(message))
+            }
+            GatewayVerificationDiagnosticView::Structured { code, summary } => {
+                let code = match code.as_str() {
+                    "artifact_digest_mismatch" => {
+                        SessionVerificationDiagnosticCode::ArtifactDigestMismatch
+                    }
+                    "artifact_invalid" => SessionVerificationDiagnosticCode::ArtifactInvalid,
+                    "manifest_invalid" => SessionVerificationDiagnosticCode::ManifestInvalid,
+                    "verification_failed" => SessionVerificationDiagnosticCode::VerificationFailed,
+                    _ => return Err("设备返回了未知的 gateway verification 诊断代码".to_string()),
+                };
+                Ok(SessionVerificationDiagnosticView::Structured { code, summary })
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Some(SessionVerificationView {
+        verdict,
+        actor: verification.actor,
+        validator: SessionVerificationValidatorView {
+            name: verification.validator_name,
+            version: verification.validator_version,
+            build_sha256: verification.validator_build_sha256,
+        },
+        manifest_sha256: verification.manifest_sha256,
+        verified_at: verification.verified_at,
+        diagnostics,
+        manifest_digest_valid: verification.manifest_digest_valid,
+    }))
+}
+
+fn gateway_verification_from_view(
+    verification: &SessionVerificationView,
+) -> GatewayVerificationView {
+    let verdict = match verification.verdict {
+        SessionVerificationVerdict::Usable => GatewayVerificationVerdictView::Usable,
+        SessionVerificationVerdict::Unusable => GatewayVerificationVerdictView::Unusable,
+    };
+    GatewayVerificationView {
+        actor: verification.actor.clone(),
+        validator_name: verification.validator.name.clone(),
+        validator_version: verification.validator.version.clone(),
+        validator_build_sha256: verification.validator.build_sha256.clone(),
+        manifest_sha256: verification.manifest_sha256.clone(),
+        manifest_digest_valid: verification.manifest_digest_valid,
+        verified_at: verification.verified_at.clone(),
+        verdict,
+        diagnostics: verification
+            .diagnostics
+            .iter()
+            .map(|diagnostic| match diagnostic {
+                SessionVerificationDiagnosticView::LegacyMessage(message) => {
+                    GatewayVerificationDiagnosticView::LegacyMessage(message.clone())
+                }
+                SessionVerificationDiagnosticView::Structured { code, summary } => {
+                    GatewayVerificationDiagnosticView::Structured {
+                        code: match code {
+                            SessionVerificationDiagnosticCode::ArtifactDigestMismatch => {
+                                "artifact_digest_mismatch"
+                            }
+                            SessionVerificationDiagnosticCode::ArtifactInvalid => {
+                                "artifact_invalid"
+                            }
+                            SessionVerificationDiagnosticCode::ManifestInvalid => {
+                                "manifest_invalid"
+                            }
+                            SessionVerificationDiagnosticCode::VerificationFailed => {
+                                "verification_failed"
+                            }
+                        }
+                        .to_string(),
+                        summary: summary.clone(),
+                    }
+                }
+            })
+            .collect(),
+    }
+}
+
+fn session_detail_to_view(detail: SessionDetailView) -> Result<SessionView, String> {
+    let verification = session_verification_to_view(detail.gateway_verification)?;
+    Ok(SessionView {
         session: Session {
             id: detail.session_id,
             revision: detail.revision,
@@ -2830,11 +3873,13 @@ fn session_detail_to_view(detail: SessionDetailView) -> SessionView {
         },
         download_status: DownloadStatus::None,
         backed_up: false,
-    }
+        verification,
+    })
 }
 
-fn session_summary_to_view(summary: SessionSummaryView) -> SessionView {
-    SessionView {
+fn session_summary_to_view(summary: SessionSummaryView) -> Result<SessionView, String> {
+    let verification = session_verification_to_view(summary.gateway_verification)?;
+    Ok(SessionView {
         session: Session {
             id: summary.session_id,
             revision: summary.revision,
@@ -2850,7 +3895,8 @@ fn session_summary_to_view(summary: SessionSummaryView) -> SessionView {
         },
         download_status: DownloadStatus::None,
         backed_up: false,
-    }
+        verification,
+    })
 }
 
 fn library_entry_covers_session_for_profile(
@@ -2885,6 +3931,45 @@ fn library_entry_covers_session(entry: &LibraryEntry, session: &Session) -> bool
                     && local.sha256 == expected.sha256
             })
         })
+}
+
+/// Pure durable projection check for ordinary session navigation.
+///
+/// The canonical commit and startup reconciliation are the boundaries that
+/// populate this exact MP4/receipt pair after strong on-disk verification.
+/// Session refresh deliberately consumes only those persisted fields; upload,
+/// cleanup and delete authorization independently reopen and hash the assets.
+fn entry_has_durable_canonical_projection(entry: &LibraryEntry) -> bool {
+    if !entry.complete || entry.processed_files.len() != 2 {
+        return false;
+    }
+    let output_path = format!("processed/{}.mp4", entry.session_id);
+    let output = entry
+        .processed_files
+        .iter()
+        .find(|file| file.display_path == output_path);
+    let receipt = entry
+        .processed_files
+        .iter()
+        .find(|file| file.display_path == derived_media::RECEIPT_DISPLAY_PATH);
+    let Some((output, receipt)) = output.zip(receipt) else {
+        return false;
+    };
+    let is_durable_asset = |file: &SessionFile| {
+        file.bytes > 0
+            && file.file_id == file.sha256
+            && file.sha256.len() == 64
+            && file
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    is_durable_asset(output)
+        && is_durable_asset(receipt)
+        && output
+            .bytes
+            .checked_add(receipt.bytes)
+            .is_some_and(|total| total == entry.bytes)
 }
 
 fn download_status_for_local_state(
@@ -2962,17 +4047,19 @@ where
             continue;
         }
 
-        let bytes = entry
-            .files
-            .iter()
-            .fold(0_u64, |total, file| total.saturating_add(file.bytes));
+        let Some(canonical) = canonical_assets_for_entry(library_root, entry) else {
+            skipped.push(skip(
+                "本地规范 MP4 或 derived media receipt 无法重新验证".to_string(),
+            ));
+            continue;
+        };
         eligible.push(DownloadedCleanupCandidate {
             session_id: session.id.clone(),
             revision: session.revision.clone(),
             date_label: session.date_label.clone(),
-            bytes,
+            bytes: canonical.total_bytes,
             local_device_id: entry.device_id.clone(),
-            local_files: entry.files.clone(),
+            local_files: canonical.files,
         });
     }
 
@@ -3012,12 +4099,9 @@ fn validate_downloaded_cleanup_entry(
         return Err("本地 durable library 文件清单包含重复项".to_string());
     }
 
-    validate_downloaded_cleanup_files(
-        library_root,
-        &entry.device_id,
-        &entry.session_id,
-        &entry.files,
-    )
+    canonical_assets_for_entry(library_root, entry)
+        .map(|_| ())
+        .ok_or_else(|| "本地规范 MP4 或 derived media receipt 无法重新验证".to_string())
 }
 
 fn validate_backed_up_cleanup_candidate<F>(
@@ -3075,27 +4159,6 @@ fn validate_downloaded_cleanup_files(
     Ok(())
 }
 
-fn validate_local_file_presence_and_size(
-    library_root: &Path,
-    device_id: &str,
-    session_id: &str,
-    files: &[SessionFile],
-) -> Result<(), String> {
-    for file in files {
-        let (_, metadata) =
-            resolve_existing_download_path(library_root, device_id, session_id, file)?;
-        if metadata.len() != file.bytes {
-            return Err(format!(
-                "本地文件大小不一致（{}）：期望 {}，实际 {}",
-                file.display_path,
-                file.bytes,
-                metadata.len()
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Returns a frontend projection of durable library history. `complete` in
 /// SQLite records that the immutable Pi inventory was downloaded at commit
 /// time; the projected value additionally says every expected local file is
@@ -3112,15 +4175,153 @@ pub(crate) fn project_library_entries(
         .iter()
         .cloned()
         .map(|mut entry| {
-            entry.complete = entry_has_complete_local_files(library_root, &entry);
-            if !entry.processed_files.is_empty()
-                && !entry_has_complete_processed_files(library_root, &entry)
-            {
+            if let Some(canonical) = canonical_assets_for_entry(library_root, &entry) {
+                entry.complete = true;
+                entry.processed_files = canonical.files;
+                entry.bytes = canonical.total_bytes;
+            } else {
+                entry.complete = false;
                 entry.processed_files.clear();
             }
             entry
         })
         .collect()
+}
+
+/// Promotes receipt-verifiable legacy processed MP4s into the canonical
+/// derived-only layout before the durable library becomes visible. A failed
+/// migration never mutates the legacy directory; the row is marked
+/// incomplete and retains its source inventory for an ordinary reprocess.
+pub(crate) fn reconcile_existing_derived_media(
+    comp: &Composition,
+    entries: &mut [LibraryEntry],
+) -> Result<bool, String> {
+    let committer = DerivedMediaCommitter::new(ffmpeg_export_config()?);
+    let current_root = comp.library_root();
+    let mut changed = false;
+    for entry in entries {
+        let publication = match validate_entry_publication(entry) {
+            Ok(publication) => publication.payload.clone(),
+            Err(error) => {
+                eprintln!(
+                    "[composition] legacy derived migration skipped for {}/{}: {}",
+                    entry.device_id, entry.session_id, error
+                );
+                if entry.complete {
+                    entry.complete = false;
+                    changed = true;
+                }
+                continue;
+            }
+        };
+        let roots = entry_search_roots(&current_root, entry);
+        let mut promoted = None;
+        let mut diagnostics = Vec::new();
+        for root in roots {
+            match committer.migrate_existing(
+                &root,
+                &entry.device_id,
+                &entry.session_id,
+                &publication,
+                &entry.processed_files,
+            ) {
+                Ok(Some(canonical)) => {
+                    promoted = Some((root, canonical));
+                    break;
+                }
+                Ok(None) => diagnostics.push(format!("{}: no migration candidate", root.display())),
+                Err(error) => diagnostics.push(format!("{}: {error}", root.display())),
+            }
+        }
+        if let Some((root, canonical)) = promoted {
+            let canonical_changed = !entry.complete
+                || entry.processed_files != canonical.files
+                || entry.bytes != canonical.total_bytes
+                || entry.library_root.as_deref() != Some(root.to_string_lossy().as_ref());
+            if canonical_changed {
+                entry.complete = true;
+                entry.processed_files = canonical.files;
+                entry.bytes = canonical.total_bytes;
+                entry.library_root = Some(root.to_string_lossy().into_owned());
+                entry.upload_status = UploadStatus::None;
+                entry.upload_retryable = false;
+                entry.uploaded_at = None;
+                entry.upload_error = None;
+                entry.object_receipts.clear();
+                entry.upload_projection = None;
+                changed = true;
+            }
+            continue;
+        }
+
+        eprintln!(
+            "[composition] legacy derived migration requires reprocessing for {}/{}: {}",
+            entry.device_id,
+            entry.session_id,
+            diagnostics.join("; ")
+        );
+        if entry.complete {
+            entry.complete = false;
+            changed = true;
+        }
+        if let Some(actual_bytes) = entry_search_roots(&current_root, entry)
+            .into_iter()
+            .find_map(|root| exact_session_disk_bytes(&root, entry).ok())
+        {
+            if entry.bytes != actual_bytes {
+                entry.bytes = actual_bytes;
+                changed = true;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+fn exact_session_disk_bytes(root: &Path, entry: &LibraryEntry) -> Result<u64, String> {
+    let session_root = root.join(&entry.device_id).join(&entry.session_id);
+    let canonical_root =
+        fs::canonicalize(root).map_err(|error| format!("无法规范化库目录：{error}"))?;
+    let canonical_session =
+        fs::canonicalize(&session_root).map_err(|error| format!("无法规范化会话目录：{error}"))?;
+    if !canonical_session.starts_with(&canonical_root) {
+        return Err("会话目录逃逸出库目录".to_string());
+    }
+    fn walk(root: &Path, directory: &Path) -> Result<u64, String> {
+        let metadata = fs::symlink_metadata(directory)
+            .map_err(|error| format!("无法检查会话目录：{error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("会话目录包含符号链接或非目录节点".to_string());
+        }
+        let mut total = 0_u64;
+        for entry in
+            fs::read_dir(directory).map_err(|error| format!("无法读取会话目录：{error}"))?
+        {
+            let entry = entry.map_err(|error| format!("无法读取会话目录项：{error}"))?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| format!("无法检查会话文件：{error}"))?;
+            if metadata.file_type().is_symlink() {
+                return Err("会话目录包含符号链接".to_string());
+            }
+            let canonical =
+                fs::canonicalize(&path).map_err(|error| format!("无法规范化会话文件：{error}"))?;
+            if !canonical.starts_with(root) {
+                return Err("会话文件逃逸出会话目录".to_string());
+            }
+            let bytes = if metadata.is_dir() {
+                walk(root, &canonical)?
+            } else if metadata.is_file() {
+                metadata.len()
+            } else {
+                return Err("会话目录包含不支持的文件类型".to_string());
+            };
+            total = total
+                .checked_add(bytes)
+                .ok_or_else(|| "会话磁盘占用溢出".to_string())?;
+        }
+        Ok(total)
+    }
+    walk(&canonical_session, &canonical_session)
 }
 
 /// Where one library row's bytes may be found, most authoritative first.
@@ -3169,42 +4370,76 @@ pub(crate) fn resolve_existing_download_path_for_entry(
     Err(last_error.unwrap_or_else(|| "本地文件不可用".to_string()))
 }
 
+#[cfg(test)]
 fn entry_has_complete_local_files(library_root: &Path, entry: &LibraryEntry) -> bool {
-    if !entry.complete || entry.files.is_empty() {
-        return false;
-    }
-    let unique_file_ids = entry
-        .files
-        .iter()
-        .map(|file| file.file_id.as_str())
-        .collect::<HashSet<_>>();
-    unique_file_ids.len() == entry.files.len()
-        && entry_search_roots(library_root, entry).iter().any(|root| {
-            validate_local_file_presence_and_size(
-                root,
+    entry.complete && canonical_assets_for_entry(library_root, entry).is_some()
+}
+
+fn canonical_assets_for_entry(
+    library_root: &Path,
+    entry: &LibraryEntry,
+) -> Option<derived_media::CanonicalDerivedAssets> {
+    let publication = validate_entry_publication(entry).ok()?;
+    entry_search_roots(library_root, entry)
+        .into_iter()
+        .find_map(|root| {
+            derived_media::canonical_assets_for_publication(
+                &root,
                 &entry.device_id,
                 &entry.session_id,
-                &entry.files,
+                &publication.payload,
             )
-            .is_ok()
+            .ok()
         })
 }
 
-fn entry_has_complete_processed_files(library_root: &Path, entry: &LibraryEntry) -> bool {
-    if entry.processed_files.is_empty() {
-        return false;
+fn canonical_publication_bundle_for_entry(
+    library_root: &Path,
+    entry: &LibraryEntry,
+) -> Result<derived_media::CanonicalPublicationBundle, String> {
+    let publication = validate_entry_publication(entry)?;
+    let mut last_error = None;
+    for root in entry_search_roots(library_root, entry) {
+        match derived_media::canonical_publication_bundle_for_entry(
+            &root,
+            &entry.device_id,
+            &entry.session_id,
+            &publication.payload,
+        ) {
+            Ok(bundle) => return Ok(bundle),
+            Err(error) => last_error = Some(error),
+        }
     }
-    let unique_file_ids = entry
-        .processed_files
-        .iter()
-        .map(|file| file.file_id.as_str())
-        .collect::<HashSet<_>>();
-    unique_file_ids.len() == entry.processed_files.len()
-        && entry_search_roots(library_root, entry).iter().any(|root| {
-            entry.processed_files.iter().all(|file| {
-                resolve_downloaded_file(root, &entry.device_id, &entry.session_id, file).is_ok()
-            })
-        })
+    Err(last_error.unwrap_or_else(|| "本地规范派生发布资产不可用".to_string()))
+}
+
+fn derived_publication_plan(
+    prefix: &str,
+    bundle: &derived_media::CanonicalPublicationBundle,
+) -> Result<DerivedPublicationPlan, String> {
+    let source_manifest_sha256 = SourceSha256::from_hex(&bundle.source_manifest_sha256)
+        .map_err(|error| format!("source manifest SHA-256 无效：{error}"))?;
+    let receipt_sha256 = SourceSha256::from_hex(&bundle.receipt_sha256)
+        .map_err(|error| format!("derived receipt SHA-256 无效：{error}"))?;
+    let output_sha256 = SourceSha256::from_hex(&bundle.output_sha256)
+        .map_err(|error| format!("derived MP4 SHA-256 无效：{error}"))?;
+    DerivedPublicationPlan::build(&DerivedPublicationInput {
+        prefix,
+        source_device_id: &bundle.source_device_id,
+        source_device_label: &bundle.source_device_label,
+        source_manifest_id: &bundle.source_manifest_id,
+        source_session_id: &bundle.source_session_id,
+        source_volume_id: &bundle.source_volume_id,
+        source_manifest_bytes: &bundle.source_manifest_bytes,
+        source_manifest_sha256,
+        receipt_id: &bundle.receipt_id,
+        receipt_bytes: &bundle.receipt_bytes,
+        receipt_sha256,
+        output_artifact_id: &bundle.output_artifact_id,
+        output_bytes: bundle.output_bytes,
+        output_sha256,
+        published_at: &bundle.published_at,
+    })
 }
 
 fn downloaded_cleanup_idempotency_key(device_id: &str, session_id: &str, revision: &str) -> String {
@@ -3251,41 +4486,176 @@ fn emit_devices(comp: &Composition, app: &AppHandle) {
     let _ = emit_devices_event(app, comp.frontend_devices());
 }
 
-fn apply_mdns_candidates(comp: &Composition, app: &AppHandle, candidates: Vec<MdnsCandidate>) {
-    let mut changed = false;
-    for c in &candidates {
-        let Some(addr) = c.addresses.first() else {
-            continue;
-        };
-        let probe = match probe_lab_v4_device(&addr.to_string(), c.port, Duration::from_secs(3)) {
-            Ok(probe) => probe,
-            Err(error) => {
-                eprintln!(
-                    "[composition] Device API v4 probe failed for mDNS candidate {}:{}: {error}",
-                    addr, c.port
-                );
-                continue;
-            }
-        };
-        let endpoint = DeviceEndpoint {
-            host: addr.to_string(),
-            port: c.port,
-            tls_fingerprint: probe.synthetic_identity_pin.0,
-            name: probe.device_label.clone(),
-            display_label: Some(probe.device_label),
-            api_profile: DeviceApiProfile::LabHttpV4,
-        };
-        match comp.register_endpoint(endpoint) {
-            Ok(EndpointRegistration { is_new: true, .. }) => changed = true,
-            Ok(EndpointRegistration { is_new: false, .. }) => {}
-            Err(error) => {
-                eprintln!("[composition] ignored invalid mDNS endpoint: {error}");
-            }
+#[derive(Debug)]
+struct MdnsObservation {
+    probes: Vec<MdnsCandidate>,
+    device_state_changed: bool,
+}
+
+fn reconcile_discovery_state(comp: &Composition, fingerprint: &DeviceFingerprint) -> bool {
+    let should_be_online = comp
+        .mdns_services
+        .lock()
+        .unwrap()
+        .should_be_online(fingerprint);
+    let Some(handle) = comp.fleet.handle(fingerprint.clone()) else {
+        return false;
+    };
+    let state = if should_be_online {
+        DiscoveryState::Online
+    } else {
+        DiscoveryState::Offline
+    };
+    handle.set_discovery_state(state)
+}
+
+fn bind_selected_endpoint(
+    comp: &Composition,
+    registry: &MdnsServiceRegistry,
+    fingerprint: &DeviceFingerprint,
+) -> bool {
+    let Some(endpoint) = registry.selected_endpoint(fingerprint) else {
+        return false;
+    };
+    match comp.register_endpoint(endpoint) {
+        Ok(registration) => registration.changed(),
+        Err(error) => {
+            eprintln!(
+                "[composition] could not select a verified endpoint for {}: {error}",
+                fingerprint.tls_pin()
+            );
+            false
         }
     }
-    if changed {
-        emit_devices(comp, app);
+}
+
+/// Applies only lifecycle metadata. Device probes run separately so a slow
+/// address cannot stop the browse loop from observing a newer removal/update.
+fn observe_mdns_changes(comp: &Composition, changes: &[MdnsChange]) -> MdnsObservation {
+    let mut probes = Vec::new();
+    let mut affected = HashSet::new();
+    let mut endpoint_changed = false;
+    {
+        let mut registry = comp.mdns_services.lock().unwrap();
+        for change in changes {
+            match change {
+                MdnsChange::Resolved(candidate) => {
+                    if let Some(observation) = registry.observe_resolved(candidate) {
+                        probes.push(candidate.clone());
+                        if let Some(fingerprint) = observation.previous_fingerprint {
+                            affected.insert(fingerprint);
+                        }
+                    }
+                }
+                MdnsChange::Lost(loss) => {
+                    if let Some(fingerprint) = registry.observe_lost(&loss.service_id, loss.cursor)
+                    {
+                        affected.insert(fingerprint);
+                    }
+                }
+                MdnsChange::BrowseLost(loss) => {
+                    for service_id in &loss.service_ids {
+                        if let Some(fingerprint) = registry.observe_lost(service_id, loss.cursor) {
+                            affected.insert(fingerprint);
+                        }
+                    }
+                }
+            }
+        }
+        for fingerprint in &affected {
+            endpoint_changed |= bind_selected_endpoint(comp, &registry, fingerprint);
+        }
     }
+    let mut device_state_changed = endpoint_changed;
+    for fingerprint in &affected {
+        device_state_changed |= reconcile_discovery_state(comp, fingerprint);
+    }
+    MdnsObservation {
+        probes,
+        device_state_changed,
+    }
+}
+
+fn probe_and_apply_mdns_candidate_with(
+    comp: &Composition,
+    candidate: MdnsCandidate,
+    probe: impl FnMut(&str, u16, Duration) -> Result<LabV4DeviceProbe, PiHttpError>,
+) -> bool {
+    if !comp
+        .mdns_services
+        .lock()
+        .unwrap()
+        .candidate_is_current(&candidate)
+    {
+        return false;
+    }
+    let success = match probe_mdns_candidate_with(&candidate, Duration::from_secs(3), probe) {
+        Ok(success) => success,
+        Err(failures) => {
+            eprintln!(
+                "[composition] Device API v4 probe failed for mDNS service {}: {}",
+                candidate.service_id, failures
+            );
+            return false;
+        }
+    };
+    let mut endpoint = lab_v4_endpoint_from_probe(success);
+    let identity = match DeviceIdentity::parse(&endpoint.tls_fingerprint) {
+        Ok(identity) => identity,
+        Err(error) => {
+            eprintln!(
+                "[composition] ignored invalid identity from mDNS service {}: {}",
+                candidate.service_id, error
+            );
+            return false;
+        }
+    };
+    endpoint.tls_fingerprint = identity.tls_pin();
+
+    // The service lock is held across the no-I/O endpoint bind so a removal
+    // cannot pass the fence between the final cursor check and registration.
+    let (association, registration_changed, previous_binding_changed) = {
+        let mut registry = comp.mdns_services.lock().unwrap();
+        if !registry.candidate_is_current(&candidate) {
+            return false;
+        }
+        let fingerprint = identity.fingerprint().clone();
+        let Some(association) = registry.accept_probe(
+            &candidate.service_id,
+            candidate.cursor,
+            fingerprint.clone(),
+            endpoint,
+        ) else {
+            return false;
+        };
+        let Some(selected_endpoint) = registry.selected_endpoint(&fingerprint) else {
+            return false;
+        };
+        let registration = match comp.register_endpoint(selected_endpoint) {
+            Ok(registration) => registration,
+            Err(error) => {
+                eprintln!("[composition] ignored invalid mDNS endpoint: {error}");
+                return false;
+            }
+        };
+        let previous_binding_changed = association
+            .previous_fingerprint
+            .as_ref()
+            .filter(|previous| *previous != &association.fingerprint)
+            .is_some_and(|previous| bind_selected_endpoint(comp, &registry, previous));
+        let changed = registration.changed();
+        (association, changed, previous_binding_changed)
+    };
+
+    // `register_endpoint` published Online under the service cursor lock;
+    // repeating that transition here could overwrite a just-observed loss.
+    let mut changed = registration_changed | previous_binding_changed;
+    if association.previous_fingerprint.as_ref() != Some(&association.fingerprint) {
+        if let Some(previous) = association.previous_fingerprint.as_ref() {
+            changed |= reconcile_discovery_state(comp, previous);
+        }
+    }
+    changed
 }
 
 /// Starts the background mDNS discovery loop. Best-effort: if
@@ -3294,30 +4664,34 @@ fn apply_mdns_candidates(comp: &Composition, app: &AppHandle, candidates: Vec<Md
 /// poll loop -- the app continues in manual-address-only mode rather than
 /// crashing or panicking. See module doc comment.
 ///
-/// The loop polls via `poll_events`, whose `PollOutcome` distinguishes
-/// "nothing pending" from "the browse channel is gone". A dead channel used
-/// to be indistinguishable from an idle one (`poll` returned `0` for both),
-/// so this loop would spin forever at 1.5s intervals on a browser that can
-/// never produce another event, while `mdns_available` kept claiming
-/// discovery worked. On `Disconnected` it now flips that flag and stops;
-/// dropping `discovery` tears the browse down through its RAII guard.
+/// The loop consumes exact lifecycle batches. Probes are detached blocking
+/// tasks: polling therefore continues while an address is slow, and the
+/// service cursor fences that late result before it can mutate device state.
 fn spawn_mdns_loop(comp: Arc<Composition>, app: AppHandle) -> Option<JoinHandle<()>> {
     match MdnsDiscovery::start() {
         Ok(mut discovery) => {
             comp.mdns_available.store(true, Ordering::SeqCst);
             Some(tauri::async_runtime::spawn(async move {
                 loop {
-                    let outcome = discovery.poll_events();
-                    if outcome.processed() > 0 {
-                        let candidates = discovery.candidates();
+                    let batch = discovery.poll_batch();
+                    let observation = observe_mdns_changes(&comp, &batch.changes);
+                    if observation.device_state_changed {
+                        emit_devices(&comp, &app);
+                    }
+                    for candidate in observation.probes {
                         let comp_for_probe = comp.clone();
                         let app_for_probe = app.clone();
-                        let _ = tauri::async_runtime::spawn_blocking(move || {
-                            apply_mdns_candidates(&comp_for_probe, &app_for_probe, candidates);
-                        })
-                        .await;
+                        tauri::async_runtime::spawn_blocking(move || {
+                            if probe_and_apply_mdns_candidate_with(
+                                &comp_for_probe,
+                                candidate,
+                                probe_lab_v4_device,
+                            ) {
+                                emit_devices(&comp_for_probe, &app_for_probe);
+                            }
+                        });
                     }
-                    if outcome.is_disconnected() {
+                    if batch.is_disconnected() {
                         comp.mdns_available.store(false, Ordering::SeqCst);
                         eprintln!(
                             "[composition] mDNS browse channel closed; stopping discovery and \
@@ -3352,6 +4726,30 @@ fn spawn_mdns_loop(comp: Arc<Composition>, app: AppHandle) -> Option<JoinHandle<
 /// single registry mutex across each request, so one Pi sitting in a socket
 /// timeout froze every other device's heartbeat -- and, because the same
 /// mutex guarded pairing, catalog reads and deletes, those too.
+fn poll_connected_device_once(
+    handle: &DeviceHandle,
+    client: Arc<PiHttpClient>,
+    api_profile: DeviceApiProfile,
+) -> bool {
+    let Ok(authenticated) = authenticated_client_for(handle, client) else {
+        return false;
+    };
+    match handle.heartbeat_with(&authenticated) {
+        // Nothing to renew: this device is not connected, so nothing
+        // changed for it either.
+        HeartbeatApplyOutcome::NotConnected => false,
+        // Lab v4's heartbeat is already its one authoritative capture-status
+        // request. Legacy keeps the descriptor refresh that binds a
+        // transcript-less publication identity and refreshes its activity.
+        _ => {
+            if api_profile == DeviceApiProfile::LegacyPinnedTlsV1 {
+                let _ = handle.refresh_capture_activity_with(&authenticated);
+            }
+            true
+        }
+    }
+}
+
 fn spawn_heartbeat_loop(comp: Arc<Composition>, app: AppHandle) -> JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         loop {
@@ -3366,21 +4764,9 @@ fn spawn_heartbeat_loop(comp: Arc<Composition>, app: AppHandle) -> JoinHandle<()
             let swept = tauri::async_runtime::spawn_blocking(move || {
                 fleet
                     .for_each_device(HEARTBEAT_CONCURRENCY, |handle| {
-                        let client = clients.get(handle.fingerprint())?;
-                        let authenticated =
-                            authenticated_client_for(handle, client.clone()).ok()?;
-                        match handle.heartbeat_with(&authenticated) {
-                            // Nothing to renew: this device is not
-                            // connected, so nothing changed for it either.
-                            HeartbeatApplyOutcome::NotConnected => None,
-                            // Renewed, expired, or a transient error: the
-                            // device's visible state may have moved either
-                            // way, so refresh it and report the tick.
-                            _ => {
-                                let _ = handle.refresh_capture_activity_with(&authenticated);
-                                Some(())
-                            }
-                        }
+                        let binding = clients.get(handle.fingerprint())?.clone();
+                        poll_connected_device_once(handle, binding.client, binding.api_profile)
+                            .then_some(())
                     })
                     .len()
             })
@@ -3565,6 +4951,7 @@ fn same_library_entry(left: Option<&LibraryEntry>, right: Option<&LibraryEntry>)
                 && left.processed_files == right.processed_files
                 && left.files == right.files
                 && left.complete == right.complete
+                && left.download_projection_sequence == right.download_projection_sequence
                 && left.publication == right.publication
                 && left.library_root == right.library_root
                 && left.object_receipts == right.object_receipts
@@ -3678,6 +5065,19 @@ fn apply_download_completion<R: Runtime>(
         )
     };
 
+    // The outbox sequence is a durable total order. A projection that
+    // already committed this sequence (crash before acknowledgement) or a
+    // newer one owns the complete library row. A stale replay must therefore
+    // be acknowledged without re-reading files or rolling any part of the
+    // row back.
+    if completion.record.outcome.is_success()
+        && current_entry
+            .as_ref()
+            .is_some_and(|entry| entry.download_projection_sequence >= completion.record.sequence)
+    {
+        return Ok((ProjectionOutcome::AlreadyApplied, false, device_id));
+    }
+
     // This is the intentionally unlocked portion. `resolve_downloaded_file`
     // performs symlink/path checks and streams a SHA-256 over every file.
     let mut candidate =
@@ -3691,6 +5091,7 @@ fn apply_download_completion<R: Runtime>(
     if completion.record.outcome.is_success() && candidate.merged {
         if let Some(entry) = candidate.entry.as_mut() {
             entry.downloaded_at = completion.record.recorded_at.clone();
+            entry.download_projection_sequence = completion.record.sequence;
         }
     }
     let serialized = candidate
@@ -3855,7 +5256,7 @@ fn upload_projection_marker_for_spec(
 }
 
 /// Checks the durable receipt batch against the immutable upload context and,
-/// when a library row is present, the signed local inventory. A successful
+/// when a library row is present, the canonical MP4/receipt pair. A successful
 /// completion with an incomplete batch remains unacknowledged rather than
 /// fabricating `UploadStatus::Done`.
 fn validate_upload_receipt_batch(
@@ -3885,80 +5286,136 @@ fn validate_upload_receipt_batch(
     let Some(entry) = entry else {
         return Ok(());
     };
-    let expected_data = entry.files.len();
-    let data = receipts
-        .iter()
-        .filter(|receipt| receipt.role == UploadReceiptRole::Data)
-        .collect::<Vec<_>>();
-    let evidence = receipts
-        .iter()
-        .filter(|receipt| receipt.role == UploadReceiptRole::Evidence)
-        .count();
-    if data.len() != expected_data || evidence != 3 || receipts.len() != expected_data + 3 {
-        return Err("对象验证凭证批次不完整".to_string());
+    validate_stored_v4_receipts(entry, object_prefix, receipts)
+}
+
+fn validate_stored_v4_receipts(
+    entry: &LibraryEntry,
+    object_prefix: &str,
+    receipts: &[StoredUploadReceipt],
+) -> Result<(), String> {
+    if entry.processed_files.len() != 2 || receipts.len() != 5 {
+        return Err(
+            "Bucket Publication v4 必须具有 3 个内容对象、marker 和 admission 共 5 个凭证"
+                .to_string(),
+        );
     }
-    for file in &entry.files {
-        let expected_sha = file.sha256.to_ascii_lowercase();
-        let expected_key = upload_object_key(
-            object_prefix,
-            &entry.device_id,
-            &entry.session_id,
-            &file.file_id,
-        )
-        .0;
-        if !data.iter().any(|receipt| {
-            receipt.object_key == expected_key
-                && receipt.size_bytes == file.bytes
-                && receipt.source_sha256.eq_ignore_ascii_case(&expected_sha)
-        }) {
-            return Err(format!(
-                "对象验证凭证缺少本地文件 {} 的 exact key/size/digest proof",
-                file.file_id
-            ));
-        }
+    let marker = receipts
+        .iter()
+        .find(|receipt| {
+            receipt
+                .object_key
+                .ends_with("/__ylx_evidence__/publication.json")
+        })
+        .ok_or_else(|| "对象验证凭证缺少 Bucket Publication v4 marker".to_string())?;
+    if marker.role != UploadReceiptRole::Evidence || marker.size_bytes == 0 {
+        return Err("Bucket Publication v4 marker 凭证角色或大小无效".to_string());
     }
-    let publication = entry
+    SourceSha256::from_hex(&marker.source_sha256)
+        .map_err(|error| format!("marker SHA-256 无效：{error}"))?;
+    let marker_key = ObjectKey(marker.object_key.clone());
+    let root = marker
+        .object_key
+        .strip_suffix("/__ylx_evidence__/publication.json")
+        .ok_or_else(|| "marker object key 后缀无效".to_string())?;
+    validate_v4_object_root(root, object_prefix, &entry.session_id)?;
+    let admission = receipts
+        .iter()
+        .find(|receipt| {
+            admission_key_belongs_to_marker(&marker_key, &ObjectKey(receipt.object_key.clone()))
+        })
+        .ok_or_else(|| {
+            "对象验证凭证缺少同一 evidence authority 的 Console admission 回执".to_string()
+        })?;
+    if admission.role != UploadReceiptRole::Evidence
+        || admission.size_bytes == 0
+        || SourceSha256::from_hex(&admission.source_sha256).is_err()
+    {
+        return Err("Console admission 凭证角色、大小或 SHA-256 无效".to_string());
+    }
+
+    let source_sha = entry
         .publication
         .as_ref()
-        .ok_or_else(|| "本地记录缺少签名 publication".to_string())?;
-    for (name, bytes) in [
-        (
-            PUBLICATION_SIGNATURE_OBJECT,
-            publication.signature.as_slice(),
-        ),
-        (
-            PUBLICATION_PUBLIC_KEY_OBJECT,
-            publication.public_key.as_slice(),
-        ),
-        (PUBLICATION_MANIFEST_OBJECT, publication.payload.as_slice()),
-    ] {
-        let expected_sha = Sha256::digest(bytes);
-        let expected_key =
-            upload_evidence_object_key(object_prefix, &entry.device_id, &entry.session_id, name).0;
-        if !receipts.iter().any(|receipt| {
-            receipt.role == UploadReceiptRole::Evidence
-                && receipt.object_key == expected_key
-                && receipt.size_bytes == bytes.len() as u64
-                && receipt.source_sha256.eq_ignore_ascii_case(
-                    &expected_sha
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect::<String>(),
-                )
-        }) {
+        .and_then(|publication| publication.revision.strip_prefix("sha256:"))
+        .ok_or_else(|| "本地记录缺少 source manifest revision".to_string())?;
+    let mut expected = HashMap::from([(
+        source_sha.to_ascii_lowercase(),
+        (None, UploadReceiptRole::Evidence),
+    )]);
+    for file in &entry.processed_files {
+        let role = if file.display_path == derived_media::RECEIPT_DISPLAY_PATH {
+            UploadReceiptRole::Evidence
+        } else {
+            UploadReceiptRole::Data
+        };
+        if expected
+            .insert(file.sha256.to_ascii_lowercase(), (Some(file.bytes), role))
+            .is_some()
+        {
+            return Err("v4 内容对象摘要必须互不相同".to_string());
+        }
+    }
+    if expected.len() != 3 {
+        return Err("v4 内容对象摘要集合不完整".to_string());
+    }
+    for (sha256, (size, role)) in expected {
+        let key = format!("{root}/f-{sha256}");
+        let receipt = receipts
+            .iter()
+            .find(|receipt| receipt.object_key == key)
+            .ok_or_else(|| format!("对象验证凭证缺少内容对象 f-{sha256}"))?;
+        if receipt.role != role
+            || receipt.size_bytes == 0
+            || size.is_some_and(|expected_size| receipt.size_bytes != expected_size)
+            || !receipt.source_sha256.eq_ignore_ascii_case(&sha256)
+        {
             return Err(format!(
-                "对象验证凭证缺少 publication evidence {} 的 exact key/size/digest proof",
-                name
+                "内容对象 f-{sha256} 的 role/size/digest 凭证不一致"
             ));
         }
     }
     Ok(())
 }
 
+fn validate_v4_object_root(
+    root: &str,
+    object_prefix: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let prefix = normalize_prefix(object_prefix);
+    let tail = if prefix.is_empty() {
+        root
+    } else {
+        root.strip_prefix(prefix)
+            .and_then(|value| value.strip_prefix('/'))
+            .ok_or_else(|| "v4 object root 不在 immutable prefix 下".to_string())?
+    };
+    let parts = tail.split('/').collect::<Vec<_>>();
+    if parts.len() != 3
+        || !uuid_has_version(parts[0], 4)
+        || parts[1] != session_id
+        || !uuid_has_version(parts[1], 7)
+        || !uuid_has_version(parts[2], 7)
+    {
+        return Err(
+            "v4 object root 不符合 device UUIDv4/session UUIDv7/publication UUIDv7".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn uuid_has_version(raw: &str, version: usize) -> bool {
+    uuid::Uuid::parse_str(raw)
+        .is_ok_and(|value| value.get_version_num() == version && value.to_string() == raw)
+}
+
 /// Projects one upload completion without holding either global mutex across
 /// serialization. Upload workers have already staged the object receipts;
 /// this phase only revision-fences the one affected library row and projects
-/// its terminal transfer activity after the row CAS succeeds.
+/// its terminal transfer activity after the row CAS succeeds. A successful
+/// worker returns success only after the exact Bucket Publication v4 marker
+/// and Console admission acknowledgement have both been read back.
 fn apply_upload_completion<R: Runtime>(
     comp: &Composition,
     app: &AppHandle<R>,
@@ -4032,6 +5489,7 @@ fn apply_upload_completion<R: Runtime>(
         TerminalOutcome::Succeeded => {
             entry.upload_status == UploadStatus::Done
                 && !entry.upload_retryable
+                && entry.upload_error.is_none()
                 && entry.uploaded_at.as_deref() == Some(completion.record.recorded_at.as_str())
                 && entry.object_receipts == frontend_upload_receipts(&receipts)
         }
@@ -4253,12 +5711,10 @@ fn spawn_transfer_poll_loop(comp: Arc<Composition>, app: AppHandle) -> JoinHandl
 /// the durable [`JobSpec`] directly, so no process-local request model can
 /// drift from the recovery authority.
 ///
-/// - `Succeeded`: independently verifies every requested file really
-///   exists on disk at its `derive_target_path` location (never trusting
-///   the state transition alone), then merges requested files by opaque id.
-///   A single-file job cannot overwrite the rest of an existing entry and
-///   is not reported as a complete session until its merged inventory really
-///   covers every file from the immutable session detail.
+/// - `Succeeded`: accepts only a full-session specification, independently
+///   verifies the canonical derived bundle (never trusting the state
+///   transition alone), and publishes that bundle to the local library.
+///   Historical partial specifications remain permanently non-publishable.
 /// - `Failed`/`Cancelled`: leaves the library unchanged. Session status is
 ///   derived from the durable terminal job and completion outbox.
 ///
@@ -4280,152 +5736,36 @@ fn apply_terminal_download(
     )
 }
 
-fn verified_file_key(file: &crate::models::SessionFile) -> (String, String, u64, String) {
-    (
-        file.file_id.clone(),
-        file.display_path.clone(),
-        file.bytes,
-        file.sha256.clone(),
-    )
-}
-
-#[derive(Debug, Clone, Default)]
-struct PublicationFileMetadata {
-    role: String,
-    media_type: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionExportFileClass {
-    VideoLeft,
-    VideoRight,
-    VideoStereo,
-    Audio,
-    Other,
-}
-
-fn publication_file_metadata(payload: &[u8]) -> HashMap<(String, String), PublicationFileMetadata> {
-    let mut out = HashMap::new();
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
-        return out;
-    };
-    let Some(files) = value.get("files").and_then(serde_json::Value::as_array) else {
-        return out;
-    };
-    for file in files {
-        let Some(id) = file.get("id").and_then(serde_json::Value::as_str) else {
-            continue;
-        };
-        let Some(display_path) = file.get("display_path").and_then(serde_json::Value::as_str)
-        else {
-            continue;
-        };
-        out.insert(
-            (id.to_string(), display_path.to_string()),
-            PublicationFileMetadata {
-                role: file
-                    .get("role")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_ascii_lowercase(),
-                media_type: file
-                    .get("media_type")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-                    .to_ascii_lowercase(),
-            },
+fn ffmpeg_export_config() -> Result<SessionExportConfig, String> {
+    let ffmpeg = resolve_bundled_ffmpeg_path();
+    let ffprobe = resolve_bundled_ffprobe_path();
+    #[cfg(target_os = "windows")]
+    if ffmpeg.is_none() || ffprobe.is_none() {
+        return Err(
+            "Windows media finalization requires bundled ffmpeg.exe and ffprobe.exe".to_string(),
         );
     }
-    out
-}
-
-fn export_file_class(
-    file: &SessionFile,
-    metadata: Option<&PublicationFileMetadata>,
-) -> SessionExportFileClass {
-    let path = file.display_path.to_ascii_lowercase();
-    let role = metadata.map(|meta| meta.role.as_str()).unwrap_or("");
-    let media_type = metadata.map(|meta| meta.media_type.as_str()).unwrap_or("");
-    if role.starts_with("audio")
-        || media_type.starts_with("audio/")
-        || path.starts_with("audio/")
-        || path.ends_with(".wav")
-        || path.ends_with(".aac")
-        || path.ends_with(".m4a")
-    {
-        return SessionExportFileClass::Audio;
+    let mut config = SessionExportConfig::system_ffmpeg();
+    if let Some(path) = ffmpeg {
+        config = config.with_ffmpeg_path(path);
     }
-    if role == "video.left"
-        || role == "video_left"
-        || path.starts_with("video/left_")
-        || path.contains("/left_")
-    {
-        return SessionExportFileClass::VideoLeft;
+    if let Some(path) = ffprobe {
+        config = config.with_ffprobe_path(path);
     }
-    if role == "video.right"
-        || role == "video_right"
-        || path.starts_with("video/right_")
-        || path.contains("/right_")
-    {
-        return SessionExportFileClass::VideoRight;
-    }
-    if role == "video.raw-side-by-side"
-        || role == "video.side-by-side"
-        || role == "video.stereo"
-        || role == "video_stereo"
-        || path.contains("side-by-side")
-        || path.contains("sbs")
-        || path.contains("stereo")
-    {
-        return SessionExportFileClass::VideoStereo;
-    }
-    SessionExportFileClass::Other
-}
-
-fn processed_output_path(
-    library_root: &Path,
-    device_id: &str,
-    session_id: &str,
-) -> Result<PathBuf, String> {
-    derive_target_path_for_file(
-        library_root,
-        device_id,
-        session_id,
-        PROCESSED_SESSION_FILE_ID,
-        Some(PROCESSED_SESSION_DISPLAY_PATH),
-    )
-    .map_err(|error| {
-        format!("processed MP4 输出路径不安全（{PROCESSED_SESSION_DISPLAY_PATH}）：{error:?}")
-    })
-}
-
-fn prepare_processed_output_parent(path: &Path) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "processed MP4 输出路径缺少父目录".to_string())?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("无法创建 processed MP4 输出目录：{error}"))?;
-    let metadata = fs::symlink_metadata(parent)
-        .map_err(|error| format!("无法检查 processed MP4 输出目录：{error}"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(format!(
-            "processed MP4 输出目录必须是真实目录：{}",
-            parent.display()
-        ));
-    }
-    Ok(())
-}
-
-fn ffmpeg_export_config() -> SessionExportConfig {
-    let Some(path) = resolve_bundled_ffmpeg_path() else {
-        return SessionExportConfig::system_ffmpeg();
-    };
-    SessionExportConfig::system_ffmpeg().with_ffmpeg_path(path)
+    Ok(config)
 }
 
 fn resolve_bundled_ffmpeg_path() -> Option<PathBuf> {
+    resolve_bundled_media_tool_path("OPENARIA_FFMPEG", "ffmpeg")
+}
+
+fn resolve_bundled_ffprobe_path() -> Option<PathBuf> {
+    resolve_bundled_media_tool_path("OPENARIA_FFPROBE", "ffprobe")
+}
+
+fn resolve_bundled_media_tool_path(environment_key: &str, tool: &str) -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(path) = std::env::var("OPENARIA_FFMPEG") {
+    if let Ok(path) = std::env::var(environment_key) {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
             candidates.push(PathBuf::from(trimmed));
@@ -4433,20 +5773,20 @@ fn resolve_bundled_ffmpeg_path() -> Option<PathBuf> {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("ffmpeg.exe"));
-            candidates.push(parent.join("ffmpeg"));
-            candidates.push(parent.join("binaries").join("ffmpeg.exe"));
-            candidates.push(parent.join("binaries").join("ffmpeg"));
+            candidates.push(parent.join(format!("{tool}.exe")));
+            candidates.push(parent.join(tool));
+            candidates.push(parent.join("binaries").join(format!("{tool}.exe")));
+            candidates.push(parent.join("binaries").join(tool));
         }
     }
     if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
         let binaries = PathBuf::from(manifest_dir).join("binaries");
         #[cfg(target_os = "windows")]
-        candidates.push(binaries.join("ffmpeg-x86_64-pc-windows-msvc.exe"));
+        candidates.push(binaries.join(format!("{tool}-x86_64-pc-windows-msvc.exe")));
         #[cfg(target_os = "linux")]
-        candidates.push(binaries.join("ffmpeg-x86_64-unknown-linux-gnu"));
+        candidates.push(binaries.join(format!("{tool}-x86_64-unknown-linux-gnu")));
         #[cfg(target_os = "macos")]
-        candidates.push(binaries.join("ffmpeg-aarch64-apple-darwin"));
+        candidates.push(binaries.join(format!("{tool}-aarch64-apple-darwin")));
     }
     candidates.into_iter().find(|path| {
         fs::symlink_metadata(path)
@@ -4455,289 +5795,89 @@ fn resolve_bundled_ffmpeg_path() -> Option<PathBuf> {
     })
 }
 
-fn maybe_build_processed_session_file(
-    library_root: &Path,
-    device_id: &str,
-    session_id: &str,
-    session_files: &[SessionFile],
-    verified_files: &HashMap<(String, String, u64, String), (PathBuf, u64)>,
-    publication_payload: &[u8],
-) -> Result<Option<SessionFile>, String> {
-    let metadata = publication_file_metadata(publication_payload);
-    let mut left_segments = Vec::new();
-    let mut right_segments = Vec::new();
-    let mut stereo_segments = Vec::new();
-    let mut audio_segments = Vec::new();
-    for file in session_files {
-        let path = verified_files
-            .get(&verified_file_key(file))
-            .map(|(path, _)| path.clone())
-            .ok_or_else(|| format!("缺少已校验的本地文件：{}", file.display_path))?;
-        let class = export_file_class(
-            file,
-            metadata.get(&(file.file_id.clone(), file.display_path.clone())),
-        );
-        match class {
-            SessionExportFileClass::VideoLeft => left_segments.push(path),
-            SessionExportFileClass::VideoRight => right_segments.push(path),
-            SessionExportFileClass::VideoStereo => stereo_segments.push(path),
-            SessionExportFileClass::Audio => audio_segments.push(path),
-            SessionExportFileClass::Other => {}
-        }
-    }
-
-    let video = if !left_segments.is_empty() || !right_segments.is_empty() {
-        SessionExportVideoInput::SeparateEyes {
-            left_segments,
-            right_segments,
-        }
-    } else if !stereo_segments.is_empty() {
-        SessionExportVideoInput::SideBySide {
-            segments: stereo_segments,
-            // The device-side source can be MP4/H.264, MJPEG, or a retained
-            // legacy shape. Re-encoding keeps the output uniformly playable
-            // and lets the same audio path be muxed with a bounded `-shortest`.
-            copy_video: false,
-        }
-    } else {
-        return Ok(None);
-    };
-
-    let output_path = processed_output_path(library_root, device_id, session_id)?;
-    prepare_processed_output_parent(&output_path)?;
-    let source_root = library_root.join(device_id).join(session_id);
-    let plan = SessionExportPlan::from_resolved_segments(
-        source_root,
-        output_path.clone(),
-        true,
-        video,
-        audio_segments,
-    )
-    .map_err(|error| format!("无法准备下载后视频合并计划：{error}"))?;
-    let receipt = FfmpegSessionExporter::new(ffmpeg_export_config())
-        .export_plan(&plan)
-        .map_err(|error| format!("下载后视频合并失败：{error}"))?;
-    let sha256 = hash_file(&receipt.output_path).map_err(|error| {
-        format!(
-            "计算 processed MP4 哈希失败（{}）：{error}",
-            receipt.output_path.display()
-        )
-    })?;
-    Ok(Some(SessionFile::new(
-        PROCESSED_SESSION_FILE_ID.to_string(),
-        PROCESSED_SESSION_DISPLAY_PATH.to_string(),
-        receipt.output_size_bytes,
-        sha256.to_hex(),
-    )))
-}
-
 fn apply_terminal_download_with_resolver<F>(
     library: &mut Vec<LibraryEntry>,
     library_root: &Path,
     spec: &JobSpec,
     state: &TransferJobState,
-    resolve: &F,
+    _resolve: &F,
 ) -> bool
 where
     F: Fn(&Path, &str, &str, &crate::models::SessionFile) -> Result<(PathBuf, u64), String>,
 {
+    if !matches!(state, TransferJobState::Succeeded) || !spec.full_session() {
+        return false;
+    }
     let device_id = spec.identity().device_id().as_str();
     let session_id = spec.identity().session_id().as_str();
-    let requested_files = spec
-        .requested_files()
-        .map(session_file_from_job_spec)
-        .collect::<Vec<_>>();
     let session_files = spec
         .session_files()
         .iter()
         .map(session_file_from_job_spec)
         .collect::<Vec<_>>();
     let publication = publication_evidence_from_job_spec(spec);
-    // Keep the verified path/size result for this projection pass. A full
-    // session's requested files are also its merged inventory, and hashing
-    // them a second time would turn one completion into two full-file reads.
-    let mut verified_files: HashMap<(String, String, u64, String), (PathBuf, u64)> = HashMap::new();
-
-    let requested_files_verified = match state {
-        TransferJobState::Succeeded => {
-            let mut verify_error: Option<String> = None;
-            for file in &requested_files {
-                match resolve(library_root, device_id, session_id, file) {
-                    Ok((path, size)) => {
-                        verified_files.insert(verified_file_key(file), (path, size));
-                    }
-                    Err(e) => {
-                        verify_error = Some(e);
-                        break;
-                    }
-                }
-            }
-            match verify_error {
-                None => true,
-                Some(e) => {
-                    eprintln!(
-                        "[composition] job for {}/{} reported Succeeded but a downloaded file \
-                         failed real on-disk verification ({e}); not fabricating a library entry",
-                        device_id, session_id
-                    );
-                    false
-                }
-            }
+    let canonical = match derived_media::canonical_assets_for_publication(
+        library_root,
+        device_id,
+        session_id,
+        spec.publication().payload(),
+    ) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            eprintln!(
+                "[composition] succeeded download for {device_id}/{session_id} has no valid canonical derived bundle: {error}"
+            );
+            return false;
         }
-        TransferJobState::Failed { .. } | TransferJobState::Cancelled => false,
-        // `spawn_transfer_poll_loop` only calls this for a terminal state;
-        // staying total here (rather than panicking) costs nothing.
-        _ => return false,
     };
-
-    if requested_files_verified {
-        let existing_index = library
-            .iter()
-            .position(|entry| entry.device_id == device_id && entry.session_id == session_id);
-        let same_revision = existing_index.is_some_and(|index| {
-            library[index]
-                .publication
-                .as_ref()
-                .is_some_and(|existing| existing.revision == publication.revision)
-        });
-        let mut merged_files = if spec.full_session() {
-            // A whole-session transfer is an authoritative snapshot for this
-            // signed revision. Never retain files removed by a newer revision.
-            session_files.clone()
-        } else if same_revision {
-            library[existing_index.expect("same_revision implies an entry")]
-                .files
-                .clone()
-        } else {
-            // A partial transfer from a new revision cannot be combined with
-            // legacy or previous-revision bytes.
-            Vec::new()
-        };
-        if !spec.full_session() {
-            for file in &requested_files {
-                if let Some(existing) = merged_files
-                    .iter_mut()
-                    .find(|existing| existing.file_id == file.file_id)
-                {
-                    *existing = file.clone();
-                } else {
-                    merged_files.push(file.clone());
-                }
+    let existing_index = library
+        .iter()
+        .position(|entry| entry.device_id == device_id && entry.session_id == session_id);
+    let downloaded_at = chrono::Utc::now().to_rfc3339();
+    match existing_index {
+        Some(index) => {
+            let existing = &mut library[index];
+            let files_changed = existing.files != session_files;
+            let processed_changed = existing.processed_files != canonical.files;
+            let publication_changed = existing.publication.as_ref() != Some(&publication);
+            existing.files = session_files;
+            existing.processed_files = canonical.files;
+            existing.bytes = canonical.total_bytes;
+            existing.date_label = spec.date_label().to_string();
+            existing.downloaded_at = downloaded_at;
+            existing.complete = true;
+            existing.library_root = Some(library_root.to_string_lossy().into_owned());
+            existing.publication = Some(publication);
+            if files_changed || processed_changed || publication_changed {
+                existing.upload_status = UploadStatus::None;
+                existing.upload_retryable = false;
+                existing.uploaded_at = None;
+                existing.upload_error = None;
+                existing.object_receipts.clear();
+                existing.upload_projection = None;
             }
         }
-
-        let mut total_bytes = 0_u64;
-        for file in &merged_files {
-            let verified = match verified_files.get(&verified_file_key(file)).cloned() {
-                Some(verified) => Ok(verified),
-                None => resolve(library_root, device_id, session_id, file),
-            };
-            match verified {
-                Ok((path, size)) => {
-                    verified_files.insert(verified_file_key(file), (path, size));
-                    total_bytes = total_bytes.saturating_add(size);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[composition] local library merge for {}/{} contains an invalid \
-                         existing file ({e}); not publishing the merged entry",
-                        device_id, session_id
-                    );
-                    return false;
-                }
-            }
-        }
-
-        let complete = files_cover_inventory(&merged_files, &session_files);
-        let existing_processed_files = if same_revision {
-            existing_index
-                .map(|index| library[index].processed_files.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let processed_files = if complete {
-            match maybe_build_processed_session_file(
-                library_root,
-                device_id,
-                session_id,
-                &session_files,
-                &verified_files,
-                spec.publication().payload(),
-            ) {
-                Ok(Some(file)) => vec![file],
-                Ok(None) => existing_processed_files,
-                Err(error) => {
-                    eprintln!(
-                        "[composition] completed download for {}/{} but post-download media \
-                         preprocessing was not published ({error})",
-                        device_id, session_id
-                    );
-                    existing_processed_files
-                }
-            }
-        } else {
-            Vec::new()
-        };
-        let downloaded_at = chrono::Utc::now().to_rfc3339();
-        match existing_index {
-            Some(index) => {
-                let existing = &mut library[index];
-                let files_changed = existing.files != merged_files;
-                let processed_changed = existing.processed_files != processed_files;
-                let publication_changed = existing.publication.as_ref() != Some(&publication);
-                existing.files = merged_files;
-                existing.processed_files = processed_files;
-                existing.bytes = total_bytes;
-                existing.date_label = spec.date_label().to_string();
-                existing.downloaded_at = downloaded_at;
-                existing.complete = complete;
-                existing.library_root = Some(library_root.to_string_lossy().into_owned());
-                existing.publication = Some(publication.clone());
-                if files_changed || processed_changed || publication_changed {
-                    existing.upload_status = UploadStatus::None;
-                    existing.upload_retryable = false;
-                    existing.uploaded_at = None;
-                    existing.upload_error = None;
-                    existing.object_receipts.clear();
-                }
-            }
-            None => library.push(LibraryEntry {
-                device_id: device_id.to_string(),
-                session_id: session_id.to_string(),
-                date_label: spec.date_label().to_string(),
-                downloaded_at,
-                bytes: total_bytes,
-                processed_files,
-                files: merged_files,
-                complete,
-                library_root: Some(library_root.to_string_lossy().into_owned()),
-                publication: Some(publication),
-                object_receipts: Vec::new(),
-                upload_projection: None,
-                upload_status: UploadStatus::None,
-                upload_retryable: false,
-                uploaded_at: None,
-                upload_error: None,
-            }),
-        }
-        return true;
+        None => library.push(LibraryEntry {
+            device_id: device_id.to_string(),
+            session_id: session_id.to_string(),
+            date_label: spec.date_label().to_string(),
+            downloaded_at,
+            bytes: canonical.total_bytes,
+            processed_files: canonical.files,
+            files: session_files,
+            complete: true,
+            download_projection_sequence: 0,
+            library_root: Some(library_root.to_string_lossy().into_owned()),
+            publication: Some(publication),
+            object_receipts: Vec::new(),
+            upload_projection: None,
+            upload_status: UploadStatus::None,
+            upload_retryable: false,
+            uploaded_at: None,
+            upload_error: None,
+        }),
     }
-    false
-}
-
-fn files_cover_inventory(local: &[SessionFile], inventory: &[SessionFile]) -> bool {
-    !inventory.is_empty()
-        && local.len() == inventory.len()
-        && inventory.iter().all(|expected| {
-            local.iter().any(|file| {
-                file.file_id == expected.file_id
-                    && file.display_path == expected.display_path
-                    && file.bytes == expected.bytes
-                    && !file.sha256.is_empty()
-                    && file.sha256 == expected.sha256
-            })
-        })
+    true
 }
 
 /// Establishes a trusted-LAN session: performs `POST /pairing-requests`
@@ -4761,6 +5901,7 @@ pub async fn connect_device(
     let device_id = binding.identity.device_id().as_str().to_string();
     let record_trusted_producer_key =
         binding.endpoint.api_profile == DeviceApiProfile::LegacyPinnedTlsV1;
+    let pairing_endpoint = binding.endpoint.clone();
     let client = binding.client;
     let handle = binding.handle;
     if let ConnectionState::Connected { connection_id, .. } = handle.connection_state() {
@@ -4831,12 +5972,85 @@ pub async fn connect_device(
         let comp = comp.clone();
         let device_id = device_id.clone();
         let attempt_id = attempt_id.clone();
+        let pairing_endpoint = pairing_endpoint.clone();
         tauri::async_runtime::spawn(async move {
-            run_pairing(comp, app, device_id, client, attempt_id, expires_at).await;
+            run_pairing(
+                comp,
+                app,
+                device_id,
+                client,
+                pairing_endpoint,
+                attempt_id,
+                expires_at,
+            )
+            .await;
         })
     };
     comp.pairing_tasks.lock().unwrap().insert(device_id, handle);
     Ok(attempt_id)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConnectionNegotiationOutcome {
+    Ready,
+    Failed(String),
+    Stale,
+}
+
+fn connection_negotiation_failure(
+    handle: &DeviceHandle,
+    expected_epoch: u64,
+    message: String,
+) -> ConnectionNegotiationOutcome {
+    if handle.disconnect_local_if_epoch(expected_epoch) {
+        ConnectionNegotiationOutcome::Failed(message)
+    } else {
+        ConnectionNegotiationOutcome::Stale
+    }
+}
+
+/// Negotiates the descriptor facts required to publish one newly connected
+/// Device API v4 epoch. The adapter's negotiation route is descriptor-only;
+/// capture status belongs to the periodic heartbeat. Any failure clears only
+/// `expected_epoch`, while an old task that encounters a newer epoch returns
+/// `Stale` without touching it.
+fn negotiate_lab_v4_connection_once(
+    handle: &DeviceHandle,
+    client: Arc<PiHttpClient>,
+    expected_epoch: u64,
+) -> ConnectionNegotiationOutcome {
+    let authenticated = match authenticated_client_for(handle, client) {
+        Ok(authenticated) => authenticated,
+        Err(error) => {
+            return connection_negotiation_failure(handle, expected_epoch, error);
+        }
+    };
+    match handle.negotiate_device_with_for_epoch(&authenticated, expected_epoch) {
+        RefreshApplyOutcome::Refreshed => match handle.negotiated_device_snapshot() {
+            Some(snapshot)
+                if snapshot.epoch == expected_epoch
+                    && snapshot.info.profile == DeviceApiProfileView::LabHttpV4 =>
+            {
+                ConnectionNegotiationOutcome::Ready
+            }
+            _ => connection_negotiation_failure(
+                handle,
+                expected_epoch,
+                "设备返回的能力 profile 与 Device API v4 连接不一致".to_string(),
+            ),
+        },
+        RefreshApplyOutcome::NotConnected => connection_negotiation_failure(
+            handle,
+            expected_epoch,
+            "设备连接在能力协商前已失效，请重试".to_string(),
+        ),
+        RefreshApplyOutcome::Stale => ConnectionNegotiationOutcome::Stale,
+        RefreshApplyOutcome::Failed(error) => connection_negotiation_failure(
+            handle,
+            expected_epoch,
+            authenticated_request_error("设备能力协商失败", error),
+        ),
+    }
 }
 
 /// Best-effort teardown of an attempt the Pi created but this client can
@@ -4870,6 +6084,7 @@ async fn run_pairing(
     app: AppHandle,
     device_id: String,
     client: Arc<PiHttpClient>,
+    pairing_endpoint: DeviceEndpoint,
     attempt_id: String,
     expires_at: chrono::DateTime<chrono::Utc>,
 ) {
@@ -4950,7 +6165,123 @@ async fn run_pairing(
                 tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
                 continue;
             }
-            Ok(PollPairingOutcome::Connected { .. }) => {
+            Ok(PollPairingOutcome::Connected { epoch }) => {
+                let current_binding = comp.resolve_binding(&device_id).ok();
+                // A pairing result is usable only while the same coherent
+                // binding still exists. Discovery may have removed the
+                // identity or selected another origin while the poll was in
+                // flight; publishing Connected in either case would expose a
+                // token/epoch that no longer belongs to the visible device.
+                let binding_invalid = current_binding.as_ref().is_none_or(|binding| {
+                    !transport_origin_matches(&binding.endpoint, &pairing_endpoint)
+                });
+                if binding_invalid {
+                    clear_active_pairing(&comp, &device_id, &attempt_id);
+                    emit_devices(&comp, &app);
+                    let message = if current_binding.is_none() {
+                        "设备连接在能力协商前已移除，请重试"
+                    } else {
+                        "设备连接地址在能力协商前已变化，请重试"
+                    };
+                    emit_pairing_resolution(
+                        &app,
+                        &device_id,
+                        &attempt_id,
+                        PairingResolutionOutcome::Failed,
+                        Some(message.to_string()),
+                    );
+                    return;
+                }
+                if current_binding.as_ref().is_some_and(|binding| {
+                    binding.endpoint.api_profile == DeviceApiProfile::LabHttpV4
+                }) {
+                    let negotiation = match current_binding {
+                        Some(binding)
+                            if !transport_origin_matches(&binding.endpoint, &pairing_endpoint) =>
+                        {
+                            ConnectionNegotiationOutcome::Stale
+                        }
+                        Some(binding) => {
+                            let handle = binding.handle;
+                            let background_handle = handle.clone();
+                            // Keep the transport that created the token. A
+                            // same-origin binding refresh may replace the
+                            // Arc, but a different origin must never receive
+                            // this bearer token.
+                            let background_client = client.clone();
+                            match tauri::async_runtime::spawn_blocking(move || {
+                                negotiate_lab_v4_connection_once(
+                                    &background_handle,
+                                    background_client,
+                                    epoch,
+                                )
+                            })
+                            .await
+                            {
+                                Ok(outcome) => outcome,
+                                Err(error) => connection_negotiation_failure(
+                                    &handle,
+                                    epoch,
+                                    format!("设备能力协商任务异常终止：{error}"),
+                                ),
+                            }
+                        }
+                        None => ConnectionNegotiationOutcome::Failed(
+                            "设备连接在能力协商前已移除，请重试".to_string(),
+                        ),
+                    };
+                    if !attempt_is_current(&comp, &device_id, &attempt_id) {
+                        return;
+                    }
+                    match negotiation {
+                        ConnectionNegotiationOutcome::Ready => {}
+                        ConnectionNegotiationOutcome::Failed(error) => {
+                            clear_active_pairing(&comp, &device_id, &attempt_id);
+                            emit_devices(&comp, &app);
+                            emit_pairing_resolution(
+                                &app,
+                                &device_id,
+                                &attempt_id,
+                                PairingResolutionOutcome::Failed,
+                                Some(error),
+                            );
+                            return;
+                        }
+                        ConnectionNegotiationOutcome::Stale => {
+                            clear_active_pairing(&comp, &device_id, &attempt_id);
+                            emit_devices(&comp, &app);
+                            emit_pairing_resolution(
+                                &app,
+                                &device_id,
+                                &attempt_id,
+                                PairingResolutionOutcome::Failed,
+                                Some("设备连接在能力协商期间已重建，请重试".to_string()),
+                            );
+                            return;
+                        }
+                    }
+                    let still_connected = comp.handle_for(&device_id).is_some_and(|handle| {
+                        matches!(
+                            handle.connection_state(),
+                            ConnectionState::Connected {
+                                epoch: current_epoch,
+                                ..
+                            } if current_epoch == epoch
+                        )
+                    });
+                    if !still_connected {
+                        clear_active_pairing(&comp, &device_id, &attempt_id);
+                        emit_devices(&comp, &app);
+                        emit_pairing_resolution(
+                            &app,
+                            &device_id,
+                            &attempt_id,
+                            PairingResolutionOutcome::Failed,
+                            Some("设备连接在能力协商后已失效，请重试".to_string()),
+                        );
+                        return;
+                    }
+                }
                 // Retained legacy v1 endpoints may still use a SAS-confirmed
                 // publication key for frozen offline compatibility paths. The
                 // current Device API v4 lab profile disables this write because
@@ -5301,8 +6632,10 @@ pub fn download_session(
     comp: &Composition,
     device_id: &str,
     session_id: &str,
+    authorization: &crate::application::SessionReadAuthorization,
 ) -> Result<String, String> {
-    let (identity, detail) = get_session_detail(comp, device_id, session_id)?;
+    let (identity, detail) =
+        get_authorized_session_detail(comp, device_id, session_id, authorization)?;
 
     let request = transfer_request_from_session_detail(&identity, session_id, &detail)?;
     let session_files = session_files_from_detail(&detail);
@@ -5312,49 +6645,6 @@ pub fn download_session(
         detail.captured_at.clone(),
         session_files.clone(),
         session_files,
-        true,
-    )
-    .map(|job_id| job_id.to_string())
-}
-
-/// Enqueues one real opaque file from one real published session.  The
-/// caller supplies only protocol identities; byte counts and hashes are
-/// always read from the authenticated session detail and never trusted from
-/// UI attributes.  Completion merges this file into an existing local
-/// library entry without claiming the whole session is downloaded.
-pub fn download_file(
-    comp: &Composition,
-    device_id: &str,
-    session_id: &str,
-    file_id: &str,
-) -> Result<String, String> {
-    let (identity, detail) = get_session_detail(comp, device_id, session_id)?;
-    let requested_file = detail
-        .files
-        .iter()
-        .find(|file| file.id == file_id)
-        .ok_or_else(|| "会话中不存在该文件".to_string())?;
-
-    let mut request = transfer_request_from_session_detail(&identity, session_id, &detail)?;
-    request
-        .files
-        .retain(|file| file.file_id.as_str() == file_id);
-    if request.files.len() != 1 {
-        return Err("会话文件清单包含重复或无效的文件 ID".to_string());
-    }
-    let file = SessionFile::new(
-        requested_file.id.clone(),
-        requested_file.display_path.clone(),
-        requested_file.size_bytes,
-        requested_file.sha256.clone(),
-    );
-    let session_files = session_files_from_detail(&detail);
-    comp.enqueue_download_with_context(
-        request,
-        detail.captured_at.clone(),
-        vec![file],
-        session_files,
-        false,
     )
     .map(|job_id| job_id.to_string())
 }
@@ -6046,28 +7336,22 @@ fn upload_receipt_is_structurally_valid_for_multipart(
         return false;
     }
 
-    // The multipart row carries no separate role column, but its exact key
-    // identifies the publication evidence namespace when it is present. In
-    // that case an object receipt claiming the data role cannot prove that
-    // this handle completed the evidence object (and vice versa).
-    let evidence_suffixes = [
-        PUBLICATION_SIGNATURE_OBJECT,
-        PUBLICATION_PUBLIC_KEY_OBJECT,
-        PUBLICATION_MANIFEST_OBJECT,
-    ];
-    let is_evidence_key = evidence_suffixes.iter().any(|suffix| {
-        record.object_key() == *suffix
-            || record
-                .object_key()
-                .strip_suffix(suffix)
-                .is_some_and(|prefix| prefix.ends_with('/'))
-    });
-    receipt.role
-        == if is_evidence_key {
-            UploadReceiptRole::Evidence
-        } else {
-            UploadReceiptRole::Data
-        }
+    // Content-addressed f-* keys need the immutable entry inventory to
+    // distinguish the MP4 from JSON evidence. The evidence namespace itself
+    // is unambiguous even during startup reconciliation and must never be
+    // accepted with a Data receipt.
+    if record
+        .object_key()
+        .split('/')
+        .any(|segment| segment == "__ylx_evidence__")
+    {
+        receipt.role == UploadReceiptRole::Evidence
+    } else {
+        matches!(
+            receipt.role,
+            UploadReceiptRole::Data | UploadReceiptRole::Evidence
+        )
+    }
 }
 
 /// The local half of [`reconcile_interrupted_uploads`], as a pure
@@ -6094,13 +7378,45 @@ fn mark_interrupted_uploads_failed(library: &mut [LibraryEntry]) -> bool {
     changed
 }
 
-fn get_session_detail(
+fn get_authorized_session_detail(
     comp: &Composition,
     device_id: &str,
     session_id: &str,
+    authorization: &crate::application::SessionReadAuthorization,
 ) -> Result<(DeviceIdentity, SessionDetailView), String> {
     let binding = comp.resolve_binding(device_id)?;
-    let detail = fetch_session_detail(&binding.handle, binding.client, session_id)?;
+    if binding.handle.current_epoch() != Some(authorization.connection_epoch) {
+        return Err("设备已重新连接，旧会话下载请求已失效".to_string());
+    }
+    let detail = match binding.endpoint.api_profile {
+        DeviceApiProfile::LegacyPinnedTlsV1 => {
+            fetch_session_detail(&binding.handle, binding.client, session_id)?
+        }
+        DeviceApiProfile::LabHttpV4 => {
+            let verification = authorization
+                .verification
+                .as_ref()
+                .filter(|verification| {
+                    verification.permits_detail_for(&authorization.session_revision)
+                })
+                .ok_or_else(|| {
+                    "该会话缺少可用且与当前 revision 匹配的 gateway verification".to_string()
+                })?;
+            let core_verification = gateway_verification_from_view(verification);
+            fetch_verified_session_detail(
+                &binding.handle,
+                binding.client,
+                session_id,
+                &core_verification,
+            )?
+        }
+    };
+    if binding.handle.current_epoch() != Some(authorization.connection_epoch) {
+        return Err("设备已重新连接，旧会话下载请求已失效".to_string());
+    }
+    if detail.revision != authorization.session_revision {
+        return Err("会话 revision 已变化，请刷新列表后重试".to_string());
+    }
     Ok((binding.identity, detail))
 }
 
@@ -6137,6 +7453,35 @@ fn fetch_session_detail(
     Ok(detail)
 }
 
+fn fetch_verified_session_detail(
+    handle: &DeviceHandle,
+    client: Arc<PiHttpClient>,
+    session_id: &str,
+    verification: &GatewayVerificationView,
+) -> Result<SessionDetailView, String> {
+    if !verification.is_detail_eligible() {
+        return Err("该会话的 gateway verification 不允许读取详情".to_string());
+    }
+    let negotiated = handle
+        .negotiated_device_snapshot()
+        .ok_or_else(|| "设备能力协商结果不可用，请重新连接后重试".to_string())?;
+    if negotiated.info.profile != DeviceApiProfileView::LabHttpV4 {
+        return Err("设备能力协商 profile 与 Device API v4 详情请求不一致".to_string());
+    }
+    let authenticated = authenticated_client_for(handle, client)?;
+    let detail = match handle.get_verified_session_with(&authenticated, session_id, verification) {
+        SessionDetailOutcome::Fetched(detail) => *detail,
+        SessionDetailOutcome::NotConnected => return Err("该设备尚未连接或连接已失效".to_string()),
+        SessionDetailOutcome::Stale => return Err("设备连接在请求期间已重建，请重试".to_string()),
+        SessionDetailOutcome::Failed(error) => return Err(error.to_string()),
+    };
+    if detail.session_id != session_id || detail.gateway_verification.as_ref() != Some(verification)
+    {
+        return Err("设备返回了未绑定到所选 gateway verification 的会话详情".to_string());
+    }
+    Ok(detail)
+}
+
 fn session_files_from_detail(detail: &SessionDetailView) -> Vec<SessionFile> {
     detail
         .files
@@ -6166,12 +7511,18 @@ fn session_files_from_detail(detail: &SessionDetailView) -> Vec<SessionFile> {
 /// naming after strict path validation. `idempotency_key`
 /// is a fresh UUID per call, matching `delete_session`'s existing style
 /// for the same reason: a retried download must not collide with an
-/// earlier attempt's still-in-flight or already-terminal job.
+/// earlier attempt's still-in-flight or already-terminal job. Lab-v4
+/// compatibility publications additionally pass the complete vendored Device
+/// Session v2 schema before this function creates any downloadable job.
 fn transfer_request_from_session_detail(
     identity: &DeviceIdentity,
     session_id: &str,
     detail: &SessionDetailView,
 ) -> Result<TransferRequest, String> {
+    if detail.publication_origin == PublicationEnvelopeOriginView::ClientDerivedLabCompatibility {
+        derived_media::validate_source_publication_for_download(&detail.publication_payload)
+            .map_err(|error| format!("设备会话清单未通过完整 Device Session v2 校验：{error}"))?;
+    }
     if detail.files.is_empty() {
         return Err("该会话没有可下载的文件".to_string());
     }
@@ -6528,6 +7879,7 @@ fn normalize_prefix(prefix: &str) -> &str {
 /// configured prefix (if any) then device/session/file id -- kept stable
 /// so re-uploading the same file after a retry lands on the same key
 /// rather than creating a duplicate object.
+#[cfg(test)]
 fn upload_object_key(prefix: &str, device_id: &str, session_id: &str, file_id: &str) -> ObjectKey {
     let trimmed = normalize_prefix(prefix);
     if trimmed.is_empty() {
@@ -6537,10 +7889,16 @@ fn upload_object_key(prefix: &str, device_id: &str, session_id: &str, file_id: &
     }
 }
 
+// Retained only for legacy-shaped test fixtures while their assertions are
+// migrated to the canonical two-object upload closure.
+#[cfg(test)]
 const PUBLICATION_SIGNATURE_OBJECT: &str = "__ylx_evidence__/publication.sig";
+#[cfg(test)]
 const PUBLICATION_PUBLIC_KEY_OBJECT: &str = "__ylx_evidence__/publication.ed25519.pub";
+#[cfg(test)]
 const PUBLICATION_MANIFEST_OBJECT: &str = "__ylx_evidence__/publication.json";
 
+#[cfg(test)]
 fn upload_evidence_object_key(
     prefix: &str,
     device_id: &str,
@@ -6556,26 +7914,11 @@ fn upload_evidence_object_key(
     }
 }
 
-fn receipt_matches(
-    receipt: &ObjectVerificationReceipt,
-    expected_key: &str,
-    bytes: u64,
-    sha256: SourceSha256,
-) -> bool {
-    receipt.key == expected_key
-        && !receipt.etag.trim().is_empty()
-        && receipt.bytes == bytes
-        && receipt.sha256.eq_ignore_ascii_case(&sha256.to_hex())
-}
-
 /// Checks the exact full object keys and source proofs for one upload
 /// namespace. This is used before a projection marker exists, while the
 /// public backed-up predicate below additionally requires that marker.
 fn entry_has_complete_object_receipts_for_prefix(entry: &LibraryEntry, prefix: &str) -> bool {
-    let Some(publication) = entry.publication.as_ref() else {
-        return false;
-    };
-    if entry.object_receipts.len() != entry.files.len().saturating_add(3) {
+    if entry.processed_files.len() != 2 || entry.object_receipts.len() != 5 {
         return false;
     }
     let unique_keys: HashSet<&str> = entry
@@ -6587,49 +7930,68 @@ fn entry_has_complete_object_receipts_for_prefix(entry: &LibraryEntry, prefix: &
         return false;
     }
 
-    let data_ok = entry.files.iter().all(|file| {
-        let Ok(expected_hash) = SourceSha256::from_hex(&file.sha256) else {
-            return false;
-        };
-        let expected_key =
-            upload_object_key(prefix, &entry.device_id, &entry.session_id, &file.file_id);
-        entry
-            .object_receipts
-            .iter()
-            .any(|receipt| receipt_matches(receipt, &expected_key.0, file.bytes, expected_hash))
-    });
-    if !data_ok {
+    let Some(marker) = entry
+        .object_receipts
+        .iter()
+        .find(|receipt| receipt.key.ends_with("/__ylx_evidence__/publication.json"))
+    else {
+        return false;
+    };
+    let Some(root) = marker
+        .key
+        .strip_suffix("/__ylx_evidence__/publication.json")
+    else {
+        return false;
+    };
+    if marker.bytes == 0 || validate_v4_object_root(root, prefix, &entry.session_id).is_err() {
         return false;
     }
-
-    [
-        (
-            PUBLICATION_SIGNATURE_OBJECT,
-            publication.signature.as_slice(),
-        ),
-        (
-            PUBLICATION_PUBLIC_KEY_OBJECT,
-            publication.public_key.as_slice(),
-        ),
-        (PUBLICATION_MANIFEST_OBJECT, publication.payload.as_slice()),
-    ]
-    .into_iter()
-    .all(|(name, bytes)| {
-        let expected_key =
-            upload_evidence_object_key(prefix, &entry.device_id, &entry.session_id, name);
-        let hash = SourceSha256::from_bytes(Sha256::digest(bytes).into());
-        entry
-            .object_receipts
-            .iter()
-            .any(|receipt| receipt_matches(receipt, &expected_key.0, bytes.len() as u64, hash))
-    })
+    if SourceSha256::from_hex(&marker.sha256).is_err() {
+        return false;
+    }
+    if !entry.object_receipts.iter().any(|receipt| {
+        receipt.bytes > 0
+            && SourceSha256::from_hex(&receipt.sha256).is_ok()
+            && admission_key_belongs_to_marker(
+                &ObjectKey(marker.key.clone()),
+                &ObjectKey(receipt.key.clone()),
+            )
+    }) {
+        return false;
+    }
+    let Some(source_sha) = entry
+        .publication
+        .as_ref()
+        .and_then(|publication| publication.revision.strip_prefix("sha256:"))
+    else {
+        return false;
+    };
+    let mut expected = HashMap::from([(source_sha.to_ascii_lowercase(), None)]);
+    for file in &entry.processed_files {
+        if expected
+            .insert(file.sha256.to_ascii_lowercase(), Some(file.bytes))
+            .is_some()
+        {
+            return false;
+        }
+    }
+    expected.len() == 3
+        && expected.into_iter().all(|(sha256, size)| {
+            let key = format!("{root}/f-{sha256}");
+            entry.object_receipts.iter().any(|receipt| {
+                receipt.key == key
+                    && receipt.bytes > 0
+                    && size.is_none_or(|expected_size| receipt.bytes == expected_size)
+                    && receipt.sha256.eq_ignore_ascii_case(&sha256)
+            })
+        })
 }
 
 /// A persisted `Done` flag is never sufficient by itself. A current upload
 /// must carry a successful, exact projection marker (including immutable
-/// entry/revision/prefix) and one unique full-key receipt for every signed
-/// data file plus signature, public key, and canonical manifest. Legacy rows
-/// without that marker fail closed instead of trusting a suffix-only key.
+/// entry/revision/prefix) and five unique receipts: source manifest, derived
+/// MP4, derived receipt, immutable v4 marker, and exact Console admission.
+/// Legacy rows without that evidence fail closed.
 pub(crate) fn entry_has_complete_object_receipts(entry: &LibraryEntry) -> bool {
     let Some(marker) = entry.upload_projection.as_ref() else {
         return false;
@@ -6659,6 +8021,27 @@ pub(crate) fn entry_has_complete_object_receipts(entry: &LibraryEntry) -> bool {
     if marker.receipts.len() != entry.object_receipts.len() {
         return false;
     }
+    let Some(publication_receipt) = entry
+        .object_receipts
+        .iter()
+        .find(|receipt| receipt.key.ends_with("/__ylx_evidence__/publication.json"))
+    else {
+        return false;
+    };
+    let Some(root) = publication_receipt
+        .key
+        .strip_suffix("/__ylx_evidence__/publication.json")
+    else {
+        return false;
+    };
+    let Some(output) = entry
+        .processed_files
+        .iter()
+        .find(|file| file.display_path != derived_media::RECEIPT_DISPLAY_PATH)
+    else {
+        return false;
+    };
+    let data_key = format!("{root}/f-{}", output.sha256.to_ascii_lowercase());
     let mut seen = HashSet::new();
     entry.object_receipts.iter().all(|receipt| {
         let Some(marker_receipt) = marker
@@ -6668,6 +8051,11 @@ pub(crate) fn entry_has_complete_object_receipts(entry: &LibraryEntry) -> bool {
         else {
             return false;
         };
+        let expected_role = if receipt.key == data_key {
+            "data"
+        } else {
+            "evidence"
+        };
         if !seen.insert(receipt.key.as_str())
             || marker_receipt.etag != receipt.etag
             || marker_receipt.version_id != receipt.version_id
@@ -6675,7 +8063,7 @@ pub(crate) fn entry_has_complete_object_receipts(entry: &LibraryEntry) -> bool {
             || !marker_receipt
                 .source_sha256
                 .eq_ignore_ascii_case(&receipt.sha256)
-            || !matches!(marker_receipt.role.as_str(), "data" | "evidence")
+            || marker_receipt.role != expected_role
             || !matches!(
                 marker_receipt.digest_proof.as_str(),
                 "server_checksum" | "streamed_readback"
@@ -6799,7 +8187,10 @@ fn spawn_sessions_refresh<R: Runtime>(app: &AppHandle<R>, device_id: String) {
                 return;
             }
         };
-        if let Err(error) = application.list_sessions(device_id.clone()).await {
+        if let Err(error) = application
+            .list_sessions(device_id.clone(), None, None)
+            .await
+        {
             eprintln!(
                 "[composition] failed to refresh sessions after local state change for \
                  {device_id}: {error}"
@@ -6845,7 +8236,12 @@ fn validate_entry_publication(entry: &LibraryEntry) -> Result<&PublicationEviden
     if signed.session_id != entry.session_id || signed.revision != publication.revision {
         return Err("本地记录身份或 revision 与签名 publication 不一致".to_string());
     }
-    if signed.total_bytes != entry.bytes
+    let source_inventory_bytes = entry.files.iter().try_fold(0_u64, |total, file| {
+        total
+            .checked_add(file.bytes)
+            .ok_or_else(|| "本地 source inventory 字节数溢出".to_string())
+    })?;
+    if signed.total_bytes != source_inventory_bytes
         || signed.files.len() != entry.files.len()
         || signed.files.is_empty()
     {
@@ -6881,7 +8277,7 @@ fn validate_entry_publication(entry: &LibraryEntry) -> Result<&PublicationEviden
 }
 
 /// The immutable input sealed into an upload job.  This deliberately hashes
-/// the verified publication, ordered local inventory, and destination
+/// the verified source publication, ordered canonical derived assets, and destination
 /// coordinates rather than the mutable UI status fields.  A retry or a
 /// duplicate click therefore reuses exactly the same job only when it is
 /// asking for the same bytes and the same object namespace.
@@ -6908,7 +8304,7 @@ fn upload_input_digest(entry: &LibraryEntry, storage: &StorageConfig) -> Result<
         entry_key: entry.key(),
         revision: &publication.revision,
         bytes: entry.bytes,
-        files: &entry.files,
+        files: &entry.processed_files,
         publication,
         endpoint: storage.endpoint.trim(),
         bucket: storage.bucket.trim(),
@@ -6949,12 +8345,14 @@ pub fn start_upload<R: Runtime>(
     app: AppHandle<R>,
     comp: Arc<Composition>,
     storage: StorageConfig,
-    entry: LibraryEntry,
+    mut entry: LibraryEntry,
 ) -> Result<UploadStartOutcome, String> {
-    if !entry.complete {
-        return Err("该本地记录只包含部分文件，不能标记为整会话备份".to_string());
-    }
     let expected_revision = validate_entry_publication(&entry)?.revision.clone();
+    let canonical = canonical_assets_for_entry(&comp.library_root(), &entry)
+        .ok_or_else(|| "规范 MP4 或 derived media receipt 无法验证，不能上传".to_string())?;
+    entry.complete = true;
+    entry.processed_files = canonical.files;
+    entry.bytes = canonical.total_bytes;
     let credential = comp
         .storage_credential()
         .map_err(|e| describe_vault_error(&e))?;
@@ -7177,9 +8575,9 @@ fn spawn_upload_worker<R: Runtime>(
                 None => "本地记录已不存在，无法开始上传".to_string(),
             });
         };
+        let previous_entry = data.library[entry_index].clone();
         if data.library[entry_index].files != entry.files
             || data.library[entry_index].publication != entry.publication
-            || !data.library[entry_index].complete
         {
             drop(data);
             let compensation =
@@ -7192,7 +8590,22 @@ fn spawn_upload_worker<R: Runtime>(
                 None => "本地记录 revision 已变化，请刷新后重试上传".to_string(),
             });
         }
-        let previous_entry = data.library[entry_index].clone();
+        // A receipt-valid existing-library migration is promoted only here,
+        // after the exact canonical pair has been revalidated. No raw source
+        // is deleted merely because an old row once claimed completion.
+        let canonical_changed = data.library[entry_index].processed_files != entry.processed_files
+            || data.library[entry_index].bytes != entry.bytes
+            || !data.library[entry_index].complete;
+        data.library[entry_index].processed_files = entry.processed_files.clone();
+        data.library[entry_index].bytes = entry.bytes;
+        data.library[entry_index].complete = true;
+        if canonical_changed {
+            data.library[entry_index].upload_projection = None;
+            data.library[entry_index].object_receipts.clear();
+            data.library[entry_index].uploaded_at = None;
+            data.library[entry_index].upload_error = None;
+            data.library[entry_index].upload_retryable = false;
+        }
         if rollback_job {
             // Evidence from an older revision must not make the new durable
             // job look backed up while it is still running. The status field
@@ -7394,7 +8807,7 @@ fn start_upload_child<R: Runtime>(
         .upload_job_spec(parent_job_id)
         .map_err(|error| format!("无法读取上传任务 immutable spec：{error}"))?
         .ok_or_else(|| "上传任务缺少 immutable spec，无法重试".to_string())?;
-    let entry = {
+    let mut entry = {
         let state = app.state::<AppState>();
         let data = state.0.lock().unwrap();
         data.library
@@ -7403,6 +8816,11 @@ fn start_upload_child<R: Runtime>(
             .cloned()
             .ok_or_else(|| "未找到该上传任务对应的本地记录".to_string())?
     };
+    let canonical = canonical_assets_for_entry(&comp.library_root(), &entry)
+        .ok_or_else(|| "规范 MP4 或 derived media receipt 无法验证，不能重试上传".to_string())?;
+    entry.complete = true;
+    entry.processed_files = canonical.files;
+    entry.bytes = canonical.total_bytes;
     let current_digest = upload_input_digest(&entry, &storage)?;
     let requested_spec =
         if parent.state == JobStateTag::Succeeded || mode == UploadChildMode::Supersede {
@@ -7705,8 +9123,17 @@ impl UploadContext {
 
 /// Pure precondition check, factored out for unit testing.
 fn require_entry_has_local_files(entry: &LibraryEntry) -> Result<(), String> {
-    if entry.files.is_empty() {
-        Err("该记录没有可上传的本地文件清单，请重新下载完整会话".to_string())
+    if entry.processed_files.len() != 2
+        || !entry
+            .processed_files
+            .iter()
+            .any(|file| file.display_path == derived_media::RECEIPT_DISPLAY_PATH)
+        || !entry
+            .processed_files
+            .iter()
+            .any(|file| file.display_path.ends_with(".mp4"))
+    {
+        Err("该记录缺少可上传的规范 MP4/receipt 二件套".to_string())
     } else {
         Ok(())
     }
@@ -7845,6 +9272,7 @@ fn resolve_downloaded_file(
 /// `AppHandle` (see the `tests` module below, which exercises this against
 /// a real temp file). Thin wrapper over `resolve_downloaded_file`; see that
 /// function's doc comment.
+#[cfg(test)]
 fn resolve_local_upload_file(
     library_root: &Path,
     entry: &LibraryEntry,
@@ -7902,6 +9330,146 @@ fn abort_multipart_after_failure<S: ObjectStorePort>(
     }
 }
 
+/// Cleans up the narrow window in which the provider has returned a live
+/// multipart handle but the durable ownership write reported an error. The
+/// write may have committed before returning that error, so first reconcile
+/// the exact `(object_key, upload_id)` row. A present row uses the normal
+/// durable abort path; an absent row uses a direct remote abort. If the row
+/// lookup itself is unavailable, the outcome stays explicitly incomplete even
+/// when the remote abort appears to succeed -- we cannot prove that no durable
+/// ownership remains.
+fn abort_multipart_after_track_failure<S: ObjectStorePort>(
+    ctx: &UploadContext,
+    store: &S,
+    handle: &MultipartUploadHandle,
+    track_error: UploadPipelineError,
+) -> UploadPipelineError {
+    let durable_row = ctx
+        .transfer_store
+        .lock()
+        .unwrap()
+        .pending_upload(&handle.key.0, &handle.upload_id.0);
+    match durable_row {
+        Ok(Some(row)) if durable_multipart_row_matches_context(ctx, handle, &row) => {
+            match abort_multipart_after_failure(ctx, store, handle) {
+                Ok(()) => track_error,
+                Err(cleanup_error) => incomplete_multipart_cleanup_error(
+                    &track_error,
+                    handle,
+                    cleanup_error.detail().unwrap_or("远端清理失败"),
+                ),
+            }
+        }
+        Ok(Some(_)) => incomplete_multipart_cleanup_error(
+            &track_error,
+            handle,
+            "durable ownership conflict; remote abort withheld",
+        ),
+        Ok(None) => abort_untracked_multipart_after_track_failure(store, handle, track_error),
+        Err(lookup_error) => {
+            let lookup_error = UploadPipelineError::internal(format!(
+                "无法确认在途分片 ownership：{lookup_error}"
+            ));
+            match store.abort_multipart_upload(handle) {
+                Ok(()) => incomplete_multipart_cleanup_error(
+                    &track_error,
+                    handle,
+                    lookup_error.detail().unwrap_or("无法确认清理状态"),
+                ),
+                Err(cleanup_error) => {
+                    let cleanup =
+                        object_store_pipeline_error("远端中止未登记分片上传失败", cleanup_error);
+                    incomplete_multipart_cleanup_error(
+                        &track_error,
+                        handle,
+                        &format!(
+                            "{}；{}",
+                            lookup_error.detail().unwrap_or("无法确认清理状态"),
+                            cleanup.detail().unwrap_or("远端清理失败"),
+                        ),
+                    )
+                }
+            }
+        }
+    }
+}
+
+fn durable_multipart_row_matches_context(
+    ctx: &UploadContext,
+    handle: &MultipartUploadHandle,
+    row: &StoredUpload,
+) -> bool {
+    row.job_id.as_deref() == Some(ctx.job_id.as_str())
+        && row.upload.transfer_key == ctx.transfer_key
+        && row.upload.entry_key == ctx.entry_key
+        && row.upload.revision == ctx.revision
+        && row.upload.object_key == handle.key.0
+        && row.upload.upload_id == handle.upload_id.0
+        && row.upload.endpoint == ctx.endpoint
+        && row.upload.bucket == ctx.bucket
+        && row.upload.url_style == ctx.url_style
+}
+
+fn abort_untracked_multipart_after_track_failure<S: ObjectStorePort>(
+    store: &S,
+    handle: &MultipartUploadHandle,
+    track_error: UploadPipelineError,
+) -> UploadPipelineError {
+    match store.abort_multipart_upload(handle) {
+        Ok(()) => track_error,
+        Err(cleanup_error) => {
+            let cleanup = object_store_pipeline_error("远端中止未登记分片上传失败", cleanup_error);
+            incomplete_multipart_cleanup_error(
+                &track_error,
+                handle,
+                cleanup.detail().unwrap_or("远端清理失败"),
+            )
+        }
+    }
+}
+
+fn incomplete_multipart_cleanup_error(
+    track_error: &UploadPipelineError,
+    handle: &MultipartUploadHandle,
+    cleanup_detail: &str,
+) -> UploadPipelineError {
+    let track_detail = track_error.detail().unwrap_or("上传跟踪失败");
+    UploadPipelineError::transient(format!(
+        "multipart_cleanup_incomplete (retryable=true); remote_handle={}; {track_detail}；{cleanup_detail}",
+        remote_multipart_handle_identity(handle),
+    ))
+}
+
+/// Remote multipart coordinates are not credentials, but they are still
+/// provider-controlled strings. Keep diagnostics bounded and single-line so a
+/// malformed response cannot turn an error into an unbounded or log-injecting
+/// payload. The full `(object_key, upload_id)` pair remains actionable.
+fn remote_multipart_handle_identity(handle: &MultipartUploadHandle) -> String {
+    format!(
+        "object_key={}; upload_id={}",
+        bounded_remote_handle_component(&handle.key.0),
+        bounded_remote_handle_component(&handle.upload_id.0),
+    )
+}
+
+fn bounded_remote_handle_component(value: &str) -> String {
+    const MAX_BYTES: usize = 512;
+    let mut bounded = String::new();
+    for character in value.chars() {
+        let character = if character.is_control() {
+            '?'
+        } else {
+            character
+        };
+        if bounded.len() + character.len_utf8() > MAX_BYTES {
+            bounded.push_str("[truncated]");
+            break;
+        }
+        bounded.push(character);
+    }
+    bounded
+}
+
 /// Persists an object-specific verification receipt before retiring its
 /// durable multipart row. Persistence failures are remote-cleanup failures
 /// too: the row is marked `aborting`, then the remote handle is torn down (or
@@ -7927,13 +9495,11 @@ fn stage_and_finish_multipart<S: ObjectStorePort>(
     Ok(())
 }
 
-/// Drives one `LibraryEntry`'s real upload end to end: for every backing
-/// file, resolve its real local path (same convention PC-04's download
-/// commit uses, `library::download::derive_target_path`), hash it, run a
-/// real multipart upload, and only mark it verified via a
-/// `verify_completed_object` HEAD bound to that completion (plan invariant:
-/// upload success != verified, and a same-key concurrent writer cannot be
-/// mistaken for this upload).
+/// Drives one `LibraryEntry` through the complete client-derived publication
+/// transaction. The source manifest, derived receipt and MP4 are independently
+/// uploaded and read-back verified; the v4 marker is written last with
+/// create-if-absent semantics; success is returned only after the exact
+/// Console admission acknowledgement has been read and validated.
 /// Blocking (real file + HTTP I/O) -- must run inside `spawn_blocking`.
 fn perform_upload<R: Runtime, S: ObjectStorePort>(
     app: &AppHandle<R>,
@@ -7947,119 +9513,93 @@ fn perform_upload<R: Runtime, S: ObjectStorePort>(
         ));
     }
     require_entry_has_local_files(entry).map_err(UploadPipelineError::integrity)?;
-    let publication = validate_entry_publication(entry).map_err(UploadPipelineError::integrity)?;
-
-    let mut sent_bytes: u64 = 0;
-    let mut receipts = Vec::with_capacity(entry.files.len().saturating_add(3));
-    for file in &entry.files {
-        ctx.check_cancelled()?;
-        let (local_path, size_bytes) = resolve_local_upload_file(&ctx.library_root, entry, file)
-            .map_err(UploadPipelineError::integrity)?;
-        let source_sha256 = SourceSha256::from_hex(&file.sha256).map_err(|error| {
-            UploadPipelineError::integrity(format!("签名 publication SHA-256 无效：{error}"))
-        })?;
-
-        let object_key = upload_object_key(
-            &ctx.prefix,
-            &entry.device_id,
-            &entry.session_id,
-            &file.file_id,
-        );
-
-        let handle = store
-            .initiate_multipart_upload(InitiateUploadRequest {
-                key: object_key.clone(),
-                content_length: size_bytes,
-                source_sha256,
-                content_type: None,
-            })
-            .map_err(|error| object_store_pipeline_error("初始化分片上传失败", error))?;
-        // Recorded before the first part is sent: from here on, a crash
-        // leaves a record this or a later process can abort.
-        if let Err(e) = ctx.track_multipart(&handle) {
-            let _ = store.abort_multipart_upload(&handle);
-            return Err(e);
-        }
-
-        let expected = ExpectedObject {
-            size_bytes,
-            source_sha256,
-        };
-        let completion = match upload_parts(
-            app,
-            ctx,
-            store,
-            &handle,
-            &local_path,
-            &expected,
-            &mut sent_bytes,
-        ) {
-            Ok(completion) => completion,
-            Err(e) => {
-                let cleanup_error = abort_multipart_after_failure(ctx, store, &handle).err();
-                if let Some(cleanup_error) = cleanup_error {
-                    return Err(append_upload_error(e, cleanup_error));
-                }
-                return Err(e);
-            }
-        };
-
-        let receipt = match verify_completed_object_bound(store, &completion, &expected) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                let verify_error =
-                    object_store_pipeline_error("上传后校验失败，未标记为已备份", error);
-                if let Err(cleanup_error) = abort_multipart_after_failure(ctx, store, &handle) {
-                    return Err(append_upload_error(verify_error, cleanup_error));
-                }
-                return Err(verify_error);
-            }
-        };
-        let receipt = upload_receipt_seed(receipt, UploadReceiptRole::Data);
-        // Keep the durable proof before retiring the multipart row. A crash
-        // or SQLite failure after remote verification must remain
-        // recoverable as evidence rather than becoming an unaccounted object.
-        // Any persistence failure enters the same abort/recovery path as a
-        // failed remote operation, leaving the durable row `aborting` when
-        // cleanup itself cannot complete.
-        stage_and_finish_multipart(ctx, store, &handle, &receipt)?;
-        receipts.push(receipt);
-    }
-
-    // The manifest is uploaded last: its verified presence is the commit
-    // marker that all data files and detached verification material were
-    // already uploaded and HEAD-verified.
-    for (name, bytes, content_type) in [
-        (
-            PUBLICATION_SIGNATURE_OBJECT,
-            publication.signature.as_slice(),
-            "application/octet-stream",
-        ),
-        (
-            PUBLICATION_PUBLIC_KEY_OBJECT,
-            publication.public_key.as_slice(),
-            "application/octet-stream",
-        ),
-        (
-            PUBLICATION_MANIFEST_OBJECT,
-            publication.payload.as_slice(),
-            "application/json",
-        ),
-    ] {
-        ctx.check_cancelled()?;
-        let key =
-            upload_evidence_object_key(&ctx.prefix, &entry.device_id, &entry.session_id, name);
-        let receipt = upload_receipt_seed(
-            upload_bytes_object(store, key, bytes, content_type, ctx)?,
-            UploadReceiptRole::Evidence,
-        );
-        receipts.push(receipt);
-    }
-    if receipts.len() != entry.files.len().saturating_add(3) {
+    validate_entry_publication(entry).map_err(UploadPipelineError::integrity)?;
+    let bundle = canonical_publication_bundle_for_entry(&ctx.library_root, entry)
+        .map_err(UploadPipelineError::integrity)?;
+    if bundle.canonical_assets.files != entry.processed_files
+        || bundle.canonical_assets.total_bytes != entry.bytes
+    {
         return Err(UploadPipelineError::integrity(
-            "对象存储验证凭证不完整，未标记为已备份",
+            "本地规范资产在上传任务创建后发生变化",
         ));
     }
+    let receipt_sha256 = SourceSha256::from_hex(&bundle.receipt_sha256).map_err(|error| {
+        UploadPipelineError::integrity(format!("derived receipt SHA-256 无效：{error}"))
+    })?;
+    let output_sha256 = SourceSha256::from_hex(&bundle.output_sha256).map_err(|error| {
+        UploadPipelineError::integrity(format!("derived MP4 SHA-256 无效：{error}"))
+    })?;
+    let plan =
+        derived_publication_plan(&ctx.prefix, &bundle).map_err(UploadPipelineError::integrity)?;
+
+    let mut sent_bytes: u64 = 0;
+    let mut receipts = Vec::with_capacity(5);
+
+    let source_receipt = upload_bytes_object(
+        store,
+        plan.source_manifest_key.clone(),
+        &bundle.source_manifest_bytes,
+        "application/json",
+        ctx,
+    )?;
+    receipts.push(upload_receipt_seed(
+        source_receipt,
+        UploadReceiptRole::Evidence,
+    ));
+
+    receipts.push(upload_local_file_object(
+        app,
+        ctx,
+        store,
+        &bundle.receipt_path,
+        bundle.receipt_bytes.len() as u64,
+        receipt_sha256,
+        plan.receipt_key.clone(),
+        "application/json",
+        UploadReceiptRole::Evidence,
+        &mut sent_bytes,
+    )?);
+    receipts.push(upload_local_file_object(
+        app,
+        ctx,
+        store,
+        &bundle.output_path,
+        bundle.output_bytes,
+        output_sha256,
+        plan.output_key.clone(),
+        "video/mp4",
+        UploadReceiptRole::Data,
+        &mut sent_bytes,
+    )?);
+
+    ctx.check_cancelled()?;
+    store
+        .put_object_if_absent(&ImmutableObjectRequest {
+            key: plan.marker_key.clone(),
+            bytes: plan.marker_bytes.clone(),
+            source_sha256: plan.marker_sha256,
+            content_type: "application/json".to_string(),
+        })
+        .map_err(|error| {
+            object_store_pipeline_error("提交 Bucket Publication v4 marker 失败", error)
+        })?;
+    let marker_readback = store
+        .read_object_bounded(&plan.marker_key, MAX_PUBLICATION_JSON_BYTES)
+        .map_err(|error| {
+            object_store_pipeline_error("回读 Bucket Publication v4 marker 失败", error)
+        })?;
+    let marker_receipt = plan
+        .verify_marker_readback(&marker_readback)
+        .map_err(UploadPipelineError::integrity)?;
+    let marker_seed = upload_receipt_seed(marker_receipt, UploadReceiptRole::Evidence);
+    ctx.stage_upload_receipt(&marker_seed)?;
+    receipts.push(marker_seed);
+
+    let admission_receipt = wait_for_publication_admission(ctx, store, &plan)?;
+    let admission_seed = upload_receipt_seed(admission_receipt, UploadReceiptRole::Evidence);
+    ctx.stage_upload_receipt(&admission_seed)?;
+    receipts.push(admission_seed);
+
     let mut proved_entry = entry.clone();
     proved_entry.object_receipts = receipts.iter().map(object_receipt_from_seed).collect();
     if !entry_has_complete_object_receipts_for_prefix(&proved_entry, &ctx.prefix) {
@@ -8068,6 +9608,135 @@ fn perform_upload<R: Runtime, S: ObjectStorePort>(
         ));
     }
     Ok(receipts)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upload_local_file_object<R: Runtime, S: ObjectStorePort>(
+    app: &AppHandle<R>,
+    ctx: &UploadContext,
+    store: &S,
+    path: &Path,
+    size_bytes: u64,
+    source_sha256: SourceSha256,
+    object_key: ObjectKey,
+    content_type: &str,
+    role: UploadReceiptRole,
+    sent_bytes: &mut u64,
+) -> Result<UploadReceiptSeed, UploadPipelineError> {
+    if hash_file(path).map_err(|error| {
+        UploadPipelineError::integrity(format!("上传前无法重新计算本地文件摘要：{error}"))
+    })? != source_sha256
+    {
+        return Err(UploadPipelineError::integrity(
+            "上传前本地规范文件摘要发生变化",
+        ));
+    }
+    let handle = store
+        .initiate_multipart_upload(InitiateUploadRequest {
+            key: object_key,
+            content_length: size_bytes,
+            source_sha256,
+            content_type: Some(content_type.to_string()),
+        })
+        .map_err(|error| object_store_pipeline_error("初始化分片上传失败", error))?;
+    if let Err(error) = ctx.track_multipart(&handle) {
+        return Err(abort_multipart_after_track_failure(
+            ctx, store, &handle, error,
+        ));
+    }
+    let expected = ExpectedObject {
+        size_bytes,
+        source_sha256,
+    };
+    let completion = match upload_parts(app, ctx, store, &handle, path, &expected, sent_bytes) {
+        Ok(completion) => completion,
+        Err(error) => {
+            return Err(match abort_multipart_after_failure(ctx, store, &handle) {
+                Ok(()) => error,
+                Err(cleanup) => append_upload_error(error, cleanup),
+            });
+        }
+    };
+    let verified = match verify_completed_object_bound(store, &completion, &expected) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            let primary = object_store_pipeline_error("上传后校验失败，未标记为已发布", error);
+            return Err(match abort_multipart_after_failure(ctx, store, &handle) {
+                Ok(()) => primary,
+                Err(cleanup) => append_upload_error(primary, cleanup),
+            });
+        }
+    };
+    let seed = upload_receipt_seed(verified, role);
+    stage_and_finish_multipart(ctx, store, &handle, &seed)?;
+    Ok(seed)
+}
+
+fn wait_for_publication_admission<S: ObjectStorePort>(
+    ctx: &UploadContext,
+    store: &S,
+    plan: &DerivedPublicationPlan,
+) -> Result<VerifiedObjectReceipt, UploadPipelineError> {
+    const WAIT: Duration = Duration::from_secs(60);
+    const POLL: Duration = Duration::from_millis(500);
+    const MAX_ACK_CANDIDATES: u16 = 2;
+    let deadline = Instant::now() + WAIT;
+    loop {
+        ctx.check_cancelled()?;
+        let first_page = store
+            .list_objects_bounded(&plan.admission_prefix, MAX_ACK_CANDIDATES)
+            .map_err(|error| {
+                object_store_pipeline_error("枚举 Console admission 回执失败", error)
+            })?;
+        let candidate = plan
+            .select_admission_candidate(&first_page)
+            .map_err(admission_pipeline_error)?;
+        let Some(candidate) = candidate else {
+            if Instant::now() >= deadline {
+                return Err(UploadPipelineError::transient(
+                    "Bucket Publication v4 已提交，但 Console 在 60 秒内未返回 admission；可在 consumer 运行后重试",
+                ));
+            }
+            std::thread::sleep(POLL);
+            continue;
+        };
+        let readback = store
+            .read_object_bounded(&candidate.key, MAX_PUBLICATION_JSON_BYTES)
+            .map_err(|error| {
+                object_store_pipeline_error("读取 Console admission 回执失败", error)
+            })?;
+        let receipt = plan
+            .verify_admission(candidate, &readback)
+            .map_err(admission_pipeline_error)?;
+
+        // Re-list after the raw GET so a second/conflicting ack or an
+        // overwrite during verification cannot be collapsed into success.
+        let final_page = store
+            .list_objects_bounded(&plan.admission_prefix, MAX_ACK_CANDIDATES)
+            .map_err(|error| {
+                object_store_pipeline_error("复核 Console admission authority 失败", error)
+            })?;
+        let final_candidate = plan
+            .select_admission_candidate(&final_page)
+            .map_err(admission_pipeline_error)?;
+        if final_candidate != Some(candidate) {
+            return Err(UploadPipelineError::integrity(
+                "Console admission candidate 在原始回读期间发生漂移",
+            ));
+        }
+        return Ok(receipt);
+    }
+}
+
+fn admission_pipeline_error(error: AdmissionError) -> UploadPipelineError {
+    match error {
+        AdmissionError::Invalid(detail) => {
+            UploadPipelineError::integrity(format!("Console admission 回执无效：{detail}"))
+        }
+        AdmissionError::Rejected(detail) => {
+            UploadPipelineError::integrity(format!("Console 拒绝派生 publication：{detail}"))
+        }
+    }
 }
 
 fn upload_receipt_seed(
@@ -8131,8 +9800,9 @@ fn upload_bytes_object<S: ObjectStorePort>(
         })
         .map_err(|error| object_store_pipeline_error("初始化 publication 证据上传失败", error))?;
     if let Err(error) = ctx.track_multipart(&handle) {
-        let _ = store.abort_multipart_upload(&handle);
-        return Err(error);
+        return Err(abort_multipart_after_track_failure(
+            ctx, store, &handle, error,
+        ));
     }
     let upload_result = (|| {
         let part_number = PartNumber::new(1).map_err(|error| {
@@ -8473,8 +10143,25 @@ fn finish_upload<R: Runtime>(
     emit_library(app);
 }
 
+#[cfg(test)]
+thread_local! {
+    static STRONG_LOCAL_FILE_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_strong_local_file_hash_count() {
+    STRONG_LOCAL_FILE_HASHES.set(0);
+}
+
+#[cfg(test)]
+fn strong_local_file_hash_count() -> usize {
+    STRONG_LOCAL_FILE_HASHES.get()
+}
+
 /// Hashes a file without loading its full contents into memory.
 fn hash_file(path: &Path) -> io::Result<SourceSha256> {
+    #[cfg(test)]
+    STRONG_LOCAL_FILE_HASHES.set(STRONG_LOCAL_FILE_HASHES.get() + 1);
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1024 * 1024];
@@ -8509,16 +10196,275 @@ fn hash_file(path: &Path) -> io::Result<SourceSha256> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, TcpListener};
     use std::sync::mpsc;
     use std::time::Instant;
 
+    use ring::signature::{Ed25519KeyPair, KeyPair};
     use rusqlite::Connection;
+    use ylx_transfer_adapters::discovery_mdns::{
+        MdnsBrowseLoss, MdnsBrowseLossReason, MdnsEndpoint, MdnsServiceLoss,
+    };
     use ylx_transfer_core::device::SessionFileEntryView;
     use ylx_transfer_core::domain::{FileId, SessionId};
     use ylx_transfer_core::library::download::{RequestedRange, SourceResponse};
+    use ylx_transfer_core::library::staging::SessionStaging;
     use ylx_transfer_core::persistence::AppStore;
     use ylx_transfer_core::transfer::queue::JobFile;
     use ylx_transfer_core::transfer::FailureCode;
+
+    const TEST_ADMISSION_ID: &str = "019a0030-0000-7a1b-8c2d-3e4f50617283";
+
+    fn empty_catalog_page(next_cursor: Option<String>) -> SessionCatalogPageRead {
+        SessionCatalogPageRead {
+            page: SessionPageView {
+                items: Vec::new(),
+                diagnostics: Vec::new(),
+                has_more: next_cursor.is_some(),
+                next_cursor,
+                catalog_revision: Some(format!("sha256:{}", "a".repeat(64))),
+                catalog_authority: SessionCatalogAuthority::DeviceSnapshot,
+                pagination_supported: true,
+                pagination_unavailable_reason: None,
+                capabilities: SessionPageCapabilities {
+                    profile: SessionApiProfile::LabHttpV4,
+                    session_deletion: SessionCapability {
+                        supported: false,
+                        source: SessionCapabilitySource::ProfileContract,
+                    },
+                    session_detail: SessionCapability {
+                        supported: true,
+                        source: SessionCapabilitySource::ProfileContract,
+                    },
+                    artifact_download: SessionCapability {
+                        supported: true,
+                        source: SessionCapabilitySource::DeviceDescriptor,
+                    },
+                    capture_status: SessionCapability {
+                        supported: true,
+                        source: SessionCapabilitySource::ProfileContract,
+                    },
+                },
+            },
+            connection_epoch: 1,
+        }
+    }
+
+    fn catalog_session_fixture(index: usize) -> SessionView {
+        let started_at = chrono::DateTime::parse_from_rfc3339("2026-08-29T12:00:00Z")
+            .expect("fixture base time")
+            - chrono::Duration::seconds(index as i64);
+        SessionView {
+            session: Session {
+                id: format!("session-{index}"),
+                revision: format!("sha256:{}", "b".repeat(64)),
+                date_label: started_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                duration_seconds: 1.0,
+                total_bytes: 1,
+                video_bytes: 1,
+                imu_samples: None,
+                files: Vec::new(),
+            },
+            download_status: DownloadStatus::None,
+            backed_up: false,
+            verification: None,
+        }
+    }
+
+    fn catalog_diagnostic_fixture(message: &str) -> SessionDiscoveryDiagnosticView {
+        SessionDiscoveryDiagnosticView {
+            quarantine_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            code: SessionDiscoveryDiagnosticCode::ManifestInvalid,
+            observed_at: "2026-08-29T12:00:00Z".to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn destructive_catalog_read_rejects_cross_page_session_duplicates_before_mutation() {
+        for (case, total_bytes) in [("same-payload", 1_u64), ("different-payload", 2_u64)] {
+            let mut first = empty_catalog_page(Some("opaque-next".to_string()));
+            first.page.items.push(catalog_session_fixture(0));
+            let mut duplicate = catalog_session_fixture(0);
+            duplicate.session.total_bytes = total_bytes;
+            let mut second = empty_catalog_page(None);
+            second.page.items.push(duplicate);
+            let mut pages = vec![first, second].into_iter();
+            let mut mutation_calls = 0_usize;
+
+            let catalog = collect_full_session_catalog(|_, _, _| {
+                Ok(pages.next().expect("two-page duplicate fixture"))
+            });
+            let destructive_result = catalog.map(|_| mutation_calls += 1);
+
+            let error = destructive_result
+                .expect_err("one complete-catalog read must reject a repeated session id");
+            assert!(
+                error.contains("sessionId"),
+                "unexpected {case} error: {error}"
+            );
+            assert_eq!(mutation_calls, 0, "{case}");
+        }
+    }
+
+    #[test]
+    fn destructive_catalog_read_rejects_cross_page_quarantine_duplicates_before_mutation() {
+        for (case, message) in [
+            ("same-payload", "manifest failed validation"),
+            ("different-payload", "conflicting diagnostic payload"),
+        ] {
+            let mut first = empty_catalog_page(Some("opaque-next".to_string()));
+            first
+                .page
+                .diagnostics
+                .push(catalog_diagnostic_fixture("manifest failed validation"));
+            let mut second = empty_catalog_page(None);
+            second
+                .page
+                .diagnostics
+                .push(catalog_diagnostic_fixture(message));
+            let mut pages = vec![first, second].into_iter();
+            let mut mutation_calls = 0_usize;
+
+            let catalog = collect_full_session_catalog(|_, _, _| {
+                Ok(pages.next().expect("two-page diagnostic fixture"))
+            });
+            let destructive_result = catalog.map(|_| mutation_calls += 1);
+
+            let error = destructive_result
+                .expect_err("one complete-catalog read must reject a repeated quarantine id");
+            assert!(
+                error.contains("quarantineId"),
+                "unexpected {case} error: {error}"
+            );
+            assert_eq!(mutation_calls, 0, "{case}");
+        }
+    }
+
+    #[test]
+    fn destructive_catalog_read_enforces_newest_first_at_items_50_and_51() {
+        let first_fifty = || (0..50).map(catalog_session_fixture).collect::<Vec<_>>();
+        let last_started_at = first_fifty()[49].session.date_label.clone();
+        for (case, invalid) in [
+            ("newer-timestamp", {
+                let mut session = catalog_session_fixture(48);
+                session.session.id = "session-newer-boundary".to_string();
+                session
+            }),
+            ("same-timestamp-higher-id", {
+                let mut session = catalog_session_fixture(50);
+                session.session.date_label = last_started_at.clone();
+                session.session.id = "session-z".to_string();
+                session
+            }),
+        ] {
+            let mut first = empty_catalog_page(Some("opaque-item-51".to_string()));
+            first.page.items = first_fifty();
+            let mut second = empty_catalog_page(None);
+            second.page.items.push(invalid);
+            let mut pages = vec![first, second].into_iter();
+            let mut mutation_calls = 0_usize;
+
+            let catalog = collect_full_session_catalog(|_, _, _| {
+                Ok(pages.next().expect("two-page ordering fixture"))
+            });
+            let destructive_result = catalog.map(|_| mutation_calls += 1);
+
+            let error =
+                destructive_result.expect_err("item 51 must be strictly older than item 50");
+            assert!(
+                error.contains("newest-first"),
+                "unexpected {case} error: {error}"
+            );
+            assert_eq!(mutation_calls, 0, "{case}");
+        }
+
+        let mut first = empty_catalog_page(Some("opaque-item-51".to_string()));
+        first.page.items = first_fifty();
+        let mut second = empty_catalog_page(None);
+        second.page.items.push(catalog_session_fixture(50));
+        let mut pages = vec![first, second].into_iter();
+        let catalog = collect_full_session_catalog(|_, _, _| {
+            Ok(pages.next().expect("two-page ordered fixture"))
+        })
+        .expect("strictly older item 51 closes the catalog");
+        assert_eq!(catalog.len(), 51);
+    }
+
+    #[test]
+    fn destructive_catalog_read_rejects_infinite_unique_cursors_before_mutation() {
+        let mut page_reads = 0_usize;
+        let mut deletion_calls = 0_usize;
+        let catalog = collect_full_session_catalog(|_, _, _| {
+            page_reads += 1;
+            Ok(empty_catalog_page(Some(format!(
+                "opaque-unique-cursor-{page_reads}"
+            ))))
+        });
+
+        let destructive_result = catalog.map(|_| {
+            deletion_calls += 1;
+        });
+
+        let error = destructive_result.expect_err("unbounded unique cursors must fail closed");
+        assert!(error.contains("总页数上限"), "unexpected error: {error}");
+        assert_eq!(page_reads, MAX_FULL_SESSION_CATALOG_PAGES);
+        assert_eq!(
+            deletion_calls, 0,
+            "a non-closed catalog must never reach the deletion stage"
+        );
+    }
+
+    #[test]
+    fn destructive_catalog_read_rejects_total_item_overflow_before_mutation() {
+        let mut deletion_calls = 0_usize;
+        let mut page = empty_catalog_page(None);
+        page.page.items = (0..=MAX_FULL_SESSION_CATALOG_ITEMS)
+            .map(catalog_session_fixture)
+            .collect();
+        let mut page = Some(page);
+        let catalog = collect_full_session_catalog(|_, _, _| {
+            Ok(page.take().expect("only one oversized page is read"))
+        });
+
+        let destructive_result = catalog.map(|_| {
+            deletion_calls += 1;
+        });
+
+        let error = destructive_result.expect_err("oversized catalog must fail closed");
+        assert!(error.contains("总条目上限"), "unexpected error: {error}");
+        assert_eq!(deletion_calls, 0);
+    }
+
+    #[test]
+    fn destructive_catalog_read_rejects_revisionless_first_page_before_mutation() {
+        let mut page = empty_catalog_page(None);
+        page.page.catalog_revision = None;
+        page.page.catalog_authority = SessionCatalogAuthority::Unavailable;
+        page.page.pagination_supported = false;
+        page.page.pagination_unavailable_reason =
+            Some(SessionPaginationUnavailableReason::CatalogRevisionUnavailable);
+        let mut page = Some(page);
+        let mut mutation_calls = 0_usize;
+
+        let catalog = collect_full_session_catalog(|_, _, _| {
+            Ok(page.take().expect("revisionless first page is read once"))
+        });
+        let destructive_result = catalog.map(|_| mutation_calls += 1);
+
+        let error =
+            destructive_result.expect_err("revisionless first page is not a complete catalog");
+        assert!(
+            error.contains("不提供快照级 revision"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(mutation_calls, 0);
+    }
+
+    fn test_admission_key(plan: &DerivedPublicationPlan) -> ObjectKey {
+        admission_object_key(&plan.marker_key, TEST_ADMISSION_ID)
+            .expect("test admission UUIDv7 and marker authority are valid")
+    }
 
     /// Creates a fresh, uniquely-named temp directory under the OS temp
     /// dir -- same pattern the existing PC-06 tests in this file use
@@ -8530,6 +10476,497 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ylx-pc05b-{label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn fake_mdns_candidate(
+        service_name: &str,
+        cursor: MdnsEventCursor,
+        port: u16,
+        addresses: &[Ipv4Addr],
+    ) -> MdnsCandidate {
+        let fullname = format!("{service_name}._ylx-capture._tcp.local.");
+        MdnsCandidate {
+            service_id: MdnsServiceId::from_fullname(&fullname),
+            fullname,
+            hostname: format!("{service_name}.local."),
+            addresses: addresses.iter().copied().map(IpAddr::V4).collect(),
+            endpoints: addresses
+                .iter()
+                .copied()
+                .map(|address| MdnsEndpoint {
+                    address: IpAddr::V4(address),
+                    interface: None,
+                })
+                .collect(),
+            port,
+            txt: HashMap::new(),
+            cursor,
+        }
+    }
+
+    fn fake_v4_probe(seed: &str, label: &str) -> LabV4DeviceProbe {
+        LabV4DeviceProbe {
+            device_id: format!("device-{seed}"),
+            device_label: label.to_string(),
+            synthetic_identity_pin: PiTlsPin(test_fingerprint(seed)),
+        }
+    }
+
+    #[test]
+    fn mdns_probe_tries_ordered_addresses_until_one_succeeds() {
+        let candidate = fake_mdns_candidate(
+            "fallback",
+            MdnsEventCursor {
+                generation: 1,
+                sequence: 1,
+            },
+            7314,
+            &[Ipv4Addr::new(192, 0, 2, 10), Ipv4Addr::new(192, 0, 2, 11)],
+        );
+        let mut attempted = Vec::new();
+
+        let success =
+            probe_mdns_candidate_with(&candidate, Duration::from_millis(50), |host, port, _| {
+                attempted.push((host.to_string(), port));
+                if host == "192.0.2.10" {
+                    Err(PiHttpError::Network(
+                        "cannot connect: actively refused (os error 10061)".to_string(),
+                    ))
+                } else {
+                    Ok(fake_v4_probe("a", "Pi fallback"))
+                }
+            })
+            .expect("the second advertised endpoint should be tried");
+
+        assert_eq!(
+            attempted,
+            vec![
+                ("192.0.2.10".to_string(), 7314),
+                ("192.0.2.11".to_string(), 7314),
+            ]
+        );
+        assert_eq!(success.target.host, "192.0.2.11");
+        assert_eq!(success.target.port, 7314);
+    }
+
+    #[test]
+    fn stale_probe_result_after_service_loss_is_fenced_before_registration() {
+        let dir = fresh_temp_dir("mdns-late-result");
+        let comp = test_composition(&dir, Vec::new());
+        let candidate = fake_mdns_candidate(
+            "late",
+            MdnsEventCursor {
+                generation: 7,
+                sequence: 1,
+            },
+            8080,
+            &[Ipv4Addr::LOCALHOST],
+        );
+        let observation = observe_mdns_changes(&comp, &[MdnsChange::Resolved(candidate.clone())]);
+        assert_eq!(observation.probes.len(), 1);
+        observe_mdns_changes(
+            &comp,
+            &[MdnsChange::Lost(MdnsServiceLoss {
+                service_id: candidate.service_id.clone(),
+                fullname: candidate.fullname.clone(),
+                cursor: MdnsEventCursor {
+                    generation: 7,
+                    sequence: 2,
+                },
+                reason: ylx_transfer_adapters::discovery_mdns::MdnsLossReason::RemovedOrExpired,
+            })],
+        );
+
+        let changed = probe_and_apply_mdns_candidate_with(&comp, candidate, |_, _, _| {
+            Ok(fake_v4_probe("b", "Late Pi"))
+        });
+        assert!(!changed);
+        assert!(comp.frontend_devices().is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn removed_service_goes_offline_and_reappears_as_the_same_device() {
+        let dir = fresh_temp_dir("mdns-reappear");
+        let comp = test_composition(&dir, Vec::new());
+        let first = fake_mdns_candidate(
+            "reappear",
+            MdnsEventCursor {
+                generation: 9,
+                sequence: 1,
+            },
+            8080,
+            &[Ipv4Addr::new(192, 0, 2, 20)],
+        );
+        observe_mdns_changes(&comp, &[MdnsChange::Resolved(first.clone())]);
+        assert!(probe_and_apply_mdns_candidate_with(
+            &comp,
+            first.clone(),
+            |_, _, _| Ok(fake_v4_probe("c", "Reappearing Pi"))
+        ));
+        let original = comp.frontend_devices().pop().unwrap();
+        assert_eq!(original.state, FrontendDeviceState::Idle);
+
+        assert!(
+            observe_mdns_changes(
+                &comp,
+                &[MdnsChange::Lost(MdnsServiceLoss {
+                    service_id: first.service_id.clone(),
+                    fullname: first.fullname.clone(),
+                    cursor: MdnsEventCursor {
+                        generation: 9,
+                        sequence: 2,
+                    },
+                    reason: ylx_transfer_adapters::discovery_mdns::MdnsLossReason::RemovedOrExpired,
+                })],
+            )
+            .device_state_changed
+        );
+        let offline = comp.frontend_devices().pop().unwrap();
+        assert_eq!(offline.id, original.id);
+        assert_eq!(offline.state, FrontendDeviceState::Offline);
+
+        let reappeared = fake_mdns_candidate(
+            "reappear",
+            MdnsEventCursor {
+                generation: 9,
+                sequence: 3,
+            },
+            9080,
+            &[Ipv4Addr::new(192, 0, 2, 21)],
+        );
+        observe_mdns_changes(&comp, &[MdnsChange::Resolved(reappeared.clone())]);
+        assert!(probe_and_apply_mdns_candidate_with(
+            &comp,
+            reappeared,
+            |_, _, _| Ok(fake_v4_probe("c", "Reappearing Pi"))
+        ));
+        let online = comp.frontend_devices().pop().unwrap();
+        assert_eq!(online.id, original.id);
+        assert_eq!(online.state, FrontendDeviceState::Idle);
+        assert_eq!(
+            comp.resolve_binding(&online.id).unwrap().endpoint.port,
+            9080
+        );
+        assert_eq!(comp.fleet.len(), 1);
+
+        let stale_loss = observe_mdns_changes(
+            &comp,
+            &[MdnsChange::Lost(MdnsServiceLoss {
+                service_id: first.service_id,
+                fullname: first.fullname,
+                cursor: MdnsEventCursor {
+                    generation: 9,
+                    sequence: 2,
+                },
+                reason: ylx_transfer_adapters::discovery_mdns::MdnsLossReason::RemovedOrExpired,
+            })],
+        );
+        assert!(!stale_loss.device_state_changed);
+        assert_eq!(
+            comp.frontend_devices().pop().unwrap().state,
+            FrontendDeviceState::Idle
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn losing_one_of_two_verified_services_rebinds_to_the_remaining_endpoint() {
+        let dir = fresh_temp_dir("mdns-multi-service-rebind");
+        let comp = test_composition(&dir, Vec::new());
+        let service_a = fake_mdns_candidate(
+            "multi-service-a",
+            MdnsEventCursor {
+                generation: 12,
+                sequence: 1,
+            },
+            8080,
+            &[Ipv4Addr::new(192, 0, 2, 51)],
+        );
+        let service_b = fake_mdns_candidate(
+            "multi-service-b",
+            MdnsEventCursor {
+                generation: 12,
+                sequence: 2,
+            },
+            8081,
+            &[Ipv4Addr::new(192, 0, 2, 52)],
+        );
+
+        observe_mdns_changes(
+            &comp,
+            &[
+                MdnsChange::Resolved(service_a.clone()),
+                MdnsChange::Resolved(service_b.clone()),
+            ],
+        );
+        assert!(probe_and_apply_mdns_candidate_with(
+            &comp,
+            service_a.clone(),
+            |_, _, _| Ok(fake_v4_probe("7", "Multi-address Pi"))
+        ));
+        assert!(probe_and_apply_mdns_candidate_with(
+            &comp,
+            service_b.clone(),
+            |_, _, _| Ok(fake_v4_probe("7", "Multi-address Pi"))
+        ));
+
+        let before_loss = comp.frontend_devices().pop().unwrap();
+        assert_eq!(before_loss.ip.as_deref(), Some("192.0.2.52"));
+        assert_eq!(
+            comp.resolve_binding(&before_loss.id).unwrap().endpoint.port,
+            8081
+        );
+
+        let observation = observe_mdns_changes(
+            &comp,
+            &[MdnsChange::Lost(MdnsServiceLoss {
+                service_id: service_b.service_id,
+                fullname: service_b.fullname,
+                cursor: MdnsEventCursor {
+                    generation: 12,
+                    sequence: 3,
+                },
+                reason: ylx_transfer_adapters::discovery_mdns::MdnsLossReason::RemovedOrExpired,
+            })],
+        );
+
+        let after_loss = comp.frontend_devices().pop().unwrap();
+        assert_eq!(after_loss.id, before_loss.id);
+        assert_eq!(after_loss.state, FrontendDeviceState::Idle);
+        assert_eq!(after_loss.ip.as_deref(), Some("192.0.2.51"));
+        let binding = comp.resolve_binding(&after_loss.id).unwrap();
+        assert_eq!(binding.endpoint.host, "192.0.2.51");
+        assert_eq!(binding.endpoint.port, 8080);
+        assert!(
+            observation.device_state_changed,
+            "endpoint fallback must be emitted even though online state stays unchanged"
+        );
+        assert_eq!(comp.fleet.len(), 1);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn terminal_browse_loss_marks_every_verified_service_offline() {
+        let dir = fresh_temp_dir("mdns-browse-loss");
+        let comp = test_composition(&dir, Vec::new());
+        let first = fake_mdns_candidate(
+            "browse-a",
+            MdnsEventCursor {
+                generation: 10,
+                sequence: 1,
+            },
+            8080,
+            &[Ipv4Addr::new(192, 0, 2, 40)],
+        );
+        let second = fake_mdns_candidate(
+            "browse-b",
+            MdnsEventCursor {
+                generation: 10,
+                sequence: 2,
+            },
+            8081,
+            &[Ipv4Addr::new(192, 0, 2, 41)],
+        );
+        observe_mdns_changes(
+            &comp,
+            &[
+                MdnsChange::Resolved(first.clone()),
+                MdnsChange::Resolved(second.clone()),
+            ],
+        );
+        assert!(probe_and_apply_mdns_candidate_with(
+            &comp,
+            first.clone(),
+            |_, _, _| Ok(fake_v4_probe("e", "Browse Pi E"))
+        ));
+        assert!(probe_and_apply_mdns_candidate_with(
+            &comp,
+            second.clone(),
+            |_, _, _| Ok(fake_v4_probe("f", "Browse Pi F"))
+        ));
+
+        let observation = observe_mdns_changes(
+            &comp,
+            &[MdnsChange::BrowseLost(MdnsBrowseLoss {
+                generation: 10,
+                cursor: MdnsEventCursor {
+                    generation: 10,
+                    sequence: 3,
+                },
+                service_ids: vec![first.service_id, second.service_id],
+                reason: MdnsBrowseLossReason::ChannelDisconnected,
+            })],
+        );
+        assert!(observation.device_state_changed);
+        let devices = comp.frontend_devices();
+        assert_eq!(devices.len(), 2);
+        assert!(devices
+            .iter()
+            .all(|device| device.state == FrontendDeviceState::Offline));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn manual_bare_reported_ip_uses_only_the_current_v4_http_origin() {
+        let dir = fresh_temp_dir("manual-v4-http-origin");
+        let comp = test_composition(&dir, Vec::new());
+        let address = IpAddr::V4(Ipv4Addr::new(192, 168, 110, 36));
+        let mut attempted = Vec::new();
+
+        let planned = manual_lab_v4_probe_target(address);
+        assert_eq!(planned.lab_v4_origin(), "http://192.168.110.36:8080");
+
+        let device = comp
+            .add_manual_device_with(address, |host, port, _| {
+                attempted.push(DeviceProbeTarget {
+                    host: host.to_string(),
+                    port,
+                });
+                Ok(fake_v4_probe("1", "Reported Pi"))
+            })
+            .unwrap();
+
+        assert_eq!(attempted.len(), 1);
+        assert_eq!(attempted[0].lab_v4_origin(), "http://192.168.110.36:8080");
+        assert!(!attempted[0].lab_v4_origin().contains("https://"));
+        assert!(!attempted[0].lab_v4_origin().contains("8443"));
+        let binding = comp.resolve_binding(&device.id).unwrap();
+        assert_eq!(binding.endpoint.host, "192.168.110.36");
+        assert_eq!(binding.endpoint.port, 8080);
+        assert_eq!(binding.endpoint.api_profile, DeviceApiProfile::LabHttpV4);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn manual_probe_error_lists_target_port_and_failure_class_without_legacy_tls_port() {
+        let dir = fresh_temp_dir("manual-probe-error");
+        let comp = test_composition(&dir, Vec::new());
+        let address = IpAddr::V4(Ipv4Addr::new(192, 168, 110, 36));
+
+        let error = comp
+            .add_manual_device_with(address, |_, _, _| {
+                Err(PiHttpError::Network(
+                    "connection refused (os error 10061)".to_string(),
+                ))
+            })
+            .unwrap_err();
+        assert!(error.contains("http://192.168.110.36:8080"), "{error}");
+        assert!(error.contains("connection_refused"), "{error}");
+        assert!(!error.contains("https://"), "{error}");
+        assert!(!error.contains("8443"), "{error}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mdns_loss_does_not_mark_a_manually_registered_identity_offline() {
+        let dir = fresh_temp_dir("manual-survives-mdns-loss");
+        let comp = test_composition(&dir, Vec::new());
+        let manual = comp
+            .add_manual_device_with(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 30)), |_, _, _| {
+                Ok(fake_v4_probe("d", "Manual Pi"))
+            })
+            .unwrap();
+        let candidate = fake_mdns_candidate(
+            "also-mdns",
+            MdnsEventCursor {
+                generation: 11,
+                sequence: 1,
+            },
+            8123,
+            &[Ipv4Addr::new(192, 0, 2, 31)],
+        );
+        observe_mdns_changes(&comp, &[MdnsChange::Resolved(candidate.clone())]);
+        assert!(probe_and_apply_mdns_candidate_with(
+            &comp,
+            candidate.clone(),
+            |_, _, _| Ok(fake_v4_probe("d", "Manual Pi"))
+        ));
+        let mdns_binding = comp.resolve_binding(&manual.id).unwrap();
+        assert_eq!(mdns_binding.endpoint.host, "192.0.2.31");
+        assert_eq!(mdns_binding.endpoint.port, 8123);
+        observe_mdns_changes(
+            &comp,
+            &[MdnsChange::Lost(MdnsServiceLoss {
+                service_id: candidate.service_id,
+                fullname: candidate.fullname,
+                cursor: MdnsEventCursor {
+                    generation: 11,
+                    sequence: 2,
+                },
+                reason: ylx_transfer_adapters::discovery_mdns::MdnsLossReason::RemovedOrExpired,
+            })],
+        );
+
+        let device = comp.frontend_devices().pop().unwrap();
+        assert_eq!(device.id, manual.id);
+        assert_eq!(device.state, FrontendDeviceState::Idle);
+        let manual_binding = comp.resolve_binding(&device.id).unwrap();
+        assert_eq!(manual_binding.endpoint.host, "192.0.2.30");
+        assert_eq!(manual_binding.endpoint.port, LAB_V4_MANUAL_PORT);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn verified_mdns_endpoint_replaces_manual_binding_without_losing_manual_presence() {
+        let dir = fresh_temp_dir("manual-mdns-endpoint-refresh");
+        let comp = test_composition(&dir, Vec::new());
+        let manual = comp
+            .add_manual_device_with(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 60)), |_, _, _| {
+                Ok(fake_v4_probe("8", "Manual and mDNS Pi"))
+            })
+            .unwrap();
+        let handle = comp.handle_for(&manual.id).expect("manual device handle");
+        connect_handle(&handle, "manual-origin-a", "origin-a-token");
+        assert_eq!(handle.current_epoch(), Some(1));
+        let mdns = fake_mdns_candidate(
+            "manual-endpoint-refresh",
+            MdnsEventCursor {
+                generation: 13,
+                sequence: 1,
+            },
+            8181,
+            &[Ipv4Addr::new(192, 0, 2, 61)],
+        );
+
+        observe_mdns_changes(&comp, &[MdnsChange::Resolved(mdns.clone())]);
+        let changed = probe_and_apply_mdns_candidate_with(&comp, mdns, |_, _, _| {
+            Ok(fake_v4_probe("8", "Manual and mDNS Pi"))
+        });
+
+        let device = comp.frontend_devices().pop().unwrap();
+        assert_eq!(device.id, manual.id);
+        assert_eq!(device.state, FrontendDeviceState::Idle);
+        assert_eq!(device.ip.as_deref(), Some("192.0.2.61"));
+        let binding = comp.resolve_binding(&device.id).unwrap();
+        assert_eq!(binding.endpoint.host, "192.0.2.61");
+        assert_eq!(binding.endpoint.port, 8181);
+        assert!(changed, "the refreshed endpoint must be emitted to the UI");
+        assert_eq!(handle.connection_state(), ConnectionState::Disconnected);
+        assert_eq!(
+            handle.current_epoch(),
+            None,
+            "a token established on manual origin A must not follow the binding to origin B"
+        );
+        assert_eq!(comp.fleet.len(), 1);
+
+        let identity = DeviceIdentity::parse(&test_fingerprint("8")).unwrap();
+        assert!(
+            comp.mdns_services
+                .lock()
+                .unwrap()
+                .should_be_online(identity.fingerprint()),
+            "manual presence must remain independent of the selected connection endpoint"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Serves a small loopback HTTP response to the real S3 adapter and
@@ -8704,6 +11141,524 @@ mod tests {
         assert!(matches!(outcome, PollPairingOutcome::Connected { .. }));
     }
 
+    fn spawn_lab_v4_catalog_server(
+        responses: Vec<String>,
+    ) -> (u16, mpsc::Receiver<String>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind catalog loopback server");
+        listener
+            .set_nonblocking(true)
+            .expect("configure nonblocking catalog listener");
+        let port = listener
+            .local_addr()
+            .expect("catalog loopback address")
+            .port();
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for body in responses {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(accepted) => break accepted,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "timed out waiting for catalog request"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept catalog request: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("catalog request read timeout");
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).expect("read catalog request");
+                    assert!(read > 0, "catalog request closed before its headers");
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let request_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .expect("catalog request line")
+                    .to_string();
+                requests_tx
+                    .send(request_line)
+                    .expect("record catalog request line");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write catalog response");
+            }
+        });
+        (port, requests_rx, server)
+    }
+
+    fn spawn_lab_v4_periodic_poll_server(
+        body: String,
+    ) -> (u16, mpsc::Receiver<String>, std::thread::JoinHandle<()>) {
+        spawn_lab_v4_single_response_server(body, Vec::new())
+    }
+
+    fn spawn_lab_v4_single_response_server(
+        body: String,
+        response_headers: Vec<(String, String)>,
+    ) -> (u16, mpsc::Receiver<String>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind periodic-poll server");
+        listener
+            .set_nonblocking(true)
+            .expect("configure nonblocking periodic-poll listener");
+        let port = listener
+            .local_addr()
+            .expect("periodic-poll loopback address")
+            .port();
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let first_deadline = Instant::now() + Duration::from_secs(5);
+            let mut first = true;
+            let mut linger_deadline = first_deadline;
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .expect("periodic-poll request read timeout");
+                        let mut request = Vec::new();
+                        let mut chunk = [0_u8; 1024];
+                        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            let read = stream.read(&mut chunk).expect("read periodic-poll request");
+                            assert!(read > 0, "periodic-poll request closed before headers");
+                            request.extend_from_slice(&chunk[..read]);
+                        }
+                        requests_tx
+                            .send(
+                                String::from_utf8_lossy(&request)
+                                    .lines()
+                                    .next()
+                                    .expect("periodic-poll request line")
+                                    .to_string(),
+                            )
+                            .expect("record periodic-poll request line");
+                        let extra_headers = response_headers
+                            .iter()
+                            .map(|(name, value)| format!("{name}: {value}\r\n"))
+                            .collect::<String>();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("write periodic-poll response");
+                        if first {
+                            first = false;
+                            linger_deadline = Instant::now() + Duration::from_millis(250);
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        let deadline = if first {
+                            first_deadline
+                        } else {
+                            linger_deadline
+                        };
+                        assert!(!first || Instant::now() < deadline, "missing periodic poll");
+                        if !first && Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept periodic-poll request: {error}"),
+                }
+            }
+        });
+        (port, requests_rx, server)
+    }
+
+    fn lab_v4_device_descriptor_body() -> String {
+        serde_json::json!({
+            "schema": "ylx.device.v4",
+            "device": {
+                "device_id": "550e8400-e29b-41d4-a716-446655440000",
+                "device_label": "YLX-30D5872D"
+            },
+            "hardware_fingerprint": test_fingerprint("e"),
+            "api_version": "4.0",
+            "build": {
+                "package_version": "0.10.0-dev.2",
+                "commit": "2db57ae68e04197397b8ac84f4d71548aa2fcb36",
+                "build_id": "build-20260821.1"
+            },
+            "security_profile": "lab",
+            "capabilities": {
+                "capture": true,
+                "preview": true,
+                "range_download": true,
+                "network_mutation": false,
+                "session_list": true,
+                "session_detail": true,
+                "artifact_download": true,
+                "capture_status": true,
+                "session_deletion": false,
+                "calibration_capture": {
+                    "supported": true,
+                    "enabled": false,
+                    "disabled_reason": "hardware_unavailable",
+                    "required_video_layout": "split-eyes"
+                }
+            },
+            "storage": {
+                "volume_id": "6ba7b810-9dad-41d1-80b4-00c04fd430c8",
+                "total_bytes": 128000000000_u64,
+                "available_bytes": 96000000000_u64,
+                "writable": true
+            },
+            "runtime": {
+                "observed_at": "2026-08-21T10:24:15+08:00",
+                "connection_method": "ethernet_lan",
+                "temperature_celsius": 53.5,
+                "network": {},
+                "live_imu": null,
+                "camera": {
+                    "schema": "ylx.camera-connection.v1",
+                    "state": "connected"
+                },
+                "camera_focus": null
+            }
+        })
+        .to_string()
+    }
+
+    fn negotiated_lab_v4_device_info() -> ylx_transfer_core::device::DeviceInfoView {
+        let profile_contract = NegotiatedCapabilityView {
+            supported: true,
+            source: CapabilitySourceView::ProfileContract,
+        };
+        let descriptor = NegotiatedCapabilityView {
+            supported: true,
+            source: CapabilitySourceView::DeviceDescriptor,
+        };
+        ylx_transfer_core::device::DeviceInfoView {
+            capture_activity: CaptureActivityState::Unknown,
+            media_admission: "lab_v4".to_string(),
+            publication_key_fingerprint: test_fingerprint("f"),
+            profile: DeviceApiProfileView::LabHttpV4,
+            capabilities: DeviceCapabilitiesView {
+                session_list: profile_contract,
+                session_detail: profile_contract,
+                artifact_download: descriptor,
+                capture_status: profile_contract,
+                session_deletion: NegotiatedCapabilityView {
+                    supported: false,
+                    source: CapabilitySourceView::ProfileContract,
+                },
+                ..DeviceCapabilitiesView::default()
+            },
+            capture_status: None,
+            publication_origin: PublicationEnvelopeOriginView::ClientDerivedLabCompatibility,
+        }
+    }
+
+    #[test]
+    fn negotiated_lab_v4_catalog_pages_issue_only_the_sessions_request() {
+        let catalog_revision = format!("sha256:{}", "c".repeat(64));
+        let next_cursor = "01989f6c-2c00-7a1b-8c2d-3e4f50617281";
+        let page = |next_cursor: Option<&str>| {
+            serde_json::json!({
+                "schema": "ylx.session-list.v3",
+                "catalog_revision": catalog_revision,
+                "items": [],
+                "diagnostics": [],
+                "next_cursor": next_cursor,
+            })
+            .to_string()
+        };
+        let (port, requests, server) =
+            spawn_lab_v4_catalog_server(vec![page(Some(next_cursor)), page(None)]);
+        let dir = fresh_temp_dir("lab-v4-one-request-per-catalog-page");
+        let comp = test_composition(&dir, Vec::new());
+        let registration = comp
+            .register_endpoint(DeviceEndpoint {
+                host: "127.0.0.1".to_string(),
+                port,
+                tls_fingerprint: test_fingerprint("e"),
+                name: "Loopback Lab v4".to_string(),
+                display_label: None,
+                api_profile: DeviceApiProfile::LabHttpV4,
+            })
+            .expect("register Lab v4 loopback endpoint");
+        connect_handle(&registration.handle, "attempt-lab-v4", "token-lab-v4");
+        registration
+            .handle
+            .actor()
+            .apply_device_info(negotiated_lab_v4_device_info())
+            .expect("install current-epoch Lab v4 negotiation");
+        let device_id = registration.identity.device_id().as_str();
+
+        let first = comp
+            .read_session_page(device_id, None, None, None)
+            .expect("first page must not depend on capture status");
+        let second = comp
+            .read_session_page(
+                device_id,
+                first.page.next_cursor.as_deref(),
+                first.page.catalog_revision.as_deref(),
+                Some(first.connection_epoch),
+            )
+            .expect("load-more must not depend on capture status");
+
+        assert!(!second.page.has_more);
+        assert_eq!(
+            requests
+                .recv_timeout(Duration::from_secs(2))
+                .expect("first request"),
+            "GET /api/v4/sessions?limit=50 HTTP/1.1"
+        );
+        assert_eq!(
+            requests
+                .recv_timeout(Duration::from_secs(2))
+                .expect("load-more request"),
+            format!("GET /api/v4/sessions?cursor={next_cursor}&limit=50 HTTP/1.1")
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "no descriptor/status preflight"
+        );
+        server.join().expect("catalog loopback server exits");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn lab_v4_connection_negotiation_is_one_descriptor_request_before_ready() {
+        let (port, requests, server) =
+            spawn_lab_v4_periodic_poll_server(lab_v4_device_descriptor_body());
+        let dir = fresh_temp_dir("lab-v4-one-request-connection-negotiation");
+        let comp = test_composition(&dir, Vec::new());
+        let registration = comp
+            .register_endpoint(DeviceEndpoint {
+                host: "127.0.0.1".to_string(),
+                port,
+                tls_fingerprint: test_fingerprint("e"),
+                name: "Loopback Lab v4".to_string(),
+                display_label: None,
+                api_profile: DeviceApiProfile::LabHttpV4,
+            })
+            .expect("register Lab v4 negotiation endpoint");
+        connect_handle(&registration.handle, "attempt-lab-v4", "token-lab-v4");
+        let binding = comp
+            .resolve_binding(registration.identity.device_id().as_str())
+            .expect("resolve negotiation binding");
+
+        assert_eq!(
+            negotiate_lab_v4_connection_once(&binding.handle, binding.client, 1),
+            ConnectionNegotiationOutcome::Ready
+        );
+
+        server.join().expect("negotiation loopback server exits");
+        assert_eq!(
+            requests.try_iter().collect::<Vec<_>>(),
+            vec!["GET /api/v4/device HTTP/1.1".to_string()]
+        );
+        let negotiated = registration
+            .handle
+            .negotiated_device_snapshot()
+            .expect("descriptor facts are atomically bound to this epoch");
+        assert_eq!(negotiated.epoch, 1);
+        assert_eq!(negotiated.info.profile, DeviceApiProfileView::LabHttpV4);
+        assert_eq!(
+            negotiated.info.capture_activity,
+            CaptureActivityState::Unknown,
+            "initial negotiation must not duplicate capture status"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn failed_lab_v4_connection_negotiation_clears_only_that_epoch() {
+        let (port, requests, server) = spawn_lab_v4_periodic_poll_server("{}".to_string());
+        let dir = fresh_temp_dir("lab-v4-failed-connection-negotiation");
+        let comp = test_composition(&dir, Vec::new());
+        let registration = comp
+            .register_endpoint(DeviceEndpoint {
+                host: "127.0.0.1".to_string(),
+                port,
+                tls_fingerprint: test_fingerprint("e"),
+                name: "Loopback Lab v4".to_string(),
+                display_label: None,
+                api_profile: DeviceApiProfile::LabHttpV4,
+            })
+            .expect("register failing negotiation endpoint");
+        connect_handle(&registration.handle, "attempt-lab-v4", "token-lab-v4");
+        let binding = comp
+            .resolve_binding(registration.identity.device_id().as_str())
+            .expect("resolve failing negotiation binding");
+
+        assert!(matches!(
+            negotiate_lab_v4_connection_once(&binding.handle, binding.client, 1),
+            ConnectionNegotiationOutcome::Failed(_)
+        ));
+
+        server.join().expect("failing negotiation server exits");
+        assert_eq!(
+            requests.try_iter().collect::<Vec<_>>(),
+            vec!["GET /api/v4/device HTTP/1.1".to_string()]
+        );
+        assert_eq!(
+            registration.handle.connection_state(),
+            ConnectionState::Disconnected
+        );
+        assert!(registration.handle.negotiated_device_snapshot().is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn negotiated_lab_v4_detail_issues_only_the_manifest_request() {
+        let session_id = "01989f6c-2c00-7a1b-8c2d-3e4f50617283";
+        let manifest = serde_json::json!({
+            "schema": "ylx.device-session.v2",
+            "session_id": session_id,
+            "sealed_at": "2026-08-08T10:31:33+08:00",
+            "time": {
+                "started_at": "2026-08-08T10:31:00+08:00",
+                "ended_at": "2026-08-08T10:31:30+08:00",
+                "duration_seconds": 30
+            }
+        })
+        .to_string();
+        let manifest_sha256 = format!("{:x}", Sha256::digest(manifest.as_bytes()));
+        let (port, requests, server) = spawn_lab_v4_single_response_server(
+            manifest,
+            vec![
+                ("YLX-Manifest-SHA256".to_string(), manifest_sha256.clone()),
+                ("ETag".to_string(), format!("\"{manifest_sha256}\"")),
+            ],
+        );
+        let dir = fresh_temp_dir("lab-v4-one-request-session-detail");
+        let comp = test_composition(&dir, Vec::new());
+        let registration = comp
+            .register_endpoint(DeviceEndpoint {
+                host: "127.0.0.1".to_string(),
+                port,
+                tls_fingerprint: test_fingerprint("e"),
+                name: "Loopback Lab v4".to_string(),
+                display_label: None,
+                api_profile: DeviceApiProfile::LabHttpV4,
+            })
+            .expect("register Lab v4 detail endpoint");
+        connect_handle(&registration.handle, "attempt-lab-v4", "token-lab-v4");
+        registration
+            .handle
+            .actor()
+            .apply_device_info(negotiated_lab_v4_device_info())
+            .expect("install current-epoch Lab v4 negotiation");
+        let verification = GatewayVerificationView {
+            actor: "gateway".to_string(),
+            validator_name: "manifest-validator".to_string(),
+            validator_version: "2.1.0".to_string(),
+            validator_build_sha256: "b".repeat(64),
+            manifest_sha256: manifest_sha256.clone(),
+            manifest_digest_valid: true,
+            verified_at: "2026-08-08T10:31:34+08:00".to_string(),
+            verdict: GatewayVerificationVerdictView::Usable,
+            diagnostics: Vec::new(),
+        };
+        let binding = comp
+            .resolve_binding(registration.identity.device_id().as_str())
+            .expect("resolve detail binding");
+
+        let detail = fetch_verified_session_detail(
+            &binding.handle,
+            binding.client,
+            session_id,
+            &verification,
+        )
+        .expect("detail reuses the negotiated snapshot");
+
+        server.join().expect("detail loopback server exits");
+        assert_eq!(detail.revision, format!("sha256:{manifest_sha256}"));
+        assert_eq!(
+            requests.try_iter().collect::<Vec<_>>(),
+            vec![format!("GET /api/v4/sessions/{session_id} HTTP/1.1")],
+            "detail must not preflight descriptor or capture status"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn negotiated_lab_v4_periodic_poll_issues_only_capture_status() {
+        let body = serde_json::json!({
+            "schema": "ylx.capture-status.v4",
+            "authority_epoch": "4fa85f64-5717-4562-b3fc-2c963f66afa6",
+            "source_revision": 7,
+            "snapshot": {
+                "schema": "ylx.capture-snapshot-event.v4",
+                "device_state": "recording",
+                "active_recording": {
+                    "generation_id": "550e8400-e29b-41d4-a716-446655440001"
+                },
+                "retained_unsuccessful": null,
+                "runtime": {
+                    "observed_at": "2026-08-21T10:24:15+08:00",
+                    "connection_method": "ethernet_lan",
+                    "temperature_celsius": 53.5,
+                    "network": {},
+                    "live_imu": null,
+                    "camera": {
+                        "schema": "ylx.camera-connection.v1",
+                        "state": "connected"
+                    },
+                    "camera_focus": null
+                }
+            }
+        })
+        .to_string();
+        let (port, requests, server) = spawn_lab_v4_periodic_poll_server(body);
+        let dir = fresh_temp_dir("lab-v4-one-request-per-periodic-poll");
+        let comp = test_composition(&dir, Vec::new());
+        let registration = comp
+            .register_endpoint(DeviceEndpoint {
+                host: "127.0.0.1".to_string(),
+                port,
+                tls_fingerprint: test_fingerprint("e"),
+                name: "Loopback Lab v4".to_string(),
+                display_label: None,
+                api_profile: DeviceApiProfile::LabHttpV4,
+            })
+            .expect("register Lab v4 periodic-poll endpoint");
+        connect_handle(&registration.handle, "attempt-lab-v4", "token-lab-v4");
+        registration
+            .handle
+            .actor()
+            .apply_device_info(negotiated_lab_v4_device_info())
+            .expect("install current-epoch Lab v4 negotiation");
+        let binding = comp
+            .resolve_binding(registration.identity.device_id().as_str())
+            .expect("resolve periodic-poll binding");
+
+        assert!(poll_connected_device_once(
+            &binding.handle,
+            binding.client,
+            DeviceApiProfile::LabHttpV4,
+        ));
+
+        server.join().expect("periodic-poll loopback server exits");
+        assert_eq!(
+            requests.try_iter().collect::<Vec<_>>(),
+            vec!["GET /api/v4/capture/status HTTP/1.1".to_string()]
+        );
+        assert_eq!(
+            registration.handle.snapshot().device.capture_activity,
+            CaptureActivityState::Recording
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn connected_session_operation_runs_with_neither_the_fleet_nor_the_handle_locked() {
         let fingerprint = test_fingerprint("a");
@@ -8763,6 +11718,48 @@ mod tests {
             sas: "123456".to_string(),
             record_trusted_producer_key: true,
         }
+    }
+
+    #[test]
+    fn connected_epoch_stays_pending_and_unpolled_until_negotiation_finishes() {
+        let dir = fresh_temp_dir("connection-negotiation-not-yet-published");
+        let comp = test_composition(&dir, Vec::new());
+        let registration = comp
+            .register_endpoint(DeviceEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: 9,
+                tls_fingerprint: test_fingerprint("e"),
+                name: "Negotiating Lab v4".to_string(),
+                display_label: None,
+                api_profile: DeviceApiProfile::LabHttpV4,
+            })
+            .expect("register negotiating device");
+        connect_handle(
+            &registration.handle,
+            "attempt-negotiating",
+            "token-negotiating",
+        );
+        let device_id = registration.identity.device_id().as_str().to_string();
+        comp.active_pairings
+            .lock()
+            .unwrap()
+            .insert(device_id.clone(), active_pairing("attempt-negotiating"));
+
+        assert_eq!(
+            comp.frontend_devices()
+                .into_iter()
+                .find(|device| device.id == device_id)
+                .expect("device projection")
+                .state,
+            FrontendDeviceState::Pending,
+            "the Connected actor must not be published before descriptor negotiation"
+        );
+        assert!(
+            comp.clients_by_fingerprint().is_empty(),
+            "the 5-second sweep must not race connection negotiation with capture status"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// A poll/cancel result belonging to an attempt the device has already
@@ -8992,13 +11989,26 @@ mod tests {
         let clients = comp.clients_by_fingerprint();
         assert_eq!(clients.len(), 2);
         assert!(Arc::ptr_eq(
-            clients.get(registration_a.identity.fingerprint()).unwrap(),
+            &clients
+                .get(registration_a.identity.fingerprint())
+                .unwrap()
+                .client,
             &binding_a.client
         ));
         assert!(Arc::ptr_eq(
-            clients.get(registration_b.identity.fingerprint()).unwrap(),
+            &clients
+                .get(registration_b.identity.fingerprint())
+                .unwrap()
+                .client,
             &binding_b.client
         ));
+        assert_eq!(
+            clients
+                .get(registration_a.identity.fingerprint())
+                .unwrap()
+                .api_profile,
+            DeviceApiProfile::LegacyPinnedTlsV1
+        );
 
         let devices = comp.frontend_devices();
         assert_eq!(devices.len(), 2);
@@ -9662,83 +12672,14 @@ mod tests {
 
     #[test]
     fn backed_up_projection_requires_marker_and_exact_prefix_keys() {
-        let file = test_session_file("file-1", "video/a.mp4", 3);
-        let mut entry = test_entry(vec![file.clone()]);
-        entry.publication = Some(test_publication("rev-1"));
-        entry.upload_status = UploadStatus::Done;
-        let spec =
-            UploadJobSpec::new_with_prefix(entry.key(), "rev-1", "digest-1", "backups").unwrap();
-        let publication = entry.publication.as_ref().unwrap();
-        let mut stored = vec![StoredUploadReceipt {
-            job_id: "upload-projection".to_string(),
-            entry_key: entry.key(),
-            revision: "rev-1".to_string(),
-            object_key: upload_object_key(
-                "backups",
-                &entry.device_id,
-                &entry.session_id,
-                &file.file_id,
-            )
-            .0,
-            role: UploadReceiptRole::Data,
-            etag: "etag-data".to_string(),
-            version_id: Some("version-data".to_string()),
-            size_bytes: file.bytes,
-            source_sha256: file.sha256.clone(),
-            digest_proof: UploadReceiptDigestProof::ServerChecksum,
-            staged_at: "t0".to_string(),
-        }];
-        for (name, bytes) in [
-            (
-                PUBLICATION_SIGNATURE_OBJECT,
-                publication.signature.as_slice(),
-            ),
-            (
-                PUBLICATION_PUBLIC_KEY_OBJECT,
-                publication.public_key.as_slice(),
-            ),
-            (PUBLICATION_MANIFEST_OBJECT, publication.payload.as_slice()),
-        ] {
-            stored.push(StoredUploadReceipt {
-                job_id: "upload-projection".to_string(),
-                entry_key: entry.key(),
-                revision: "rev-1".to_string(),
-                object_key: upload_evidence_object_key(
-                    "backups",
-                    &entry.device_id,
-                    &entry.session_id,
-                    name,
-                )
-                .0,
-                role: UploadReceiptRole::Evidence,
-                etag: format!("etag-{name}"),
-                version_id: None,
-                size_bytes: bytes.len() as u64,
-                source_sha256: Sha256::digest(bytes)
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect(),
-                digest_proof: UploadReceiptDigestProof::StreamedReadback,
-                staged_at: "t0".to_string(),
-            });
-        }
-        entry.object_receipts = frontend_upload_receipts(&stored);
-        entry.upload_projection = Some(upload_projection_marker_for_spec(
-            "upload-projection",
-            &spec,
-            &TerminalOutcome::Succeeded,
-            &stored,
-        ));
-        assert!(entry_has_complete_object_receipts(&entry));
+        let root = fresh_temp_dir("backed-up-projection-v4");
+        let mut entry = worker_start_failure_entry(&root);
+        mark_canonical_entry_backed_up(&root, &mut entry, "backups", "upload-projection");
 
         let mut wrong_prefix = entry.clone();
-        wrong_prefix.object_receipts[0].key = upload_object_key(
-            "other",
-            &wrong_prefix.device_id,
-            &wrong_prefix.session_id,
-            &file.file_id,
-        )
-        .0;
+        wrong_prefix.object_receipts[0].key = wrong_prefix.object_receipts[0]
+            .key
+            .replacen("backups/", "other/", 1);
         assert!(!entry_has_complete_object_receipts(&wrong_prefix));
 
         let mut marker_without_prefix = entry.clone();
@@ -9748,6 +12689,8 @@ mod tests {
             .unwrap()
             .object_prefix = None;
         assert!(!entry_has_complete_object_receipts(&marker_without_prefix));
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     fn stored_receipt(
@@ -9776,13 +12719,92 @@ mod tests {
 
     #[test]
     fn upload_receipt_validation_rejects_a_wrong_prefix_with_the_same_tail() {
+        let root = fresh_temp_dir("upload-receipt-wrong-prefix-v4");
+        let library_root = root.join("library");
+        let entry = worker_start_failure_entry(&library_root);
+        let bundle = canonical_publication_bundle_for_entry(&library_root, &entry).unwrap();
+        let plan = derived_publication_plan("captures", &bundle).unwrap();
+        let admission_key = test_admission_key(&plan);
+        let revision = entry.publication.as_ref().unwrap().revision.clone();
+        let spec =
+            UploadJobSpec::new_with_prefix(entry.key(), revision.clone(), "digest", "captures")
+                .unwrap();
+        let mut receipts = vec![
+            stored_receipt(
+                "upload-prefix",
+                &entry.key(),
+                &revision,
+                &plan.source_manifest_key.0,
+                UploadReceiptRole::Evidence,
+                bundle.source_manifest_bytes.len() as u64,
+                bundle.source_manifest_sha256.clone(),
+            ),
+            stored_receipt(
+                "upload-prefix",
+                &entry.key(),
+                &revision,
+                &plan.receipt_key.0,
+                UploadReceiptRole::Evidence,
+                bundle.receipt_bytes.len() as u64,
+                bundle.receipt_sha256.clone(),
+            ),
+            stored_receipt(
+                "upload-prefix",
+                &entry.key(),
+                &revision,
+                &plan.output_key.0,
+                UploadReceiptRole::Data,
+                bundle.output_bytes,
+                bundle.output_sha256.clone(),
+            ),
+            stored_receipt(
+                "upload-prefix",
+                &entry.key(),
+                &revision,
+                &plan.marker_key.0,
+                UploadReceiptRole::Evidence,
+                plan.marker_bytes.len() as u64,
+                plan.marker_sha256.to_hex(),
+            ),
+            stored_receipt(
+                "upload-prefix",
+                &entry.key(),
+                &revision,
+                &admission_key.0,
+                UploadReceiptRole::Evidence,
+                1,
+                "1".repeat(64),
+            ),
+        ];
+        validate_upload_receipt_batch("upload-prefix", &spec, Some(&entry), &receipts)
+            .expect("baseline v4 receipt batch must validate");
+
+        receipts[0].object_key = receipts[0]
+            .object_key
+            .replacen("captures/", "wrong-prefix/", 1);
+        let error = validate_upload_receipt_batch("upload-prefix", &spec, Some(&entry), &receipts)
+            .expect_err("same-tail receipts under another prefix must fail closed");
+        assert!(error.contains("缺少内容对象"), "{error}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn legacy_upload_spec_cannot_validate_a_success_receipt_batch() {
         let file = test_session_file("file-1", "video/a.mp4", 3);
         let mut entry = test_entry(vec![file.clone()]);
-        entry.publication = Some(test_publication("rev-1"));
-        let spec =
-            UploadJobSpec::new_with_prefix(entry.key(), "rev-1", "digest", "captures").unwrap();
+        entry.publication = Some(test_publication("rev-legacy"));
+        let spec = UploadJobSpec::new(entry.key(), "rev-legacy", "legacy-digest").unwrap();
         let publication = entry.publication.as_ref().unwrap();
-        let evidence = [
+        let mut receipts = vec![stored_receipt(
+            "upload-legacy",
+            &entry.key(),
+            "rev-legacy",
+            &upload_object_key("", &entry.device_id, &entry.session_id, &file.file_id).0,
+            UploadReceiptRole::Data,
+            file.bytes,
+            file.sha256,
+        )];
+        for (name, bytes) in [
             (
                 PUBLICATION_SIGNATURE_OBJECT,
                 publication.signature.as_slice(),
@@ -9792,44 +12814,19 @@ mod tests {
                 publication.public_key.as_slice(),
             ),
             (PUBLICATION_MANIFEST_OBJECT, publication.payload.as_slice()),
-        ];
-        let mut receipts = vec![stored_receipt(
-            "upload-prefix",
-            &entry.key(),
-            "rev-1",
-            &format!(
-                "wrong-prefix/{}/{}/{}",
-                entry.device_id, entry.session_id, file.file_id
-            ),
-            UploadReceiptRole::Data,
-            file.bytes,
-            file.sha256.clone(),
-        )];
-        receipts.extend(evidence.iter().map(|(name, bytes)| {
-            stored_receipt(
-                "upload-prefix",
+        ] {
+            receipts.push(stored_receipt(
+                "upload-legacy",
                 &entry.key(),
-                "rev-1",
-                &format!("captures/{}/{}/{}", entry.device_id, entry.session_id, name),
+                "rev-legacy",
+                &upload_evidence_object_key("", &entry.device_id, &entry.session_id, name).0,
                 UploadReceiptRole::Evidence,
                 bytes.len() as u64,
                 hex_encode(&Sha256::digest(bytes)),
-            )
-        }));
-
-        let error = validate_upload_receipt_batch("upload-prefix", &spec, Some(&entry), &receipts)
-            .expect_err("same-tail receipts under another prefix must fail closed");
-        assert!(error.contains("exact key"), "{error}");
-    }
-
-    #[test]
-    fn legacy_upload_spec_cannot_validate_a_success_receipt_batch() {
-        let file = test_session_file("file-1", "video/a.mp4", 3);
-        let mut entry = test_entry(vec![file]);
-        entry.publication = Some(test_publication("rev-legacy"));
-        let spec = UploadJobSpec::new(entry.key(), "rev-legacy", "legacy-digest").unwrap();
-        let error = validate_upload_receipt_batch("upload-legacy", &spec, Some(&entry), &[])
-            .expect_err("legacy namespace is not enough to authorize success");
+            ));
+        }
+        let error = validate_upload_receipt_batch("upload-legacy", &spec, Some(&entry), &receipts)
+            .expect_err("legacy four-object namespace is not enough to authorize v4 success");
         assert!(error.contains("object namespace"), "{error}");
     }
 
@@ -9916,52 +12913,184 @@ mod tests {
         }
     }
 
-    /// A real signed publication used by tests that exercise `start_upload`
-    /// itself. The worker-start tests deliberately fail before the worker can
-    /// do any local-file or object-store work, but `start_upload` still must
-    /// pass its publication verifier before it reaches that boundary.
-    fn worker_start_failure_entry() -> LibraryEntry {
-        const FILE_SHA256: &str =
-            "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
-        const PUBLIC_KEY: &str = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c";
-        const SIGNATURE: &str =
-            "289245967e244c588b211aaffcb18f7fb6e3176b357f2555c629d34f844f5ec8f1607113fa63635691b049b56ad8c46489f77ab737774f9459daacd769dbb901";
+    /// Installs a small byte-level derived bundle around the exact synchronized
+    /// Score fixtures. The MP4 payload is deliberately tiny, but every source,
+    /// receipt, signature, digest, path, and v4 compatibility claim is checked
+    /// by the same production validators used by `start_upload`.
+    fn worker_start_failure_entry(library_root: &Path) -> LibraryEntry {
+        const SOURCE: &str = include_str!(
+            "../../contracts/fixtures/valid/ylx-device-session-v2.audio-recorded-multi-segment.json"
+        );
+        const RECEIPT: &str =
+            include_str!("../../contracts/fixtures/valid/ylx-derived-media-receipt-v1.json");
+        const LAB_V4_PUBLICATION_KEY_SEED: [u8; 32] = [
+            0x74, 0x93, 0x4f, 0x27, 0x6d, 0x8b, 0x1c, 0x55, 0xa0, 0xf2, 0x42, 0x38, 0x91, 0x63,
+            0xd4, 0x2a, 0x5f, 0x13, 0x8c, 0xe1, 0x97, 0x20, 0xab, 0x4d, 0x69, 0xbe, 0x03, 0x81,
+            0xca, 0x7d, 0x5e, 0x11,
+        ];
 
-        fn decode_hex(value: &str) -> Vec<u8> {
-            let bytes = value.as_bytes();
-            let mut decoded = Vec::with_capacity(bytes.len() / 2);
-            for index in (0..bytes.len()).step_by(2) {
-                let high = (bytes[index] as char).to_digit(16).expect("hex") as u8;
-                let low = (bytes[index + 1] as char).to_digit(16).expect("hex") as u8;
-                decoded.push((high << 4) | low);
+        fn collect_artifacts(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    let fields = [
+                        "artifact_id",
+                        "role",
+                        "path",
+                        "media_type",
+                        "bytes",
+                        "sha256",
+                    ];
+                    if fields.iter().all(|field| object.contains_key(*field)) {
+                        out.push(serde_json::json!({
+                            "id": object["artifact_id"],
+                            "display_path": object["path"],
+                            "role": object["role"],
+                            "size_bytes": object["bytes"],
+                            "sha256": object["sha256"],
+                            "media_type": object["media_type"],
+                        }));
+                        return;
+                    }
+                    for child in object.values() {
+                        collect_artifacts(child, out);
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for child in values {
+                        collect_artifacts(child, out);
+                    }
+                }
+                _ => {}
             }
-            decoded
         }
 
-        let payload = format!(
-            r#"{{"session_id":"sess-terminal-retry","revision":"rev-terminal","total_bytes":1,"files":[{{"id":"file-terminal","display_path":"video/terminal.mp4","size_bytes":1,"sha256":"{FILE_SHA256}"}}]}}"#
-        );
+        let source: serde_json::Value = serde_json::from_str(SOURCE).expect("Score v2 fixture");
+        let device_id = source["device"]["device_id"]
+            .as_str()
+            .expect("source device id");
+        let session_id = source["session_id"].as_str().expect("source session id");
+        let source_sha256 = hex_encode(&Sha256::digest(SOURCE.as_bytes()));
+        let revision = format!("sha256:{source_sha256}");
+        let mut files = Vec::new();
+        collect_artifacts(&source, &mut files);
+        files.sort_by(|left, right| {
+            left["display_path"]
+                .as_str()
+                .cmp(&right["display_path"].as_str())
+                .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
+        });
+        let total_bytes = files
+            .iter()
+            .map(|file| file["size_bytes"].as_u64().expect("artifact bytes"))
+            .sum::<u64>();
+        let video_bytes = files
+            .iter()
+            .filter(|file| {
+                file["role"]
+                    .as_str()
+                    .is_some_and(|role| role.starts_with("video."))
+            })
+            .map(|file| file["size_bytes"].as_u64().expect("video bytes"))
+            .sum::<u64>();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "source_schema": "ylx.device-session.v2",
+            "source_manifest_sha256": source_sha256,
+            "source_manifest_json": SOURCE,
+            "source_profile": "ylx-device-api-v4-lab-http",
+            "receipt_origin": "client-derived-lab-compatibility",
+            "device_authenticity": "not_asserted",
+            "gateway_verification": {
+                "actor": "gateway",
+                "validator": {
+                    "name": "openaria-conductor",
+                    "version": "0.1.0",
+                    "build_sha256": "a".repeat(64),
+                },
+                "manifest_sha256": source_sha256,
+                "manifest_digest_valid": true,
+                "verified_at": "2026-08-28T10:09:58Z",
+                "verdict": "usable",
+                "diagnostics": [],
+            },
+            "session_id": session_id,
+            "revision": revision,
+            "captured_at": source["time"]["started_at"],
+            "published_at": source["sealed_at"],
+            "duration_seconds": source["time"]["duration_seconds"],
+            "total_bytes": total_bytes,
+            "video_bytes": video_bytes,
+            "integrity_ok": true,
+            "files": files,
+        }))
+        .expect("serialize v4 compatibility publication");
+        let key_pair = Ed25519KeyPair::from_seed_unchecked(&LAB_V4_PUBLICATION_KEY_SEED)
+            .expect("lab-v4 publication key");
+
+        let output_bytes = b"tiny-derived-mp4-fixture";
+        let output_sha256 = hex_encode(&Sha256::digest(output_bytes));
+        let mut receipt: serde_json::Value =
+            serde_json::from_str(RECEIPT).expect("Score derived receipt fixture");
+        receipt["output"]["artifact_id"] = serde_json::json!(output_sha256);
+        receipt["output"]["bytes"] = serde_json::json!(output_bytes.len());
+        receipt["output"]["sha256"] = serde_json::json!(output_sha256);
+        receipt["timeline_verification"]["probe_summary"]["output_sha256"] =
+            serde_json::json!(output_sha256);
+        receipt["timeline_verification"]["probe_summary"]["output_bytes"] =
+            serde_json::json!(output_bytes.len());
+        let receipt_bytes = serde_json::to_vec_pretty(&receipt).expect("serialize receipt");
+
+        let staging =
+            SessionStaging::for_publication(library_root, device_id, session_id, &payload)
+                .expect("canonical staging identity");
+        let processed = staging.published_dir().join("processed");
+        std::fs::create_dir_all(&processed).expect("canonical processed directory");
+        std::fs::write(processed.join(format!("{session_id}.mp4")), output_bytes)
+            .expect("derived output fixture");
+        std::fs::write(processed.join("derived-media-receipt.json"), receipt_bytes)
+            .expect("derived receipt fixture");
+
+        let canonical = derived_media::canonical_assets_for_publication(
+            library_root,
+            device_id,
+            session_id,
+            &payload,
+        )
+        .expect("canonical fixture validates");
+        let source_files = files
+            .iter()
+            .map(|file| {
+                SessionFile::new(
+                    file["id"].as_str().expect("artifact id").to_string(),
+                    file["display_path"]
+                        .as_str()
+                        .expect("artifact path")
+                        .to_string(),
+                    file["size_bytes"].as_u64().expect("artifact size"),
+                    file["sha256"]
+                        .as_str()
+                        .expect("artifact digest")
+                        .to_string(),
+                )
+            })
+            .collect();
         LibraryEntry {
-            device_id: "dev-terminal".to_string(),
-            session_id: "sess-terminal-retry".to_string(),
+            device_id: device_id.to_string(),
+            session_id: session_id.to_string(),
             date_label: "today".to_string(),
             downloaded_at: "now".to_string(),
-            bytes: 1,
-            processed_files: Vec::new(),
-            files: vec![SessionFile::new(
-                "file-terminal".to_string(),
-                "video/terminal.mp4".to_string(),
-                1,
-                FILE_SHA256.to_string(),
-            )],
+            bytes: canonical.total_bytes,
+            processed_files: canonical.files,
+            files: source_files,
             complete: true,
+            download_projection_sequence: 0,
             publication: Some(PublicationEvidence {
-                revision: "rev-terminal".to_string(),
-                payload: payload.into_bytes(),
-                signature: decode_hex(SIGNATURE),
-                public_key: decode_hex(PUBLIC_KEY),
+                revision,
+                signature: key_pair.sign(&payload).as_ref().to_vec(),
+                public_key: key_pair.public_key().as_ref().to_vec(),
+                payload,
             }),
-            library_root: None,
+            library_root: Some(library_root.to_string_lossy().into_owned()),
             object_receipts: Vec::new(),
             upload_projection: None,
             upload_status: UploadStatus::None,
@@ -9969,6 +13098,142 @@ mod tests {
             uploaded_at: None,
             upload_error: None,
         }
+    }
+
+    /// Reuses the exact canonical derived fixture under another safe local
+    /// device directory. The signed source session remains unchanged; only
+    /// the desktop's directory identity varies, matching legacy/canonical-id
+    /// projection tests without weakening the production validators.
+    fn canonical_entry_for_device(library_root: &Path, device_id: &str) -> LibraryEntry {
+        let mut entry = worker_start_failure_entry(library_root);
+        if entry.device_id == device_id {
+            return entry;
+        }
+
+        let publication = entry.publication.as_ref().expect("canonical publication");
+        let source = SessionStaging::for_publication(
+            library_root,
+            &entry.device_id,
+            &entry.session_id,
+            &publication.payload,
+        )
+        .expect("source canonical staging")
+        .published_dir();
+        let target = SessionStaging::for_publication(
+            library_root,
+            device_id,
+            &entry.session_id,
+            &publication.payload,
+        )
+        .expect("target canonical staging")
+        .published_dir();
+        std::fs::create_dir_all(target.join("processed"))
+            .expect("target canonical processed directory");
+        for file in &entry.processed_files {
+            let destination = target.join(&file.display_path);
+            std::fs::create_dir_all(destination.parent().expect("canonical asset parent"))
+                .expect("canonical asset parent directory");
+            std::fs::copy(source.join(&file.display_path), destination)
+                .expect("copy canonical fixture asset");
+        }
+        entry.device_id = device_id.to_string();
+        entry
+    }
+
+    fn canonical_download_spec(entry: &LibraryEntry) -> JobSpec {
+        job_spec_from_context(
+            &entry.device_id,
+            &entry.session_id,
+            &entry.date_label,
+            &entry.files,
+            &entry.files,
+            entry.publication.as_ref().expect("canonical publication"),
+            true,
+        )
+        .expect("canonical full-session download spec")
+    }
+
+    fn mark_canonical_entry_backed_up(
+        library_root: &Path,
+        entry: &mut LibraryEntry,
+        prefix: &str,
+        job_id: &str,
+    ) {
+        let bundle = canonical_publication_bundle_for_entry(library_root, entry)
+            .expect("canonical publication bundle");
+        let plan = derived_publication_plan(prefix, &bundle).expect("derived publication plan");
+        let admission_key = test_admission_key(&plan);
+        let revision = entry
+            .publication
+            .as_ref()
+            .expect("canonical publication")
+            .revision
+            .clone();
+        let entry_key = entry.key();
+        let spec = UploadJobSpec::new_with_prefix(
+            entry_key.clone(),
+            revision.clone(),
+            "canonical-backup-digest",
+            prefix,
+        )
+        .expect("canonical backup spec");
+        let stored = vec![
+            stored_receipt(
+                job_id,
+                &entry_key,
+                &revision,
+                &plan.source_manifest_key.0,
+                UploadReceiptRole::Evidence,
+                bundle.source_manifest_bytes.len() as u64,
+                bundle.source_manifest_sha256,
+            ),
+            stored_receipt(
+                job_id,
+                &entry_key,
+                &revision,
+                &plan.receipt_key.0,
+                UploadReceiptRole::Evidence,
+                bundle.receipt_bytes.len() as u64,
+                bundle.receipt_sha256,
+            ),
+            stored_receipt(
+                job_id,
+                &entry_key,
+                &revision,
+                &plan.output_key.0,
+                UploadReceiptRole::Data,
+                bundle.output_bytes,
+                bundle.output_sha256,
+            ),
+            stored_receipt(
+                job_id,
+                &entry_key,
+                &revision,
+                &plan.marker_key.0,
+                UploadReceiptRole::Evidence,
+                plan.marker_bytes.len() as u64,
+                plan.marker_sha256.to_hex(),
+            ),
+            stored_receipt(
+                job_id,
+                &entry_key,
+                &revision,
+                &admission_key.0,
+                UploadReceiptRole::Evidence,
+                1,
+                "1".repeat(64),
+            ),
+        ];
+        entry.upload_status = UploadStatus::Done;
+        entry.uploaded_at = Some("2026-08-28T10:10:00Z".to_string());
+        entry.object_receipts = frontend_upload_receipts(&stored);
+        entry.upload_projection = Some(upload_projection_marker_for_spec(
+            job_id,
+            &spec,
+            &TerminalOutcome::Succeeded,
+            &stored,
+        ));
+        assert!(entry_has_complete_object_receipts(entry));
     }
 
     /// Fault-inject the application-store connection from another SQLite
@@ -10007,6 +13272,7 @@ mod tests {
             processed_files: Vec::new(),
             files,
             complete: true,
+            download_projection_sequence: 0,
             publication: None,
             library_root: None,
             object_receipts: Vec::new(),
@@ -10027,29 +13293,10 @@ mod tests {
     /// and the app still shows only one device's recordings.
     #[test]
     fn a_row_downloaded_under_a_previous_root_goes_incomplete_after_the_root_moves() {
-        fn entry_with_file(device_id: &str, root: &Path) -> LibraryEntry {
-            let file = crate::models::SessionFile::new(
-                "f1".to_string(),
-                "video.mp4".to_string(),
-                3,
-                String::new(),
-            );
-            let directory = root.join(device_id).join("sess1");
-            std::fs::create_dir_all(&directory).expect("session directory");
-            std::fs::write(directory.join("video.mp4"), b"abc").expect("downloaded file");
-            let mut entry = test_entry(vec![file]);
-            entry.device_id = device_id.to_string();
-            // A real download commit records the root it wrote under.
-            entry.library_root = Some(root.to_string_lossy().into_owned());
-            entry
-        }
-
         let previous_root = tempfile::tempdir().expect("previous root");
         let current_root = tempfile::tempdir().expect("current root");
-        // Each device's bytes really are on disk, just under the root that was
-        // configured when that download ran.
-        let older = entry_with_file("dev-a", previous_root.path());
-        let newer = entry_with_file("dev-b", current_root.path());
+        let older = canonical_entry_for_device(previous_root.path(), "dev-a");
+        let newer = canonical_entry_for_device(current_root.path(), "dev-b");
 
         let projected = project_library_entries(current_root.path(), &[older, newer]);
 
@@ -10071,15 +13318,7 @@ mod tests {
     #[test]
     fn a_legacy_row_without_a_recorded_root_still_resolves_against_the_current_one() {
         let root = tempfile::tempdir().expect("root");
-        let directory = root.path().join("dev1").join("sess1");
-        std::fs::create_dir_all(&directory).expect("session directory");
-        std::fs::write(directory.join("video.mp4"), b"abc").expect("downloaded file");
-        let mut entry = test_entry(vec![crate::models::SessionFile::new(
-            "f1".to_string(),
-            "video.mp4".to_string(),
-            3,
-            String::new(),
-        )]);
+        let mut entry = worker_start_failure_entry(root.path());
         entry.library_root = None;
 
         assert!(project_library_entries(root.path(), &[entry])[0].complete);
@@ -10090,15 +13329,7 @@ mod tests {
     #[test]
     fn a_stale_recorded_root_does_not_hide_a_library_the_user_moved() {
         let moved_to = tempfile::tempdir().expect("current root");
-        let directory = moved_to.path().join("dev1").join("sess1");
-        std::fs::create_dir_all(&directory).expect("session directory");
-        std::fs::write(directory.join("video.mp4"), b"abc").expect("downloaded file");
-        let mut entry = test_entry(vec![crate::models::SessionFile::new(
-            "f1".to_string(),
-            "video.mp4".to_string(),
-            3,
-            String::new(),
-        )]);
+        let mut entry = worker_start_failure_entry(moved_to.path());
         entry.library_root = Some("/nonexistent/old/root".to_string());
 
         assert!(project_library_entries(moved_to.path(), &[entry])[0].complete);
@@ -10232,141 +13463,95 @@ mod tests {
         assert!(!cancelled.retryable);
     }
 
-    fn cleanup_session(file: crate::models::SessionFile, status: DownloadStatus) -> SessionView {
-        let total_bytes = file.bytes;
+    fn cleanup_session(entry: &LibraryEntry, status: DownloadStatus) -> SessionView {
+        let total_bytes = entry.files.iter().map(|file| file.bytes).sum();
         SessionView {
             session: Session {
-                id: "sess1".to_string(),
-                revision: "rev-cleanup-1".to_string(),
+                id: entry.session_id.clone(),
+                revision: entry
+                    .publication
+                    .as_ref()
+                    .expect("cleanup publication")
+                    .revision
+                    .clone(),
                 date_label: "2026-08-03T10:00:00Z".to_string(),
                 duration_seconds: 1.0,
                 total_bytes,
                 video_bytes: total_bytes,
                 imu_samples: None,
-                files: vec![file],
+                files: entry.files.clone(),
             },
             download_status: status,
             backed_up: false,
+            verification: None,
         }
     }
 
-    fn complete_cleanup_entry(file: crate::models::SessionFile) -> LibraryEntry {
-        let mut entry = test_entry(vec![file]);
-        entry.publication = Some(test_publication("rev-cleanup-1"));
-        entry
+    fn status_only_session(session_id: &str) -> SessionView {
+        SessionView {
+            session: Session {
+                id: session_id.to_string(),
+                revision: format!("revision-{session_id}"),
+                date_label: "2026-08-29T00:00:00Z".to_string(),
+                duration_seconds: 1.0,
+                total_bytes: 1,
+                video_bytes: 1,
+                imu_samples: None,
+                files: Vec::new(),
+            },
+            download_status: DownloadStatus::None,
+            backed_up: false,
+            verification: None,
+        }
     }
 
-    fn backed_up_cleanup_entry(file: crate::models::SessionFile) -> LibraryEntry {
-        let mut entry = complete_cleanup_entry(file.clone());
-        entry.upload_status = UploadStatus::Done;
-        let entry_key = entry.key();
-        let revision = entry
-            .publication
-            .as_ref()
-            .expect("cleanup publication")
-            .revision
-            .clone();
-        let spec = UploadJobSpec::new_with_prefix(
-            entry_key.clone(),
-            revision.clone(),
-            "cleanup-digest",
-            "backups",
-        )
-        .unwrap();
-        let publication = entry.publication.as_ref().unwrap();
-        let mut stored = vec![StoredUploadReceipt {
-            job_id: "cleanup-upload".to_string(),
-            entry_key: entry_key.clone(),
-            revision: revision.clone(),
-            object_key: upload_object_key(
-                "backups",
-                &entry.device_id,
-                &entry.session_id,
-                &file.file_id,
+    fn seed_failed_status_job(comp: &Composition, job_id: &str, device_id: &str, session_id: &str) {
+        let spec = test_download_spec(device_id, session_id, "status-file", 1);
+        let mut store = comp.transfer_store.lock().unwrap();
+        store.create_job(job_id, &spec, "t0").unwrap();
+        store
+            .complete_job(
+                job_id,
+                &TerminalOutcome::Failed {
+                    code: "network".to_string(),
+                    retryable: true,
+                },
+                "t1",
             )
-            .0,
-            role: UploadReceiptRole::Data,
-            etag: "etag-data".to_string(),
-            version_id: Some("version-data".to_string()),
-            size_bytes: file.bytes,
-            source_sha256: file.sha256.clone(),
-            digest_proof: UploadReceiptDigestProof::ServerChecksum,
-            staged_at: "t0".to_string(),
-        }];
-        for (name, bytes) in [
-            (
-                PUBLICATION_SIGNATURE_OBJECT,
-                publication.signature.as_slice(),
-            ),
-            (
-                PUBLICATION_PUBLIC_KEY_OBJECT,
-                publication.public_key.as_slice(),
-            ),
-            (PUBLICATION_MANIFEST_OBJECT, publication.payload.as_slice()),
-        ] {
-            stored.push(StoredUploadReceipt {
-                job_id: "cleanup-upload".to_string(),
-                entry_key: entry_key.clone(),
-                revision: revision.clone(),
-                object_key: upload_evidence_object_key(
-                    "backups",
-                    &entry.device_id,
-                    &entry.session_id,
-                    name,
-                )
-                .0,
-                role: UploadReceiptRole::Evidence,
-                etag: format!("etag-{name}"),
-                version_id: None,
-                size_bytes: bytes.len() as u64,
-                source_sha256: Sha256::digest(bytes)
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect(),
-                digest_proof: UploadReceiptDigestProof::StreamedReadback,
-                staged_at: "t0".to_string(),
-            });
-        }
-        entry.object_receipts = frontend_upload_receipts(&stored);
-        entry.upload_projection = Some(upload_projection_marker_for_spec(
-            "cleanup-upload",
-            &spec,
-            &TerminalOutcome::Succeeded,
-            &stored,
-        ));
-        assert!(entry_has_complete_object_receipts(&entry));
+            .unwrap();
+    }
+
+    fn complete_cleanup_entry(library_root: &Path) -> LibraryEntry {
+        worker_start_failure_entry(library_root)
+    }
+
+    fn backed_up_cleanup_entry(library_root: &Path) -> LibraryEntry {
+        let mut entry = complete_cleanup_entry(library_root);
+        mark_canonical_entry_backed_up(library_root, &mut entry, "backups", "cleanup-upload");
         entry
     }
 
     #[test]
     fn library_projection_tracks_external_deletion_without_mutating_history() {
         let root = fresh_temp_dir("library-projection-deleted");
-        let file = test_session_file("file-video", "video/left_00000.mp4", 10);
-        let mut durable = complete_cleanup_entry(file.clone());
+        let mut durable = complete_cleanup_entry(&root);
+        let output_path = canonical_publication_bundle_for_entry(&root, &durable)
+            .expect("canonical bundle")
+            .output_path;
         durable.upload_status = UploadStatus::Done;
         durable.uploaded_at = Some("2026-08-03T10:00:00Z".to_string());
         durable.object_receipts = vec![ObjectVerificationReceipt {
-            key: "dev1/sess1/video/left_00000.mp4".to_string(),
+            key: "historical/object".to_string(),
             etag: "etag-1".to_string(),
             version_id: None,
-            bytes: 10,
-            sha256: file.sha256.clone(),
+            bytes: 1,
+            sha256: "0".repeat(64),
         }];
-        let path = derive_target_path_for_file(
-            &root,
-            &durable.device_id,
-            &durable.session_id,
-            &file.file_id,
-            Some(&file.display_path),
-        )
-        .unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, test_bytes(10)).unwrap();
 
         let present = project_library_entries(&root, std::slice::from_ref(&durable));
         assert!(present[0].complete);
 
-        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&output_path).unwrap();
         let missing = project_library_entries(&root, std::slice::from_ref(&durable));
         assert!(!missing[0].complete);
         assert_eq!(missing[0].upload_status, UploadStatus::Done);
@@ -10377,7 +13562,7 @@ mod tests {
             "read-only projection must not rewrite SQLite history"
         );
 
-        std::fs::write(&path, test_bytes(9)).unwrap();
+        std::fs::write(&output_path, test_bytes(9)).unwrap();
         let wrong_size = project_library_entries(&root, std::slice::from_ref(&durable));
         assert!(!wrong_size[0].complete);
 
@@ -10385,10 +13570,10 @@ mod tests {
     }
 
     #[test]
-    fn library_projection_keeps_legacy_opaque_downloads_visible() {
+    fn library_projection_fails_closed_for_legacy_raw_only_downloads() {
         let root = fresh_temp_dir("library-projection-legacy");
         let file = test_session_file("f-legacy-opaque", "video/left_00000.mp4", 10);
-        let durable = complete_cleanup_entry(file.clone());
+        let durable = test_entry(vec![file.clone()]);
         let legacy_path = derive_target_path(
             &root,
             &durable.device_id,
@@ -10400,7 +13585,10 @@ mod tests {
         std::fs::write(&legacy_path, test_bytes(10)).unwrap();
 
         let projected = project_library_entries(&root, std::slice::from_ref(&durable));
-        assert!(projected[0].complete);
+        assert!(
+            !projected[0].complete,
+            "raw-only legacy bytes cannot be projected as a usable derived library"
+        );
 
         std::fs::remove_dir_all(root).ok();
     }
@@ -10426,27 +13614,175 @@ mod tests {
     }
 
     #[test]
+    fn local_status_batches_canonical_and_unique_legacy_job_history_for_the_current_page() {
+        let dir = fresh_temp_dir("local-status-unique-legacy-batch");
+        let comp = test_composition(&dir, Vec::new());
+        let canonical_id = register_test_device(&comp, "d");
+        let legacy_id = comp
+            .resolve_binding(&canonical_id)
+            .unwrap()
+            .identity
+            .display_id()
+            .to_string();
+        seed_failed_status_job(
+            &comp,
+            "job-canonical-status",
+            &canonical_id,
+            "session-canonical",
+        );
+        seed_failed_status_job(&comp, "job-legacy-status", &legacy_id, "session-legacy");
+        seed_failed_status_job(
+            &comp,
+            "job-unrelated-session",
+            &canonical_id,
+            "session-not-on-page",
+        );
+
+        let mut sessions = vec![
+            status_only_session("session-canonical"),
+            status_only_session("session-legacy"),
+            status_only_session("session-without-history"),
+        ];
+        comp.apply_local_session_state(&canonical_id, &[], &mut sessions)
+            .expect("apply one scoped durable snapshot");
+
+        assert_eq!(sessions[0].download_status, DownloadStatus::Failed);
+        assert_eq!(sessions[1].download_status, DownloadStatus::Failed);
+        assert_eq!(sessions[2].download_status, DownloadStatus::None);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn ambiguous_legacy_alias_is_not_a_download_job_lookup_key() {
+        let dir = fresh_temp_dir("local-status-ambiguous-legacy");
+        let comp = test_composition(&dir, Vec::new());
+        let registration_a = comp
+            .register_endpoint(DeviceEndpoint {
+                host: "192.0.2.31".to_string(),
+                port: 8443,
+                tls_fingerprint: format!("sha256:abcdef01{}", "1".repeat(56)),
+                name: "Pi A".to_string(),
+                display_label: None,
+                api_profile: DeviceApiProfile::LegacyPinnedTlsV1,
+            })
+            .unwrap();
+        let registration_b = comp
+            .register_endpoint(DeviceEndpoint {
+                host: "192.0.2.32".to_string(),
+                port: 8443,
+                tls_fingerprint: format!("sha256:abcdef01{}", "2".repeat(56)),
+                name: "Pi B".to_string(),
+                display_label: None,
+                api_profile: DeviceApiProfile::LegacyPinnedTlsV1,
+            })
+            .unwrap();
+        let canonical_id = registration_a.identity.device_id().as_str().to_string();
+        let ambiguous_alias = registration_a.identity.display_id().to_string();
+        assert_eq!(
+            ambiguous_alias,
+            registration_b.identity.display_id().to_string()
+        );
+        seed_failed_status_job(
+            &comp,
+            "job-ambiguous-alias",
+            &ambiguous_alias,
+            "session-alias-only",
+        );
+        seed_failed_status_job(
+            &comp,
+            "job-canonical-visible",
+            &canonical_id,
+            "session-canonical",
+        );
+
+        let mut sessions = vec![
+            status_only_session("session-alias-only"),
+            status_only_session("session-canonical"),
+        ];
+        comp.apply_local_session_state(&canonical_id, &[], &mut sessions)
+            .expect("ambiguous history is ignored, not an identity error");
+
+        assert_eq!(sessions[0].download_status, DownloadStatus::None);
+        assert_eq!(sessions[1].download_status, DownloadStatus::Failed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn ordinary_session_refresh_does_not_verify_tampered_media_but_explicit_actions_do() {
+        let dir = fresh_temp_dir("ordinary-refresh-zero-strong-media-verification");
+        let comp = Arc::new(test_composition(&dir, Vec::new()));
+        let canonical_id = register_test_device(&comp, "c");
+        let entry = canonical_entry_for_device(&comp.library_root(), &canonical_id);
+        let bundle = canonical_publication_bundle_for_entry(&comp.library_root(), &entry)
+            .expect("baseline canonical bundle");
+        let initial_session = cleanup_session(&entry, DownloadStatus::Done);
+        let (eligible, skipped) = downloaded_cleanup_candidates_with_match(
+            &comp.library_root(),
+            &canonical_id,
+            std::slice::from_ref(&initial_session),
+            std::slice::from_ref(&entry),
+            |stored, current| comp.device_ids_match(stored, current),
+        );
+        assert!(skipped.is_empty());
+        let candidate = eligible.into_iter().next().expect("baseline candidate");
+
+        let output_size = std::fs::metadata(&bundle.output_path).unwrap().len() as usize;
+        std::fs::write(&bundle.output_path, vec![b'y'; output_size]).unwrap();
+        derived_media::reset_strong_media_verification_count();
+        reset_strong_local_file_hash_count();
+
+        let mut ordinary = vec![cleanup_session(&entry, DownloadStatus::None)];
+        comp.apply_local_session_state(&canonical_id, std::slice::from_ref(&entry), &mut ordinary)
+            .expect("ordinary refresh uses durable in-memory projection");
+        assert_eq!(ordinary[0].download_status, DownloadStatus::Done);
+        assert_eq!(
+            derived_media::strong_media_verification_count(),
+            0,
+            "session refresh must not inspect the canonical media bundle"
+        );
+        assert_eq!(
+            strong_local_file_hash_count(),
+            0,
+            "session refresh must not open, read, or hash canonical MP4 bytes"
+        );
+
+        let cleanup_error = comp
+            .revalidate_downloaded_candidate(&canonical_id, &candidate)
+            .expect_err("delete authorization must strongly revalidate the MP4");
+        assert!(
+            cleanup_error.contains("SHA-256 与签名 publication 不一致"),
+            "{cleanup_error}"
+        );
+        assert!(strong_local_file_hash_count() > 0);
+
+        derived_media::reset_strong_media_verification_count();
+        reset_strong_local_file_hash_count();
+        let app = tauri::test::mock_app();
+        let upload_error = start_upload(
+            app.handle().clone(),
+            comp.clone(),
+            StorageConfig::default(),
+            entry,
+        )
+        .expect_err("upload admission must strongly revalidate the MP4");
+        assert!(upload_error.contains("不能上传"), "{upload_error}");
+        assert!(derived_media::strong_media_verification_count() > 0);
+
+        drop(app);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn cleanup_after_restart_uses_verified_library_without_runtime_status() {
         let root = fresh_temp_dir("cleanup-restart-library");
-        let file = test_session_file("video.mp4", "video/main.mp4", 10);
-        let entry = complete_cleanup_entry(file.clone());
-        let path = derive_target_path_for_file(
-            &root,
-            &entry.device_id,
-            &entry.session_id,
-            &file.file_id,
-            Some(&file.display_path),
-        )
-        .unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, test_bytes(10)).unwrap();
+        let entry = complete_cleanup_entry(&root);
 
         let status = download_status_for_local_state(
             entry_has_complete_local_files(&root, &entry),
             false,
             false,
         );
-        let session = cleanup_session(file, status);
+        let session = cleanup_session(&entry, status);
         let (eligible, skipped) = downloaded_cleanup_candidates(
             &root,
             &entry.device_id,
@@ -10468,20 +13804,11 @@ mod tests {
         let identity = comp.resolve_binding(&canonical_id).unwrap().identity;
         let legacy_id = identity.display_id().to_string();
         let root = comp.library_root();
-        let file = test_session_file("video.mp4", "video/main.mp4", 10);
-        let mut entry = complete_cleanup_entry(file.clone());
-        entry.device_id = legacy_id.clone();
-        let legacy_path = derive_target_path_for_file(
-            &root,
-            &entry.device_id,
-            &entry.session_id,
-            &file.file_id,
-            Some(&file.display_path),
-        )
-        .unwrap();
-        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
-        std::fs::write(&legacy_path, test_bytes(10)).unwrap();
-        let session = cleanup_session(file, DownloadStatus::Done);
+        let entry = canonical_entry_for_device(&root, &legacy_id);
+        let legacy_path = canonical_publication_bundle_for_entry(&root, &entry)
+            .expect("legacy-id canonical bundle")
+            .output_path;
+        let session = cleanup_session(&entry, DownloadStatus::Done);
 
         let (eligible, skipped) = downloaded_cleanup_candidates_with_match(
             &root,
@@ -10505,29 +13832,25 @@ mod tests {
     #[test]
     fn downloaded_cleanup_selects_only_done_sessions_with_real_exact_size_files() {
         let root = fresh_temp_dir("downloaded-cleanup-exact");
-        let file = test_session_file("video.mp4", "video/main.mp4", 10);
-        let entry = complete_cleanup_entry(file.clone());
-        let path = derive_target_path_for_file(
-            &root,
-            "dev1",
-            "sess1",
-            "video.mp4",
-            Some("video/main.mp4"),
-        )
-        .unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, test_bytes(10)).unwrap();
+        let entry = complete_cleanup_entry(&root);
 
-        let done = cleanup_session(file.clone(), DownloadStatus::Done);
-        let mut not_done = cleanup_session(file, DownloadStatus::Failed);
+        let done = cleanup_session(&entry, DownloadStatus::Done);
+        let mut not_done = cleanup_session(&entry, DownloadStatus::Failed);
         not_done.session.id = "sess-failed".to_string();
-        let (eligible, skipped) =
-            downloaded_cleanup_candidates(&root, "dev1", &[done, not_done], &[entry]);
+        let (eligible, skipped) = downloaded_cleanup_candidates(
+            &root,
+            &entry.device_id,
+            &[done, not_done],
+            std::slice::from_ref(&entry),
+        );
 
         assert_eq!(eligible.len(), 1);
-        assert_eq!(eligible[0].session_id, "sess1");
-        assert_eq!(eligible[0].revision, "rev-cleanup-1");
-        assert_eq!(eligible[0].bytes, 10);
+        assert_eq!(eligible[0].session_id, entry.session_id);
+        assert_eq!(
+            eligible[0].revision,
+            entry.publication.as_ref().unwrap().revision
+        );
+        assert_eq!(eligible[0].bytes, entry.bytes);
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].session_id, "sess-failed");
         assert!(skipped[0].reason.contains("失败"));
@@ -10538,36 +13861,33 @@ mod tests {
     #[test]
     fn downloaded_cleanup_skips_done_state_when_a_local_file_is_missing_or_wrong_size() {
         let root = fresh_temp_dir("downloaded-cleanup-missing");
-        let file = test_session_file("video.mp4", "video/main.mp4", 10);
-        let entry = complete_cleanup_entry(file.clone());
-        let session = cleanup_session(file, DownloadStatus::Done);
+        let entry = complete_cleanup_entry(&root);
+        let output_path = canonical_publication_bundle_for_entry(&root, &entry)
+            .expect("canonical bundle")
+            .output_path;
+        std::fs::remove_file(&output_path).unwrap();
+        let session = cleanup_session(&entry, DownloadStatus::Done);
 
         let (eligible, skipped) = downloaded_cleanup_candidates(
             &root,
-            "dev1",
+            &entry.device_id,
             std::slice::from_ref(&session),
             std::slice::from_ref(&entry),
         );
         assert!(eligible.is_empty());
         assert_eq!(skipped.len(), 1);
-        assert!(skipped[0].reason.contains("缺失"));
+        assert!(skipped[0].reason.contains("规范 MP4"));
 
-        let path = derive_target_path_for_file(
+        std::fs::write(&output_path, test_bytes(9)).unwrap();
+        let (eligible, skipped) = downloaded_cleanup_candidates(
             &root,
-            "dev1",
-            "sess1",
-            "video.mp4",
-            Some("video/main.mp4"),
-        )
-        .unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, test_bytes(9)).unwrap();
-        let (eligible, skipped) =
-            downloaded_cleanup_candidates(&root, "dev1", &[session], &[entry]);
+            &entry.device_id,
+            &[session],
+            std::slice::from_ref(&entry),
+        );
         assert!(eligible.is_empty());
         assert_eq!(skipped.len(), 1);
-        assert!(skipped[0].reason.contains("video/main.mp4"));
-        assert!(skipped[0].reason.contains("9"));
+        assert!(skipped[0].reason.contains("规范 MP4"));
 
         std::fs::remove_dir_all(root).ok();
     }
@@ -10575,29 +13895,23 @@ mod tests {
     #[test]
     fn downloaded_cleanup_skips_same_size_hash_mismatch() {
         let root = fresh_temp_dir("downloaded-cleanup-hash-mismatch");
-        let file = test_session_file("video.mp4", "video/main.mp4", 10);
-        let entry = complete_cleanup_entry(file.clone());
-        let path = derive_target_path_for_file(
-            &root,
-            "dev1",
-            "sess1",
-            "video.mp4",
-            Some("video/main.mp4"),
-        )
-        .unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, vec![b'y'; 10]).unwrap();
+        let entry = complete_cleanup_entry(&root);
+        let output_path = canonical_publication_bundle_for_entry(&root, &entry)
+            .expect("canonical bundle")
+            .output_path;
+        let output_bytes = std::fs::metadata(&output_path).unwrap().len() as usize;
+        std::fs::write(output_path, vec![b'y'; output_bytes]).unwrap();
 
         let (eligible, skipped) = downloaded_cleanup_candidates(
             &root,
-            "dev1",
-            &[cleanup_session(file, DownloadStatus::Done)],
-            &[entry],
+            &entry.device_id,
+            &[cleanup_session(&entry, DownloadStatus::Done)],
+            std::slice::from_ref(&entry),
         );
 
         assert!(eligible.is_empty());
         assert_eq!(skipped.len(), 1);
-        assert!(skipped[0].reason.contains("SHA-256"));
+        assert!(skipped[0].reason.contains("规范 MP4"));
 
         std::fs::remove_dir_all(root).ok();
     }
@@ -10605,24 +13919,13 @@ mod tests {
     #[test]
     fn downloaded_cleanup_skips_ambiguous_duplicate_library_rows() {
         let root = fresh_temp_dir("downloaded-cleanup-duplicate");
-        let file = test_session_file("video.mp4", "video/main.mp4", 10);
-        let entry = complete_cleanup_entry(file.clone());
-        let path = derive_target_path_for_file(
-            &root,
-            "dev1",
-            "sess1",
-            "video.mp4",
-            Some("video/main.mp4"),
-        )
-        .unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, test_bytes(10)).unwrap();
+        let entry = complete_cleanup_entry(&root);
 
         let (eligible, skipped) = downloaded_cleanup_candidates(
             &root,
-            "dev1",
-            &[cleanup_session(file, DownloadStatus::Done)],
-            &[entry.clone(), entry],
+            &entry.device_id,
+            &[cleanup_session(&entry, DownloadStatus::Done)],
+            &[entry.clone(), entry.clone()],
         );
         assert!(eligible.is_empty());
         assert_eq!(skipped.len(), 1);
@@ -10646,20 +13949,9 @@ mod tests {
     #[test]
     fn backed_up_cleanup_revalidation_refuses_a_new_pi_revision() {
         let root = fresh_temp_dir("backed-up-cleanup-revision-race");
-        let file = test_session_file("video.mp4", "video/main.mp4", 10);
-        let entry = backed_up_cleanup_entry(file.clone());
-        let path = derive_target_path_for_file(
-            &root,
-            &entry.device_id,
-            &entry.session_id,
-            &file.file_id,
-            Some(&file.display_path),
-        )
-        .unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, test_bytes(10)).unwrap();
+        let entry = backed_up_cleanup_entry(&root);
 
-        let mut selected = cleanup_session(file, DownloadStatus::Done);
+        let mut selected = cleanup_session(&entry, DownloadStatus::Done);
         selected.backed_up = true;
         let (eligible, skipped) = downloaded_cleanup_candidates(
             &root,
@@ -10683,7 +13975,10 @@ mod tests {
         .expect_err("an advanced Pi revision must stop automatic cleanup before DELETE");
 
         assert!(error.contains("revision"), "{error}");
-        assert_eq!(candidate.revision, "rev-cleanup-1");
+        assert_eq!(
+            candidate.revision,
+            entry.publication.as_ref().unwrap().revision
+        );
         assert_ne!(
             downloaded_cleanup_idempotency_key(
                 &entry.device_id,
@@ -10725,18 +14020,22 @@ mod tests {
 
     #[test]
     fn require_entry_has_local_files_rejects_empty_file_list() {
-        // `entry.files` empty is today's universal case for any entry
-        // actually reachable through the UI (see `perform_upload`'s doc
-        // comment) -- this proves that state produces an honest,
-        // human-readable error rather than a silent no-op or a panic.
         let entry = test_entry(Vec::new());
         assert!(require_entry_has_local_files(&entry).is_err());
     }
 
     #[test]
-    fn require_entry_has_local_files_accepts_a_non_empty_file_list() {
+    fn require_entry_has_local_files_rejects_a_non_empty_raw_inventory() {
         let entry = test_entry(vec![test_session_file("video.mp4", "video/main.mp4", 10)]);
+        assert!(require_entry_has_local_files(&entry).is_err());
+    }
+
+    #[test]
+    fn require_entry_has_local_files_accepts_a_canonical_derived_bundle() {
+        let root = fresh_temp_dir("require-canonical-local-files");
+        let entry = worker_start_failure_entry(&root);
         assert!(require_entry_has_local_files(&entry).is_ok());
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -10912,6 +14211,259 @@ mod tests {
         );
 
         drop(store);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn multipart_track_failure_aborts_remote_and_returns_original_error() {
+        let root = fresh_temp_dir("upload-track-failure-clean");
+        let (transfer_store, expected_version, context) =
+            started_upload_context_fixture(&root, "upload-track-failure-clean");
+        let remote = MemoryObjectStore::new();
+        let key = ObjectKey("prefix/dev-upload/sess-upload/evidence.bin".to_string());
+
+        // A stale job version makes the durable track write fail after the
+        // provider has already handed us a live multipart handle.
+        let stale_context = test_upload_context(
+            &root,
+            transfer_store.clone(),
+            "upload-track-failure-clean",
+            expected_version + 1,
+            context.cancel.clone(),
+        );
+        let error = upload_bytes_object(
+            &remote,
+            key,
+            b"evidence",
+            "application/octet-stream",
+            &stale_context,
+        )
+        .expect_err("stale track write must fail");
+
+        let detail = error.detail().expect("track failure has a detail");
+        assert!(detail.contains("无法记录在途分片上传"));
+        assert!(
+            !detail.contains("清理未完成"),
+            "successful cleanup must preserve only the original error: {detail}"
+        );
+        assert_eq!(
+            remote.in_progress_upload_count(),
+            0,
+            "a tracked-handle failure must abort the remote multipart upload"
+        );
+        assert!(
+            transfer_store
+                .lock()
+                .unwrap()
+                .list_pending_uploads()
+                .unwrap()
+                .is_empty(),
+            "track failure must not create a durable row"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn multipart_track_and_abort_failure_reports_retryable_incomplete_cleanup() {
+        let root = fresh_temp_dir("upload-track-failure-aborting");
+        let (transfer_store, expected_version, context) =
+            started_upload_context_fixture(&root, "upload-track-failure-aborting");
+        let remote = MemoryObjectStore::new();
+        remote.queue_fault(
+            FaultPoint::AbortMultipartUpload,
+            ObjectStoreError::Network("cleanup unavailable".to_string()),
+        );
+        let key = ObjectKey("prefix/dev-upload/sess-upload/evidence.bin".to_string());
+        let stale_context = test_upload_context(
+            &root,
+            transfer_store.clone(),
+            "upload-track-failure-aborting",
+            expected_version + 1,
+            context.cancel.clone(),
+        );
+
+        let error = upload_bytes_object(
+            &remote,
+            key.clone(),
+            b"evidence",
+            "application/octet-stream",
+            &stale_context,
+        )
+        .expect_err("stale track write must fail");
+
+        let outcome = error.terminal_outcome();
+        assert!(
+            matches!(
+                outcome,
+                TerminalOutcome::Failed {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "an untracked remote handle with failed cleanup must be retryable: {outcome:?}"
+        );
+        let detail = error.detail().expect("track/cleanup failure has a detail");
+        assert!(
+            detail.contains("cleanup_incomplete"),
+            "missing stable cleanup marker: {detail}"
+        );
+        assert!(
+            detail.contains("object_key="),
+            "missing remote object identity: {detail}"
+        );
+        assert!(
+            detail.contains("upload_id="),
+            "missing remote upload identity: {detail}"
+        );
+        assert!(
+            detail.contains(&key.0),
+            "object identity must be actionable: {detail}"
+        );
+        assert!(
+            detail.contains("cleanup unavailable"),
+            "missing cleanup cause: {detail}"
+        );
+        assert!(
+            !detail.contains("access") && !detail.contains("secret"),
+            "diagnostic must not expose credential labels: {detail}"
+        );
+        assert_eq!(
+            remote.in_progress_upload_count(),
+            1,
+            "failed cleanup must leave the remote handle observable for operator cleanup"
+        );
+        assert!(
+            transfer_store
+                .lock()
+                .unwrap()
+                .list_pending_uploads()
+                .unwrap()
+                .is_empty(),
+            "the failed track write cannot pretend to have a durable ownership row"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn track_failure_with_a_durable_row_reconciles_that_row_before_returning_error() {
+        let root = fresh_temp_dir("upload-track-failure-durable-row");
+        let (transfer_store, expected_version, context) =
+            started_upload_context_fixture(&root, "upload-track-failure-durable-row");
+        let remote = MemoryObjectStore::new();
+        let key = ObjectKey("prefix/dev-upload/sess-upload/evidence.bin".to_string());
+        let handle = remote
+            .initiate_multipart_upload(InitiateUploadRequest {
+                key: key.clone(),
+                content_length: 8,
+                source_sha256: SourceSha256::from_bytes(Sha256::digest(b"evidence").into()),
+                content_type: Some("application/octet-stream".to_string()),
+            })
+            .expect("initiate multipart upload");
+        transfer_store
+            .lock()
+            .unwrap()
+            .begin_upload_for_job(
+                "upload-track-failure-durable-row",
+                expected_version,
+                &NewUpload {
+                    transfer_key: context.transfer_key.clone(),
+                    entry_key: context.entry_key.clone(),
+                    revision: context.revision.clone(),
+                    object_key: handle.key.0.clone(),
+                    upload_id: handle.upload_id.0.clone(),
+                    endpoint: context.endpoint.clone(),
+                    bucket: context.bucket.clone(),
+                    url_style: context.url_style,
+                },
+                "t2",
+            )
+            .expect("seed the row that an ambiguous track commit could leave");
+
+        let track_error = UploadPipelineError::internal("injected ambiguous track failure");
+        let error = abort_multipart_after_track_failure(&context, &remote, &handle, track_error);
+        assert_eq!(
+            error.detail(),
+            Some("injected ambiguous track failure"),
+            "successful cleanup must preserve the original tracking error"
+        );
+        assert_eq!(remote.in_progress_upload_count(), 0);
+        assert!(transfer_store
+            .lock()
+            .unwrap()
+            .list_pending_uploads()
+            .unwrap()
+            .is_empty());
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn track_failure_never_aborts_a_durable_row_owned_by_another_upload() {
+        let root = fresh_temp_dir("upload-track-failure-ownership-conflict");
+        let (transfer_store, _expected_version, context) =
+            started_upload_context_fixture(&root, "upload-track-failure-ownership-conflict");
+        let remote = MemoryObjectStore::new();
+        let key = ObjectKey("prefix/dev-upload/sess-upload/evidence.bin".to_string());
+        let handle = remote
+            .initiate_multipart_upload(InitiateUploadRequest {
+                key: key.clone(),
+                content_length: 8,
+                source_sha256: SourceSha256::from_bytes(Sha256::digest(b"evidence").into()),
+                content_type: Some("application/octet-stream".to_string()),
+            })
+            .expect("initiate multipart upload");
+        transfer_store
+            .lock()
+            .unwrap()
+            .begin_upload(
+                &NewUpload {
+                    transfer_key: "different-transfer".to_string(),
+                    entry_key: "different-entry".to_string(),
+                    revision: "different-revision".to_string(),
+                    object_key: handle.key.0.clone(),
+                    upload_id: handle.upload_id.0.clone(),
+                    endpoint: context.endpoint.clone(),
+                    bucket: context.bucket.clone(),
+                    url_style: context.url_style,
+                },
+                "t2",
+            )
+            .expect("seed a conflicting legacy row");
+
+        let error = abort_multipart_after_track_failure(
+            &context,
+            &remote,
+            &handle,
+            UploadPipelineError::internal("injected ownership conflict"),
+        );
+        assert!(error
+            .detail()
+            .expect("ownership conflict has a detail")
+            .contains("remote abort withheld"));
+        assert!(matches!(
+            error.terminal_outcome(),
+            TerminalOutcome::Failed {
+                retryable: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            remote.in_progress_upload_count(),
+            1,
+            "a handle owned by another upload must never be aborted here"
+        );
+        assert_eq!(
+            transfer_store
+                .lock()
+                .unwrap()
+                .list_pending_uploads()
+                .unwrap()
+                .len(),
+            1
+        );
+
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -11222,12 +14774,11 @@ mod tests {
         .expect("valid test download spec")
     }
 
-    /// Commit 34: the single-file recovery context that used to round-trip
-    /// through `pending-downloads.json` now round-trips through the durable
-    /// `JobSpec` -- including the `full_session = false` distinction the
-    /// completion path needs to tell a partial copy from a complete session.
+    /// A historical partial recovery record still round-trips through the
+    /// durable store so current builds can recognize it and refuse to publish
+    /// it. No current command can create this specification.
     #[test]
-    fn durable_spec_round_trips_single_file_recovery_context() {
+    fn historical_partial_spec_round_trips_only_for_fail_closed_compatibility() {
         let root = fresh_temp_dir("durable-spec-round-trip");
         let requested = vec![test_session_file("file-p", "recording/file-p", 12)];
         let mut inventory = requested.clone();
@@ -11661,12 +15212,13 @@ mod tests {
             comp.background_loops.lock().unwrap().is_empty(),
             "stage 2 must not start any background loop"
         );
-        // Stage 3's recovery is an explicit, separate step -- it does not
-        // start loops either.
-        comp.recover_on_startup();
+        // Stage 3's interruption settlement is an explicit, separate step --
+        // it does not start loops or schedule transfer work either.
+        comp.fail_interrupted_downloads_on_startup()
+            .expect("settle an empty transfer store");
         assert!(
             comp.background_loops.lock().unwrap().is_empty(),
-            "startup recovery must not start any background loop"
+            "startup interruption settlement must not start any background loop"
         );
         // And with nothing started, shutdown is a no-op rather than a panic.
         comp.shutdown_background_loops();
@@ -11738,8 +15290,8 @@ mod tests {
     }
 
     #[test]
-    fn single_file_success_stays_partial_until_inventory_is_complete() {
-        let root = fresh_temp_dir("single-file-partial");
+    fn historical_partial_success_cannot_create_a_library_entry() {
+        let root = fresh_temp_dir("historical-partial");
         let requested = vec![test_session_file("file-2", "recording/file-2", 4)];
         let inventory = vec![
             test_session_file("file-1", "video/left.mp4", 3),
@@ -11752,22 +15304,23 @@ mod tests {
         std::fs::write(target_dir.join("file-2"), test_bytes(4)).unwrap();
 
         let mut library = Vec::new();
-        assert!(apply_terminal_download(
+        assert!(!apply_terminal_download(
             &mut library,
             &root,
             &spec,
             &TransferJobState::Succeeded,
         ));
-        assert_eq!(library.len(), 1);
-        assert_eq!(library[0].files, requested);
-        assert!(!library[0].complete);
+        assert!(
+            library.is_empty(),
+            "a selected raw file is not a canonical derived publication"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn single_file_success_merges_without_overwriting_existing_files() {
-        let root = fresh_temp_dir("single-file-merge");
+    fn historical_partial_success_does_not_mutate_an_existing_library_entry() {
+        let root = fresh_temp_dir("historical-partial-existing");
         let requested = vec![test_session_file("file-2", "recording/file-2", 4)];
         let first = test_session_file("file-1", "video/left.mp4", 3);
         let inventory = vec![first.clone(), requested[0].clone()];
@@ -11778,7 +15331,7 @@ mod tests {
         std::fs::write(target_dir.join("file-1"), test_bytes(3)).unwrap();
         std::fs::write(target_dir.join("file-2"), test_bytes(4)).unwrap();
 
-        let mut library = vec![LibraryEntry {
+        let existing = LibraryEntry {
             device_id: "dev-merge".to_string(),
             session_id: "sess-merge".to_string(),
             date_label: "earlier".to_string(),
@@ -11787,6 +15340,7 @@ mod tests {
             processed_files: Vec::new(),
             files: vec![first],
             complete: false,
+            download_projection_sequence: 0,
             publication: Some(publication_evidence_from_job_spec(&spec)),
             library_root: None,
             object_receipts: Vec::new(),
@@ -11795,21 +15349,17 @@ mod tests {
             upload_retryable: false,
             uploaded_at: Some("earlier".to_string()),
             upload_error: None,
-        }];
-        assert!(apply_terminal_download(
+        };
+        let existing_bytes = serde_json::to_vec(&existing).unwrap();
+        let mut library = vec![existing.clone()];
+        assert!(!apply_terminal_download(
             &mut library,
             &root,
             &spec,
             &TransferJobState::Succeeded,
         ));
         assert_eq!(library.len(), 1);
-        assert_eq!(library[0].files.len(), 2);
-        assert!(library[0].files.iter().any(|file| file.file_id == "file-1"));
-        assert!(library[0].files.iter().any(|file| file.file_id == "file-2"));
-        assert_eq!(library[0].bytes, 7);
-        assert!(library[0].complete);
-        assert_eq!(library[0].upload_status, UploadStatus::None);
-        assert_eq!(library[0].uploaded_at, None);
+        assert_eq!(serde_json::to_vec(&library[0]).unwrap(), existing_bytes);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -11838,12 +15388,10 @@ mod tests {
     }
 
     #[test]
-    fn succeeded_state_with_a_real_file_upserts_a_library_entry() {
+    fn succeeded_state_with_a_canonical_bundle_upserts_a_library_entry() {
         let root = fresh_temp_dir("real-file");
-        let spec = test_download_spec("dev-ok", "sess-ok", "video.mp4", 10);
-        let target_dir = root.join("dev-ok").join("sess-ok");
-        std::fs::create_dir_all(&target_dir).unwrap();
-        std::fs::write(target_dir.join("video.mp4"), test_bytes(10)).unwrap();
+        let expected = worker_start_failure_entry(&root);
+        let spec = canonical_download_spec(&expected);
 
         let mut library = Vec::new();
         assert!(apply_terminal_download(
@@ -11854,26 +15402,44 @@ mod tests {
         ));
 
         assert_eq!(library.len(), 1);
-        assert_eq!(library[0].device_id, "dev-ok");
-        assert_eq!(library[0].session_id, "sess-ok");
-        assert_eq!(library[0].bytes, 10);
+        assert_eq!(library[0].device_id, expected.device_id);
+        assert_eq!(library[0].session_id, expected.session_id);
+        assert_eq!(library[0].bytes, expected.bytes);
+        assert_eq!(library[0].processed_files, expected.processed_files);
         assert_eq!(library[0].upload_status, UploadStatus::None);
 
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn full_session_terminal_verification_resolves_each_file_once() {
+    fn retryable_failed_state_with_a_canonical_bundle_is_not_library_complete_or_upload_ready() {
+        let root = fresh_temp_dir("failed-after-canonical-publication");
+        let expected = worker_start_failure_entry(&root);
+        let spec = canonical_download_spec(&expected);
+        let mut library = Vec::new();
+
+        assert!(!apply_terminal_download(
+            &mut library,
+            &root,
+            &spec,
+            &TransferJobState::Failed {
+                code: FailureCode::Other("source staging cleanup failed".to_string()),
+                retryable: true,
+            },
+        ));
+
+        assert!(
+            library.is_empty(),
+            "a visible canonical bundle cannot override the failed completion authority"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn full_session_terminal_verification_uses_the_canonical_bundle() {
         let root = fresh_temp_dir("full-session-verification-count");
-        let mut requested = vec![test_session_file("file-a", "recording/file-a", 3)];
-        let second = test_session_file("file-b", "recording/file-b", 4);
-        requested.push(second);
-        let spec =
-            test_download_spec_from_files("dev-count", "sess-count", &requested, &requested, true);
-        let target_dir = root.join("dev-count").join("sess-count");
-        std::fs::create_dir_all(&target_dir).unwrap();
-        std::fs::write(target_dir.join("file-a"), test_bytes(3)).unwrap();
-        std::fs::write(target_dir.join("file-b"), test_bytes(4)).unwrap();
+        let expected = worker_start_failure_entry(&root);
+        let spec = canonical_download_spec(&expected);
 
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls_for_resolver = Arc::clone(&calls);
@@ -11892,8 +15458,13 @@ mod tests {
             &TransferJobState::Succeeded,
             &resolver,
         ));
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert_eq!(library[0].files.len(), 2);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "terminal projection revalidates the canonical bundle, not raw files"
+        );
+        assert_eq!(library[0].files, expected.files);
+        assert_eq!(library[0].processed_files, expected.processed_files);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -11905,10 +15476,8 @@ mod tests {
         // of the outbox-delivery guard used by `spawn_transfer_poll_loop`
         // in practice (see the coordinator-backed test below).
         let root = fresh_temp_dir("upsert-not-duplicate");
-        let spec = test_download_spec("dev-3", "sess-3", "video.mp4", 4);
-        let target_dir = root.join("dev-3").join("sess-3");
-        std::fs::create_dir_all(&target_dir).unwrap();
-        std::fs::write(target_dir.join("video.mp4"), test_bytes(4)).unwrap();
+        let entry = worker_start_failure_entry(&root);
+        let spec = canonical_download_spec(&entry);
 
         let mut library = Vec::new();
         apply_terminal_download(&mut library, &root, &spec, &TransferJobState::Succeeded);
@@ -11993,6 +15562,7 @@ mod tests {
 
     struct FixedFactory {
         data: Vec<u8>,
+        source_opens: Arc<AtomicUsize>,
     }
 
     struct TestPassVerifier;
@@ -12015,6 +15585,7 @@ mod tests {
             _session_id: &SessionId,
             _file_id: &FileId,
         ) -> Result<Box<dyn DownloadSource>, DownloadError> {
+            self.source_opens.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(FixedSource {
                 data: self.data.clone(),
             }))
@@ -12030,8 +15601,19 @@ mod tests {
     /// touching the network. Never goes through `Composition::spawn`
     /// (which needs a real `AppHandle`).
     fn test_composition(dir: &Path, data: Vec<u8>) -> Composition {
+        test_composition_with_source_counter(dir, data).0
+    }
+
+    fn test_composition_with_source_counter(
+        dir: &Path,
+        data: Vec<u8>,
+    ) -> (Composition, Arc<AtomicUsize>) {
+        let source_opens = Arc::new(AtomicUsize::new(0));
         let device_status: Arc<dyn DeviceStatusPort> = Arc::new(AllConnected);
-        let source_factory: Arc<dyn DownloadSourceFactory> = Arc::new(FixedFactory { data });
+        let source_factory: Arc<dyn DownloadSourceFactory> = Arc::new(FixedFactory {
+            data,
+            source_opens: source_opens.clone(),
+        });
         let verifier: Arc<dyn ylx_transfer_core::library::download::PublicationVerifier> =
             Arc::new(TestPassVerifier);
         let library_root = dir.join("library");
@@ -12058,11 +15640,12 @@ mod tests {
             config,
         ));
 
-        Composition {
+        let composition = Composition {
             fleet: Arc::new(DeviceFleet::new()),
             bindings: Arc::new(Mutex::new(DeviceBindings::default())),
             coordinator,
             mdns_available: AtomicBool::new(false),
+            mdns_services: Mutex::new(MdnsServiceRegistry::default()),
             pairing_tasks: Mutex::new(HashMap::new()),
             active_pairings: Mutex::new(HashMap::new()),
             vault: Arc::new(InMemoryCredentialVault::new()),
@@ -12080,7 +15663,8 @@ mod tests {
             settings_revision: Mutex::new(0),
             background_loops: Mutex::new(Vec::new()),
             transfer_projection_read_failure: AtomicBool::new(false),
-        }
+        };
+        (composition, source_opens)
     }
 
     fn test_upload_context(
@@ -12717,8 +16301,10 @@ mod tests {
     fn unverified_success_replays_after_restart_before_ack_and_retirement() {
         let dir = fresh_temp_dir("unverified-success-replay");
         let library_root = dir.join("library");
+        let fixture_root = dir.join("fixture-library");
         let store_path = dir.join("transfer_store.sqlite3");
-        let spec = test_download_spec("dev-replay", "sess-replay", "video.bin", 4);
+        let fixture_entry = worker_start_failure_entry(&fixture_root);
+        let spec = canonical_download_spec(&fixture_entry);
         {
             let mut store = TransferStore::open(&store_path).expect("open store");
             store.create_job("job-replay", &spec, "t0").unwrap();
@@ -12749,15 +16335,8 @@ mod tests {
         assert!(store.get_job("job-replay").unwrap().is_some());
         assert!(!record.is_acknowledged());
 
-        let target = derive_target_path(
-            &library_root,
-            spec.identity().device_id().as_str(),
-            spec.identity().session_id().as_str(),
-            "video.bin",
-        )
-        .unwrap();
-        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        std::fs::write(&target, test_bytes(4)).unwrap();
+        let installed = worker_start_failure_entry(&library_root);
+        assert_eq!(canonical_download_spec(&installed), spec);
 
         let candidate = prepare_terminal_download(
             None,
@@ -12779,6 +16358,121 @@ mod tests {
             .delete_job("job-replay")
             .expect("retire applied success");
         assert!(store.get_job("job-replay").unwrap().is_none());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn synthetic_download_success(
+        spec: &JobSpec,
+        job_id: &str,
+        sequence: u64,
+        recorded_at: &str,
+    ) -> OwnedCompletion {
+        OwnedCompletion {
+            record: CompletionRecord {
+                sequence,
+                job_id: job_id.to_string(),
+                operation_kind: OperationKind::Download,
+                outcome: TerminalOutcome::Succeeded,
+                state_version: 7,
+                recorded_at: recorded_at.to_string(),
+                acknowledged_at: None,
+            },
+            context: OwnedCompletionContext::Download(spec.clone()),
+        }
+    }
+
+    #[test]
+    fn stale_download_completions_cannot_reverse_the_newest_projection_after_restart() {
+        let dir = fresh_temp_dir("completion-fence-newest");
+        let library_root = dir.join("library");
+        let fixture_entry = worker_start_failure_entry(&library_root);
+        let spec = canonical_download_spec(&fixture_entry);
+        let comp = Arc::new(test_composition(&dir, Vec::new()));
+        let app_store_path = dir.join("app.sqlite3");
+        let state = AppState::for_test(
+            comp.clone(),
+            Arc::new(AppStore::open(&app_store_path).expect("open app store")),
+            Vec::new(),
+            0,
+        );
+        let app = tauri::test::mock_app();
+        app.manage(state.clone());
+        let newest =
+            synthetic_download_success(&spec, "download-newest", 20, "2026-08-29T00:00:20Z");
+
+        let (projection, changed, _) =
+            apply_download_completion(app.handle(), &newest, &library_root)
+                .expect("project newest success");
+        assert_eq!(projection, ProjectionOutcome::Applied);
+        assert!(changed);
+
+        let (revision, persisted) = {
+            let data = state.0.lock().unwrap();
+            let entry = data.library.first().expect("newest projection entry");
+            assert_eq!(entry.download_projection_sequence, 20);
+            assert_eq!(entry.downloaded_at, "2026-08-29T00:00:20Z");
+            assert!(
+                serde_json::to_value(entry.view()).unwrap()["downloadProjectionSequence"].is_null(),
+                "the internal replay fence must not cross the RPC boundary"
+            );
+            let (revision, row) = data
+                .app_store()
+                .read_library_entry(&entry.key())
+                .expect("read newest durable projection");
+            (revision, row.expect("newest durable row").payload)
+        };
+        let persisted_entry: LibraryEntry =
+            serde_json::from_slice(&persisted).expect("reload persisted projection after restart");
+        assert_eq!(persisted_entry.download_projection_sequence, 20);
+
+        // Rebuild the application state only from its durable payload. This
+        // is the crash/restart boundary: no process-local delivery ordering
+        // survives into the second mock application.
+        drop(app);
+        drop(state);
+        let restarted_state = AppState::for_test(
+            comp.clone(),
+            Arc::new(AppStore::open(&app_store_path).expect("reopen app store")),
+            vec![persisted_entry],
+            revision,
+        );
+        let restarted_app = tauri::test::mock_app();
+        restarted_app.manage(restarted_state.clone());
+
+        let (projection, changed, _) =
+            apply_download_completion(restarted_app.handle(), &newest, &library_root)
+                .expect("replay the same successful completion");
+        assert_eq!(projection, ProjectionOutcome::AlreadyApplied);
+        assert!(!changed);
+
+        // An older unacknowledged child can be delivered after the newest
+        // projection when its earlier acknowledgement failed. It must now be
+        // acknowledged as already applied without touching the library row.
+        let old = synthetic_download_success(&spec, "download-old", 10, "2026-08-29T00:00:10Z");
+        let (projection, changed, _) =
+            apply_download_completion(restarted_app.handle(), &old, &library_root)
+                .expect("stale success is harmlessly replayable");
+        assert_eq!(projection, ProjectionOutcome::AlreadyApplied);
+        assert!(!changed);
+
+        let data = restarted_state.0.lock().unwrap();
+        let entry = data.library.first().expect("restarted projection entry");
+        assert_eq!(entry.download_projection_sequence, 20);
+        assert_eq!(entry.downloaded_at, "2026-08-29T00:00:20Z");
+        let durable = data
+            .app_store()
+            .read_library_entry(&entry.key())
+            .expect("read fenced durable projection")
+            .1
+            .expect("fenced durable row");
+        let durable: LibraryEntry =
+            serde_json::from_slice(&durable.payload).expect("decode fenced durable row");
+        assert_eq!(durable.download_projection_sequence, 20);
+        drop(data);
+
+        drop(restarted_app);
+        drop(restarted_state);
+        drop(comp);
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -12927,7 +16621,7 @@ mod tests {
     }
 
     #[test]
-    fn succeeded_job_via_enqueue_download_produces_a_real_library_entry_on_disk() {
+    fn raw_only_succeeded_job_via_enqueue_download_fails_closed_before_library_projection() {
         let dir = fresh_temp_dir("succeeded-e2e");
         let data = b"a real recording's real bytes, end to end".to_vec();
         let comp = test_composition(&dir, data.clone());
@@ -12955,20 +16649,17 @@ mod tests {
             .expect("enqueue_download must have tracked this job");
 
         let mut library = Vec::new();
-        assert!(apply_terminal_download(
+        assert!(!apply_terminal_download(
             &mut library,
             &comp.library_root(),
             &spec,
             &state,
         ));
 
-        assert_eq!(library.len(), 1);
-        let entry = &library[0];
-        assert_eq!(entry.device_id, "dev-e2e");
-        assert_eq!(entry.session_id, "sess-e2e");
-        assert_eq!(entry.files.len(), 1);
-        assert_eq!(entry.files[0].file_id, "video.mp4");
-        assert_eq!(entry.bytes, data.len() as u64);
+        assert!(
+            library.is_empty(),
+            "a raw coordinator success cannot bypass derived media finalization"
+        );
 
         // The file the coordinator itself committed -- not anything this
         // test wrote -- really exists at the exact convention PC-06 also
@@ -12980,33 +16671,17 @@ mod tests {
             "expected the coordinator's real committed file at {path:?}"
         );
         assert_eq!(std::fs::read(&path).unwrap(), data);
-
-        comp.transfer_store
-            .lock()
-            .unwrap()
-            .acknowledge_completion(job_id.as_str(), "test-projection-ack")
-            .expect("library projection acknowledgement");
-        comp.retire_successful_download(&job_id)
-            .expect("successful durable merge retires the completed job");
-        assert!(
-            comp.coordinator.job_state(&job_id).is_none(),
-            "a successfully archived download must leave the active coordinator"
-        );
         assert!(
             comp.download_job_spec(&job_id).is_some(),
-            "successful context remains as durable audit history"
+            "an unprojected raw success remains durable for finalization/replay"
         );
         let store = comp.transfer_store.lock().unwrap();
         assert_eq!(store.count_jobs().expect("count durable jobs"), 1);
         assert!(store
             .get_job(job_id.as_str())
             .unwrap()
-            .is_some_and(|job| job.dismissed_at.is_some()));
+            .is_some_and(|job| job.dismissed_at.is_none()));
         drop(store);
-        assert!(
-            comp.job_label(&job_id).is_none(),
-            "retiring a successful job must also release its UI label"
-        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -13203,6 +16878,106 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_session_capabilities_preserve_evidence_and_fail_closed() {
+        let capabilities = DeviceCapabilitiesView {
+            session_list: NegotiatedCapabilityView {
+                supported: true,
+                source: CapabilitySourceView::ProfileContract,
+            },
+            session_detail: NegotiatedCapabilityView {
+                supported: true,
+                source: CapabilitySourceView::ProfileContract,
+            },
+            artifact_download: NegotiatedCapabilityView {
+                supported: true,
+                source: CapabilitySourceView::DeviceDescriptor,
+            },
+            capture_status: NegotiatedCapabilityView {
+                supported: true,
+                source: CapabilitySourceView::ProfileContract,
+            },
+            session_deletion: NegotiatedCapabilityView {
+                supported: false,
+                source: CapabilitySourceView::ProfileContract,
+            },
+            ..DeviceCapabilitiesView::default()
+        };
+
+        let projected = session_page_capabilities_from_negotiation(
+            DeviceApiProfile::LabHttpV4,
+            DeviceApiProfileView::LabHttpV4,
+            &capabilities,
+        )
+        .expect("the endpoint and negotiated v4 profile agree");
+        assert_eq!(projected.profile, SessionApiProfile::LabHttpV4);
+        assert_eq!(
+            projected.artifact_download,
+            SessionCapability {
+                supported: true,
+                source: SessionCapabilitySource::DeviceDescriptor,
+            }
+        );
+        assert_eq!(
+            projected.session_deletion,
+            SessionCapability {
+                supported: false,
+                source: SessionCapabilitySource::ProfileContract,
+            }
+        );
+
+        let mut unavailable = capabilities.clone();
+        unavailable.session_detail = NegotiatedCapabilityView {
+            supported: true,
+            source: CapabilitySourceView::Unavailable,
+        };
+        let projected = session_page_capabilities_from_negotiation(
+            DeviceApiProfile::LabHttpV4,
+            DeviceApiProfileView::LabHttpV4,
+            &unavailable,
+        )
+        .expect("an unavailable optional capability does not invalidate listing");
+        assert_eq!(projected.session_detail, SessionCapability::unavailable());
+        assert!(session_page_capabilities_from_negotiation(
+            DeviceApiProfile::LegacyPinnedTlsV1,
+            DeviceApiProfileView::LabHttpV4,
+            &capabilities,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn invalid_gateway_digest_remains_visible_but_cannot_authorize_detail() {
+        let summary = SessionSummaryView {
+            session_id: "session-invalid-digest".to_string(),
+            revision: String::new(),
+            captured_at: "2026-08-29T12:00:00Z".to_string(),
+            published_at: "2026-08-29T12:01:00Z".to_string(),
+            duration_seconds: 60.0,
+            total_bytes: 1024,
+            video_bytes: 1024,
+            file_count: 1,
+            gateway_verification: Some(GatewayVerificationView {
+                actor: "gateway".to_string(),
+                validator_name: "manifest-validator".to_string(),
+                validator_version: "2.1.0".to_string(),
+                validator_build_sha256: "b".repeat(64),
+                manifest_sha256: "invalid-digest".to_string(),
+                manifest_digest_valid: false,
+                verified_at: "2026-08-29T12:01:01Z".to_string(),
+                verdict: GatewayVerificationVerdictView::Usable,
+                diagnostics: Vec::new(),
+            }),
+        };
+
+        let row = session_summary_to_view(summary).expect("row remains visible");
+        let verification = row.verification.expect("raw gateway evidence is projected");
+        assert_eq!(verification.manifest_sha256, "invalid-digest");
+        assert_eq!(verification.verdict, SessionVerificationVerdict::Usable);
+        assert!(!verification.permits_detail_for(&row.session.revision));
+        assert!(!gateway_verification_from_view(&verification).is_detail_eligible());
+    }
+
+    #[test]
     fn transfer_request_from_session_detail_rejects_a_session_with_no_files() {
         let identity = test_identity("1");
         let detail = SessionDetailView {
@@ -13219,11 +16994,49 @@ mod tests {
             publication_signature: vec![7; 64],
             publication_public_key: vec![9; 32],
             publication_key_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            gateway_verification: None,
+            publication_origin: PublicationEnvelopeOriginView::DeviceSigned,
         };
         let result = transfer_request_from_session_detail(&identity, "sess-1", &detail);
         assert!(
             result.is_err(),
             "a session with zero files must be a real, honest error"
+        );
+    }
+
+    #[test]
+    fn transfer_request_rejects_invalid_lab_v4_manifest_before_enqueue() {
+        let data = b"must never be downloaded".to_vec();
+        let identity = test_identity("1");
+        let detail = SessionDetailView {
+            session_id: "sess-invalid-v4".to_string(),
+            revision: format!("sha256:{}", "a".repeat(64)),
+            captured_at: "2026-08-01T00:00:00Z".to_string(),
+            published_at: "2026-08-01T00:01:00Z".to_string(),
+            duration_seconds: 1.0,
+            total_bytes: data.len() as u64,
+            video_bytes: data.len() as u64,
+            file_count: 1,
+            files: vec![file_entry(
+                "f-invalid-v4",
+                "video/left_00000.mp4",
+                "video.left",
+                &data,
+            )],
+            publication_payload: b"{}".to_vec(),
+            publication_signature: vec![7; 64],
+            publication_public_key: vec![9; 32],
+            publication_key_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            gateway_verification: None,
+            publication_origin: PublicationEnvelopeOriginView::ClientDerivedLabCompatibility,
+        };
+
+        let error =
+            transfer_request_from_session_detail(&identity, detail.session_id.as_str(), &detail)
+                .expect_err("invalid v4 publication must not produce a downloadable request");
+        assert!(
+            error.contains("完整 Device Session v2 校验"),
+            "unexpected error: {error}"
         );
     }
 
@@ -13248,6 +17061,8 @@ mod tests {
             publication_signature: vec![7; 64],
             publication_public_key: vec![9; 32],
             publication_key_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            gateway_verification: None,
+            publication_origin: PublicationEnvelopeOriginView::DeviceSigned,
         };
 
         let request = transfer_request_from_session_detail(&identity, "sess-1", &detail)
@@ -13271,6 +17086,76 @@ mod tests {
         // GET /sessions/{id}/files/{file_id}; the display path is a separate
         // local-target field and never replaces it in network requests.
         assert_ne!(request.files[0].file_id.as_str(), "video/left_00000.mp4");
+    }
+
+    #[test]
+    fn partial_inventory_is_rejected_before_source_job_or_staging_for_every_profile() {
+        let dir = fresh_temp_dir("partial-inventory-rejected");
+        let data = b"raw segment that must not be opened".to_vec();
+        let (comp, source_opens) = test_composition_with_source_counter(&dir, data.clone());
+        let identity = test_identity("8");
+        let detail = SessionDetailView {
+            session_id: "sess-complete-only".to_string(),
+            revision: "rev-complete-only-1".to_string(),
+            captured_at: "2026-08-29T00:00:00Z".to_string(),
+            published_at: "2026-08-29T00:01:00Z".to_string(),
+            duration_seconds: 1.0,
+            total_bytes: (data.len() * 2) as u64,
+            video_bytes: (data.len() * 2) as u64,
+            file_count: 2,
+            files: vec![
+                file_entry("left-00000", "video/left_00000.mp4", "video_left", &data),
+                file_entry("right-00000", "video/right_00000.mp4", "video_right", &data),
+            ],
+            publication_payload: b"canonical-publication".to_vec(),
+            publication_signature: vec![7; 64],
+            publication_public_key: vec![9; 32],
+            publication_key_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            gateway_verification: None,
+            publication_origin: PublicationEnvelopeOriginView::DeviceSigned,
+        };
+        let inventory = session_files_from_detail(&detail);
+
+        // Profile negotiation is intentionally absent from the enqueue
+        // contract: after detail normalization, every profile reaches this
+        // same complete-inventory boundary.
+        for profile in ["legacyPinnedTlsV1", "labHttpV4"] {
+            let mut request = transfer_request_from_session_detail(
+                &identity,
+                detail.session_id.as_str(),
+                &detail,
+            )
+            .expect("build complete request");
+            request.files.truncate(1);
+            let error = comp
+                .enqueue_download_with_context(
+                    request,
+                    detail.captured_at.clone(),
+                    vec![inventory[0].clone()],
+                    inventory.clone(),
+                )
+                .expect_err("a raw subset must not enqueue for {profile}");
+            assert!(
+                error.contains("下载范围不一致"),
+                "unexpected {profile} error: {error}"
+            );
+        }
+
+        assert_eq!(source_opens.load(Ordering::SeqCst), 0);
+        assert!(comp.coordinator.list_snapshots().is_empty());
+        assert!(comp
+            .transfer_store
+            .lock()
+            .unwrap()
+            .list_jobs()
+            .unwrap()
+            .is_empty());
+        assert!(
+            !comp.library_root().join(".ylx-staging").exists(),
+            "policy rejection must precede staging allocation"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -13300,6 +17185,8 @@ mod tests {
             publication_signature: vec![7; 64],
             publication_public_key: vec![9; 32],
             publication_key_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            gateway_verification: None,
+            publication_origin: PublicationEnvelopeOriginView::DeviceSigned,
         };
 
         let resolved_from_legacy = comp.resolve_binding(&legacy_id).unwrap();
@@ -13319,7 +17206,6 @@ mod tests {
                 detail.captured_at.clone(),
                 session_files.clone(),
                 session_files,
-                true,
             )
             .unwrap();
         let spec = comp.download_job_spec(&job_id).unwrap();
@@ -13335,14 +17221,7 @@ mod tests {
     }
 
     #[test]
-    fn download_session_shaped_request_genuinely_reaches_enqueue_download_and_succeeds() {
-        // Proves the whole real chain download_session drives --
-        // SessionDetailView (what a real GET /sessions/{id} now returns)
-        // -> transfer_request_from_session_detail -> enqueue_download ->
-        // real TransferCoordinator -> Succeeded -> apply_terminal_download
-        // -- actually works end to end for a session with a real
-        // multi-file inventory, rather than ever hitting the old
-        // "no per-file manifest available" short-circuit.
+    fn download_session_shaped_raw_success_fails_closed_before_library_projection() {
         let dir = fresh_temp_dir("download-session-e2e");
         let data = b"a whole real session's real recorded bytes".to_vec();
         let comp = test_composition(&dir, data.clone());
@@ -13365,6 +17244,8 @@ mod tests {
             publication_signature: vec![7; 64],
             publication_public_key: vec![9; 32],
             publication_key_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            gateway_verification: None,
+            publication_origin: PublicationEnvelopeOriginView::DeviceSigned,
         };
 
         let request = transfer_request_from_session_detail(&identity, "sess-real", &detail)
@@ -13375,8 +17256,7 @@ mod tests {
                 request,
                 detail.captured_at.clone(),
                 session_files.clone(),
-                session_files,
-                true,
+                session_files.clone(),
             )
             .expect("download_session's real request reaches enqueue_download successfully");
 
@@ -13397,24 +17277,17 @@ mod tests {
             .download_job_spec(&job_id)
             .expect("enqueue_download must have tracked this job");
         let mut library = Vec::new();
-        apply_terminal_download(&mut library, &comp.library_root(), &spec, &state);
-
-        assert_eq!(
-            library.len(),
-            1,
-            "the real per-file inventory must produce one real library entry"
+        assert!(!apply_terminal_download(
+            &mut library,
+            &comp.library_root(),
+            &spec,
+            &state,
+        ));
+        assert!(
+            library.is_empty(),
+            "raw split-eye segments cannot become the final desktop library"
         );
-        let entry = &library[0];
-        assert_eq!(entry.device_id, identity.device_id().as_str());
-        assert_eq!(entry.session_id, "sess-real");
-        assert_eq!(
-            entry.files.len(),
-            2,
-            "both real files from the session detail must be tracked"
-        );
-        // Every file the coordinator actually committed exists on disk at
-        // the real convention -- not just a job state claiming success.
-        for file in &entry.files {
+        for file in &session_files {
             let path = derive_target_path_for_file(
                 &comp.library_root(),
                 identity.device_id().as_str(),
@@ -13423,7 +17296,10 @@ mod tests {
                 Some(&file.display_path),
             )
             .unwrap();
-            assert!(path.is_file(), "expected a real committed file at {path:?}");
+            assert!(
+                path.is_file(),
+                "the raw coordinator stage still committed its verified input at {path:?}"
+            );
         }
 
         std::fs::remove_dir_all(&dir).ok();
@@ -13614,11 +17490,12 @@ mod tests {
             url_style: StorageUrlStyle::Path,
             download_root: None,
         };
-        let entry = worker_start_failure_entry();
+        let entry = worker_start_failure_entry(&comp.library_root());
         let input_digest = upload_input_digest(&entry, &storage).unwrap();
+        let revision = entry.publication.as_ref().unwrap().revision.clone();
         let spec = UploadJobSpec::new_with_prefix(
             entry.key(),
-            "rev-terminal",
+            revision,
             input_digest,
             normalize_prefix(&storage.prefix),
         )
@@ -13728,7 +17605,7 @@ mod tests {
             url_style: StorageUrlStyle::Path,
             download_root: None,
         };
-        let entry = worker_start_failure_entry();
+        let entry = worker_start_failure_entry(&comp.library_root());
         let app_store_path = dir.join("app-state.sqlite3");
         let app_store = AppStore::open(&app_store_path).unwrap();
         let app_state = crate::state::AppState::for_test(
@@ -13883,66 +17760,10 @@ mod tests {
     /// The normal library action must reach the durable child transaction,
     /// rather than merely selecting a mode in a pure helper. Tauri's mock
     /// runtime gives this test a real `AppHandle`/`AppState`; the worker may
-    /// fail its deliberately absent local-file fixture afterwards, but the
+    /// fail against its deliberately unreachable object endpoint afterwards, but the
     /// child lineage and immutable spec must already be committed.
     #[test]
     fn normal_library_terminal_action_starts_durable_retry_repeat_and_supersede_children() {
-        const FILE_SHA256: &str =
-            "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881";
-        const PUBLIC_KEY: &str = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c";
-        const RETRY_SIGNATURE: &str =
-            "289245967e244c588b211aaffcb18f7fb6e3176b357f2555c629d34f844f5ec8f1607113fa63635691b049b56ad8c46489f77ab737774f9459daacd769dbb901";
-        const REPEAT_SIGNATURE: &str =
-            "a6b96b8a234307901542f2fecab3b7635e015c666375d48953594724efa89d7ec9a048cf91f2099f26e39c45069caa797f124d30116b2e241750cf67ece83008";
-        const SUPERSEDE_SIGNATURE: &str =
-            "2c7e5251c06352a5431e4e1fde95f20b4dc3e476d0b72abbc034a42052b8d1ac843a68b08446a0d58a2919e66f75f8f7ad97ec5dfa09faed6b6ad2cedb907e09";
-
-        fn decode_hex(value: &str) -> Vec<u8> {
-            assert_eq!(value.len() % 2, 0);
-            let bytes = value.as_bytes();
-            let mut decoded = Vec::with_capacity(bytes.len() / 2);
-            for index in (0..bytes.len()).step_by(2) {
-                let high = (bytes[index] as char).to_digit(16).expect("hex") as u8;
-                let low = (bytes[index + 1] as char).to_digit(16).expect("hex") as u8;
-                decoded.push((high << 4) | low);
-            }
-            decoded
-        }
-
-        fn route_entry(session_id: &str, signature: &str, public_key: &str) -> LibraryEntry {
-            let payload = format!(
-                r#"{{"session_id":"{session_id}","revision":"rev-terminal","total_bytes":1,"files":[{{"id":"file-terminal","display_path":"video/terminal.mp4","size_bytes":1,"sha256":"{FILE_SHA256}"}}]}}"#
-            );
-            LibraryEntry {
-                device_id: "dev-terminal".to_string(),
-                session_id: session_id.to_string(),
-                date_label: "today".to_string(),
-                downloaded_at: "now".to_string(),
-                bytes: 1,
-                processed_files: Vec::new(),
-                files: vec![SessionFile::new(
-                    "file-terminal".to_string(),
-                    "video/terminal.mp4".to_string(),
-                    1,
-                    FILE_SHA256.to_string(),
-                )],
-                complete: true,
-                publication: Some(PublicationEvidence {
-                    revision: "rev-terminal".to_string(),
-                    payload: payload.into_bytes(),
-                    signature: decode_hex(signature),
-                    public_key: decode_hex(public_key),
-                }),
-                library_root: None,
-                object_receipts: Vec::new(),
-                upload_projection: None,
-                upload_status: UploadStatus::None,
-                upload_retryable: false,
-                uploaded_at: None,
-                upload_error: None,
-            }
-        }
-
         fn seed_terminal_parent(
             comp: &Composition,
             parent_id: &str,
@@ -13951,9 +17772,15 @@ mod tests {
             input_digest: &str,
             outcome: TerminalOutcome,
         ) {
+            let revision = entry
+                .publication
+                .as_ref()
+                .expect("canonical terminal publication")
+                .revision
+                .clone();
             let spec = UploadJobSpec::new_with_prefix(
                 entry.key(),
-                "rev-terminal",
+                revision,
                 input_digest,
                 normalize_prefix(&storage.prefix),
             )
@@ -13988,10 +17815,10 @@ mod tests {
             url_style: StorageUrlStyle::Path,
             download_root: None,
         };
-        let retry_entry = route_entry("sess-terminal-retry", RETRY_SIGNATURE, PUBLIC_KEY);
-        let repeat_entry = route_entry("sess-terminal-repeat", REPEAT_SIGNATURE, PUBLIC_KEY);
+        let retry_entry = canonical_entry_for_device(&comp.library_root(), "dev-terminal-retry");
+        let repeat_entry = canonical_entry_for_device(&comp.library_root(), "dev-terminal-repeat");
         let supersede_entry =
-            route_entry("sess-terminal-supersede", SUPERSEDE_SIGNATURE, PUBLIC_KEY);
+            canonical_entry_for_device(&comp.library_root(), "dev-terminal-supersede");
         let entries = [
             retry_entry.clone(),
             repeat_entry.clone(),

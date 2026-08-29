@@ -15,6 +15,14 @@ const SESSION: SessionView = {
   files: [],
   downloadStatus: "none",
   backedUp: false,
+  verification: {
+    verdict: "usable",
+    actor: "gateway",
+    validator: { name: "catalog-validator", version: "1", buildSha256: "b".repeat(64) },
+    manifestSha256: "a".repeat(64),
+    verifiedAt: "2026-08-03T00:00:01Z",
+    diagnostics: [],
+  },
 };
 
 test("focus paints before an 800ms session refresh completes", async () => {
@@ -135,6 +143,40 @@ test("repeated focus shares one in-flight refresh for the same device", async ()
   assert.equal(await first, "stale");
   assert.equal(await second, "applied");
   assert.deepEqual(applied, ["YLX-A"]);
+});
+
+test("invalidate starts a new same-device transport and only its response may commit", async () => {
+  const resolvers: Array<(sessions: SessionView[]) => void> = [];
+  const applied: string[] = [];
+  let loadCount = 0;
+  const controller = createDeviceNavigationController({
+    onBegin: () => {},
+    loadSessions: () => {
+      loadCount += 1;
+      return new Promise<SessionView[]>((resolve) => resolvers.push(resolve));
+    },
+    isCurrent: () => true,
+    onLoaded: (_deviceId, sessions) => applied.push(sessions[0]?.revision ?? "missing"),
+    onFailed: () => {},
+    onInvalidated: () => {},
+  });
+
+  const stale = controller.refresh("YLX-A");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(loadCount, 1);
+
+  controller.invalidate();
+  const fresh = controller.refresh("YLX-A");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(loadCount, 2);
+
+  resolvers[0]?.([{ ...SESSION, revision: "stale-revision" }]);
+  assert.equal(await stale, "stale");
+  assert.deepEqual(applied, []);
+
+  resolvers[1]?.([{ ...SESSION, revision: "fresh-revision" }]);
+  assert.equal(await fresh, "applied");
+  assert.deepEqual(applied, ["fresh-revision"]);
 });
 
 test("refresh failures are reported without rejecting the navigation task", async () => {

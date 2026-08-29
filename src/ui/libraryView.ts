@@ -115,7 +115,7 @@ export function libraryRowHtml(
     `<span><span class="cell-label">来源设备</span><span class="tag-device">${deviceDisplayIdText}</span></span>` +
     `<span><span class="cell-label">大小</span><span class="cell-value">${formatBytes(entry.bytes)}</span></span>` +
     `<span><span class="cell-label">下载时间</span><span class="cell-value">${downloadedAtText}</span></span>` +
-    `<span>${chip}</span>` +
+    `<span class="library-status-chips">${chip}</span>` +
     `<span class="row-actions">${uploadBtn}${removeBtn}</span>` +
     `</div>` +
     `<div class="session-files"><ul class="file-list">${filesHtml}</ul></div>` +

@@ -131,6 +131,184 @@ pub struct SessionView {
     pub session: Session,
     pub download_status: DownloadStatus,
     pub backed_up: bool,
+    /// Gateway evidence for the exact Device API v4 manifest revision.
+    /// `None` is an explicit missing verdict, not an optimistic default.
+    pub verification: Option<SessionVerificationView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionVerificationVerdict {
+    Usable,
+    Unusable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionVerificationValidatorView {
+    pub name: String,
+    pub version: String,
+    pub build_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionVerificationDiagnosticCode {
+    ArtifactDigestMismatch,
+    ArtifactInvalid,
+    ManifestInvalid,
+    VerificationFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum SessionVerificationDiagnosticView {
+    LegacyMessage(String),
+    Structured {
+        code: SessionVerificationDiagnosticCode,
+        summary: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionVerificationView {
+    pub verdict: SessionVerificationVerdict,
+    pub actor: String,
+    pub validator: SessionVerificationValidatorView,
+    pub manifest_sha256: String,
+    pub verified_at: String,
+    pub diagnostics: Vec<SessionVerificationDiagnosticView>,
+    /// Adapter-validated state used only by the trusted backend. It is
+    /// deliberately absent from the wire so a WebView cannot present an
+    /// eligibility boolean as authorization.
+    #[serde(skip)]
+    pub(crate) manifest_digest_valid: bool,
+}
+
+impl SessionVerificationView {
+    #[must_use]
+    pub(crate) fn permits_detail_for(&self, revision: &str) -> bool {
+        self.verdict == SessionVerificationVerdict::Usable
+            && self.manifest_digest_valid
+            && revision == format!("sha256:{}", self.manifest_sha256)
+    }
+}
+
+/// One bounded page of the device session catalog.
+///
+/// `next_cursor` is an opaque transport token. Callers must return it
+/// unchanged together with `catalog_revision`; decoding it as an offset would
+/// make pagination depend on one particular device implementation. When
+/// `catalog_authority` is unavailable, `catalog_revision` and `next_cursor`
+/// are both absent. Local UI request generations are deliberately separate
+/// from this device-owned identity. Session detail remains absent from
+/// summary-only rows until an explicit detail RPC.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPageView {
+    pub items: Vec<SessionView>,
+    pub diagnostics: Vec<SessionDiscoveryDiagnosticView>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    pub catalog_revision: Option<String>,
+    pub catalog_authority: SessionCatalogAuthority,
+    pub pagination_supported: bool,
+    pub pagination_unavailable_reason: Option<SessionPaginationUnavailableReason>,
+    pub capabilities: SessionPageCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionDiscoveryDiagnosticCode {
+    ManifestUnreadable,
+    UnsupportedSchema,
+    ManifestInvalid,
+    ManifestNotSealed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDiscoveryDiagnosticView {
+    pub quarantine_id: String,
+    pub code: SessionDiscoveryDiagnosticCode,
+    pub observed_at: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionCatalogAuthority {
+    /// The device promises one immutable catalog revision across all cursors.
+    DeviceSnapshot,
+    /// The response has no authority that can fence two different pages.
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionPaginationUnavailableReason {
+    /// The endpoint can show a first page but cannot prove snapshot-consistent
+    /// traversal. Current Device API v2 falls into this compatibility mode.
+    CatalogRevisionUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionCapabilitySource {
+    DeviceDescriptor,
+    ProfileContract,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SessionApiProfile {
+    LegacyPinnedTlsV1,
+    LabHttpV4,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCapability {
+    pub supported: bool,
+    pub source: SessionCapabilitySource,
+}
+
+impl SessionCapability {
+    #[must_use]
+    pub const fn unavailable() -> Self {
+        Self {
+            supported: false,
+            source: SessionCapabilitySource::Unavailable,
+        }
+    }
+}
+
+/// Explicit command/query capabilities attached to a catalog page. Keeping
+/// the evidence source beside every boolean prevents the UI from turning an
+/// absent descriptor or an empty artifact list into an optimistic guess.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPageCapabilities {
+    pub profile: SessionApiProfile,
+    pub session_deletion: SessionCapability,
+    pub session_detail: SessionCapability,
+    pub artifact_download: SessionCapability,
+    pub capture_status: SessionCapability,
+}
+
+impl Default for SessionPageCapabilities {
+    fn default() -> Self {
+        Self {
+            profile: SessionApiProfile::Unknown,
+            session_deletion: SessionCapability::unavailable(),
+            session_detail: SessionCapability::unavailable(),
+            artifact_download: SessionCapability::unavailable(),
+            capture_status: SessionCapability::unavailable(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +318,10 @@ pub enum UploadStatus {
     Uploading,
     Done,
     Failed,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 /// A session that has been downloaded to local disk. It lives independently
@@ -166,6 +348,13 @@ pub struct LibraryEntry {
     /// this field migrates to `false` and cannot authorize upload/deletion.
     #[serde(default)]
     pub complete: bool,
+    /// Monotonic `transfer_completion_outbox.sequence` of the newest
+    /// successful full-session projection committed into this row. It is
+    /// persisted with the row but intentionally omitted from `LibraryView`;
+    /// completion replay uses it to prevent an older attempt from rolling
+    /// back newer files, publication evidence, timestamps, or completion state.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub(crate) download_projection_sequence: u64,
     /// Signed publication material accepted by the download coordinator.
     /// A legacy entry without this evidence cannot be uploaded or treated
     /// as a complete immutable revision.
@@ -559,8 +748,12 @@ pub struct PersistedStore {
 mod tests {
     use super::{
         Device, DeviceState, LibraryEntry, ObjectVerificationReceipt, PublicationEvidence,
-        SessionFile, StorageConfig, StorageUrlStyle, Transfer, TransferDirection, TransferState,
-        UploadStatus,
+        SessionApiProfile, SessionCapability, SessionCapabilitySource, SessionCatalogAuthority,
+        SessionDiscoveryDiagnosticCode, SessionDiscoveryDiagnosticView, SessionFile,
+        SessionPageCapabilities, SessionPageView, SessionVerificationDiagnosticCode,
+        SessionVerificationDiagnosticView, SessionVerificationValidatorView,
+        SessionVerificationVerdict, SessionVerificationView, StorageConfig, StorageUrlStyle,
+        Transfer, TransferDirection, TransferState, UploadStatus,
     };
 
     const RPC_FIXTURE: &str = include_str!("../../fixtures/rpc/application_contract.json");
@@ -575,6 +768,7 @@ mod tests {
             processed_files: Vec::new(),
             files: Vec::new(),
             complete: false,
+            download_projection_sequence: 0,
             publication: None,
             library_root: None,
             object_receipts: Vec::new(),
@@ -592,6 +786,104 @@ mod tests {
             serde_json::from_str(r#"{"endpoint":"https://s3.example","bucket":"b","prefix":"p"}"#)
                 .unwrap();
         assert_eq!(config.download_root, None);
+    }
+
+    #[test]
+    fn session_page_capabilities_serialize_with_explicit_profile_and_sources() {
+        let page = SessionPageView {
+            items: Vec::new(),
+            diagnostics: Vec::new(),
+            next_cursor: Some("opaque/cursor==".to_string()),
+            has_more: true,
+            catalog_revision: Some(format!("sha256:{}", "a".repeat(64))),
+            catalog_authority: SessionCatalogAuthority::DeviceSnapshot,
+            pagination_supported: true,
+            pagination_unavailable_reason: None,
+            capabilities: SessionPageCapabilities {
+                profile: SessionApiProfile::LabHttpV4,
+                session_deletion: SessionCapability {
+                    supported: false,
+                    source: SessionCapabilitySource::ProfileContract,
+                },
+                session_detail: SessionCapability {
+                    supported: true,
+                    source: SessionCapabilitySource::ProfileContract,
+                },
+                artifact_download: SessionCapability {
+                    supported: true,
+                    source: SessionCapabilitySource::DeviceDescriptor,
+                },
+                capture_status: SessionCapability {
+                    supported: true,
+                    source: SessionCapabilitySource::ProfileContract,
+                },
+            },
+        };
+
+        let value = serde_json::to_value(page).unwrap();
+        assert_eq!(value["nextCursor"], "opaque/cursor==");
+        assert_eq!(value["hasMore"], true);
+        assert_eq!(value["catalogAuthority"], "deviceSnapshot");
+        assert_eq!(value["paginationSupported"], true);
+        assert_eq!(
+            value["paginationUnavailableReason"],
+            serde_json::Value::Null
+        );
+        assert_eq!(value["capabilities"]["profile"], "labHttpV4");
+        assert_eq!(
+            value["capabilities"]["sessionDeletion"]["source"],
+            "profileContract"
+        );
+        assert_eq!(
+            value["capabilities"]["artifactDownload"]["source"],
+            "deviceDescriptor"
+        );
+    }
+
+    #[test]
+    fn session_verification_and_quarantine_diagnostics_keep_the_exact_wire_shape() {
+        let verification = SessionVerificationView {
+            verdict: SessionVerificationVerdict::Unusable,
+            actor: "gateway".to_string(),
+            validator: SessionVerificationValidatorView {
+                name: "manifest-validator".to_string(),
+                version: "2.1.0".to_string(),
+                build_sha256: "b".repeat(64),
+            },
+            manifest_sha256: "not-a-valid-digest".to_string(),
+            verified_at: "2026-08-29T12:34:56Z".to_string(),
+            diagnostics: vec![SessionVerificationDiagnosticView::Structured {
+                code: SessionVerificationDiagnosticCode::ManifestInvalid,
+                summary: "manifest failed closed validation".to_string(),
+            }],
+            manifest_digest_valid: false,
+        };
+        let value = serde_json::to_value(verification).unwrap();
+        assert_eq!(value["verdict"], "unusable");
+        assert_eq!(value["validator"]["buildSha256"], "b".repeat(64));
+        assert_eq!(value["diagnostics"][0]["code"], "manifest_invalid");
+        assert!(value.get("manifestDigestValid").is_none());
+        assert_eq!(
+            serde_json::to_value(SessionVerificationDiagnosticView::LegacyMessage(
+                "legacy verifier message".to_string()
+            ))
+            .unwrap(),
+            serde_json::json!("legacy verifier message")
+        );
+
+        let diagnostic = SessionDiscoveryDiagnosticView {
+            quarantine_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            code: SessionDiscoveryDiagnosticCode::ManifestNotSealed,
+            observed_at: "2026-08-29T12:34:56Z".to_string(),
+            message: "publication is not sealed".to_string(),
+        };
+        let value = serde_json::to_value(diagnostic).unwrap();
+        assert_eq!(
+            value["quarantineId"],
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(value["code"], "manifest_not_sealed");
+        assert_eq!(value["observedAt"], "2026-08-29T12:34:56Z");
     }
 
     #[test]
@@ -681,6 +973,7 @@ mod tests {
                 "a".repeat(64),
             )],
             complete: true,
+            download_projection_sequence: 0,
             publication: Some(PublicationEvidence {
                 revision: "rev-1".to_string(),
                 payload: vec![1, 2, 3],
@@ -711,6 +1004,7 @@ mod tests {
         assert!(value.get("payload").is_none());
         assert!(value.get("signature").is_none());
         assert!(value.get("publicKey").is_none());
+        assert!(value.get("downloadProjectionSequence").is_none());
     }
 
     #[test]

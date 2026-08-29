@@ -1,0 +1,110 @@
+{
+  "schema": "ylx.derived-media-receipt.v1",
+  "receipt_id": "019a0010-0000-7a1b-8c2d-3e4f50617283",
+  "created_at": "2026-08-28T10:10:00Z",
+  "origin": "new-download",
+  "source_manifest": {
+    "schema": "ylx.device-session.v2",
+    "manifest_id": "01989f6d-2c01-7b2c-9d3e-4f5061728394",
+    "session_id": "01989f6d-2c00-7a1b-8c2d-3e4f50617283",
+    "volume_id": "6ba7b813-9dad-41d1-80b4-00c04fd430c8",
+    "bytes": 5443,
+    "sha256": "3d9773099e8e77c41052f064a5b4d5e4a7ddb8d726151dca807ca41e37e9a42a"
+  },
+  "input_artifacts": [
+    {
+      "artifact_id": "abababababababababababababababababababababababababababababababab",
+      "role": "video.left",
+      "bytes": 30123456,
+      "sha256": "abababababababababababababababababababababababababababababababab"
+    },
+    {
+      "artifact_id": "bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc",
+      "role": "video.right",
+      "bytes": 30234567,
+      "sha256": "bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc"
+    },
+    {
+      "artifact_id": "dededededededededededededededededededededededededededededededede",
+      "role": "frames.index",
+      "bytes": 120240,
+      "sha256": "dededededededededededededededededededededededededededededededede"
+    },
+    {
+      "artifact_id": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+      "role": "audio.wav",
+      "bytes": 2880068,
+      "sha256": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+    },
+    {
+      "artifact_id": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+      "role": "audio.wav",
+      "bytes": 2880044,
+      "sha256": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1"
+    }
+  ],
+  "transformer": {
+    "name": "openaria-bridge-desktop",
+    "version": "0.1.6",
+    "recipe_id": "openaria.stereo-derived-mp4",
+    "recipe_version": 1
+  },
+  "output": {
+    "artifact_id": "9090909090909090909090909090909090909090909090909090909090909090",
+    "role": "media.derived",
+    "filename": "01989f6d-2c00-7a1b-8c2d-3e4f50617283.mp4",
+    "media_type": "video/mp4",
+    "bytes": 65000000,
+    "sha256": "9090909090909090909090909090909090909090909090909090909090909090",
+    "container": "mp4",
+    "video_codec": "h264",
+    "layout": "left-right-side-by-side",
+    "width": 3840,
+    "eye_width": 1920,
+    "height": 1080,
+    "audio": {
+      "state": "present",
+      "codec": "aac",
+      "sample_rate": 48000,
+      "channels": 2
+    }
+  },
+  "timeline_verification": {
+    "policy_id": "openaria.manifest-timeline.v1",
+    "verdict": "pass",
+    "source_manifest_sha256": "3d9773099e8e77c41052f064a5b4d5e4a7ddb8d726151dca807ca41e37e9a42a",
+    "left_right_pairing": "pass",
+    "paired_frames": 900,
+    "video_start_residual_ns": 0,
+    "video_end_residual_ns": 0,
+    "audio_start_residual_ns": 0,
+    "audio_end_residual_ns": 0,
+    "source_video_tick_ns": 33333334,
+    "encoding_audio_frame_ns": 21333334,
+    "allowed_residual_ns": 33333334,
+    "preserved_leading_gap_ns": 0,
+    "verified_at": "2026-08-28T10:09:59Z",
+    "probe_summary": {
+      "output_sha256": "9090909090909090909090909090909090909090909090909090909090909090",
+      "output_bytes": 65000000,
+      "video_streams": 1,
+      "audio_streams": 1,
+      "frame_count": 900,
+      "duration_ns": 30000000000,
+      "report_sha256": "9191919191919191919191919191919191919191919191919191919191919191"
+    }
+  },
+  "canonicalization": {
+    "state": "committed",
+    "committed_at": "2026-08-28T10:10:00Z",
+    "local_asset": "derived-output",
+    "required_upload_assets": ["derived-output", "derived-media-receipt"],
+    "source_inputs": "temporary-delete-after-commit"
+  },
+  "provenance": {
+    "derived_authorship": "openaria-bridge-desktop",
+    "source_manifest_signature": "not-declared-by-device-session-v2",
+    "device_signature_inheritance": "forbidden",
+    "derived_output_signature": "not-device-signed"
+  }
+}

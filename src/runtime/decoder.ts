@@ -11,6 +11,7 @@ import type {
   BatchJobItemResult,
   BatchJobResult,
   BatchOutcome,
+  DeviceCapability,
   Device,
   DesiredRunState,
   DownloadedCleanupPreview,
@@ -22,8 +23,16 @@ import type {
   PairingTickPayload,
   RpcError,
   SaveStorageConfigInput,
+  SessionCatalogAuthority,
+  SessionCatalogDiagnostic,
+  SessionCapabilities,
   SessionFile,
   SessionMutationResult,
+  SessionPaginationUnavailableReason,
+  SessionPageView,
+  SessionVerification,
+  SessionVerificationDiagnostic,
+  SessionValidatorIdentity,
   SessionView,
   StorageConfig,
   Transfer,
@@ -192,6 +201,59 @@ function decodeSessionFile(value: unknown, path = "payload"): SessionFile {
   };
 }
 
+function decodeSessionVerificationDiagnostic(value: unknown, path = "payload"): SessionVerificationDiagnostic {
+  if (typeof value === "string") return value;
+  const item = object(value, path);
+  return {
+    code: required(item, "code", string, path),
+    summary: required(item, "summary", string, path),
+  };
+}
+
+function decodeSessionValidatorIdentity(value: unknown, path = "payload"): SessionValidatorIdentity {
+  const item = object(value, path);
+  return {
+    name: required(item, "name", string, path),
+    version: required(item, "version", string, path),
+    buildSha256: required(item, "buildSha256", string, path),
+  };
+}
+
+function decodeSessionVerification(value: unknown, path = "payload"): SessionVerification {
+  const item = object(value, path);
+  return {
+    verdict: required(
+      item,
+      "verdict",
+      (raw, field) => oneOf(["usable", "unusable"] as const, raw, field ?? path),
+      path,
+    ),
+    actor: required(item, "actor", string, path),
+    validator: required(item, "validator", decodeSessionValidatorIdentity, path),
+    // Shape validation deliberately does not validate this digest. The
+    // adapter may surface bounded malformed evidence on a visible row; the
+    // operation eligibility helper in types.ts rejects it fail-closed.
+    manifestSha256: required(item, "manifestSha256", string, path),
+    verifiedAt: required(item, "verifiedAt", string, path),
+    diagnostics: required(
+      item,
+      "diagnostics",
+      (raw, field) => array(raw, decodeSessionVerificationDiagnostic, field ?? path),
+      path,
+    ),
+  };
+}
+
+function decodeSessionCatalogDiagnostic(value: unknown, path = "payload"): SessionCatalogDiagnostic {
+  const item = object(value, path);
+  return {
+    quarantineId: required(item, "quarantineId", string, path),
+    code: required(item, "code", string, path),
+    observedAt: required(item, "observedAt", string, path),
+    message: required(item, "message", string, path),
+  };
+}
+
 function decodeSessionView(value: unknown, path = "payload"): SessionView {
   const item = object(value, path);
   return {
@@ -215,6 +277,152 @@ function decodeSessionView(value: unknown, path = "payload"): SessionView {
       path,
     ),
     backedUp: required(item, "backedUp", boolean, path),
+    verification: required(
+      item,
+      "verification",
+      (raw, field) => (raw === null ? null : decodeSessionVerification(raw, field ?? path)),
+      path,
+    ),
+  };
+}
+
+function decodeDeviceCapability(value: unknown, path = "payload"): DeviceCapability {
+  const item = object(value, path);
+  const supported = required(item, "supported", boolean, path);
+  const source = required(
+    item,
+    "source",
+    (raw, field) => oneOf(["deviceDescriptor", "profileContract", "unavailable"] as const, raw, field ?? path),
+    path,
+  );
+  if (supported && source === "unavailable") {
+    fail(`${path}.source`, "deviceDescriptor | profileContract when supported is true", source);
+  }
+  return { supported, source };
+}
+
+function decodeSessionCapabilities(value: unknown, path = "payload"): SessionCapabilities {
+  const item = object(value, path);
+  const capabilities: SessionCapabilities = {
+    profile: required(
+      item,
+      "profile",
+      (raw, field) => oneOf(["legacyPinnedTlsV1", "labHttpV4", "unknown"] as const, raw, field ?? path),
+      path,
+    ),
+    sessionDeletion: required(item, "sessionDeletion", decodeDeviceCapability, path),
+    sessionDetail: required(item, "sessionDetail", decodeDeviceCapability, path),
+    artifactDownload: required(item, "artifactDownload", decodeDeviceCapability, path),
+    captureStatus: required(item, "captureStatus", decodeDeviceCapability, path),
+  };
+  if (
+    capabilities.profile === "unknown" &&
+    (capabilities.sessionDeletion.supported ||
+      capabilities.sessionDetail.supported ||
+      capabilities.artifactDownload.supported ||
+      capabilities.captureStatus.supported)
+  ) {
+    fail(`${path}.profile`, "known profile when any session capability is supported", capabilities.profile);
+  }
+  if (capabilities.profile === "labHttpV4" && capabilities.sessionDeletion.supported) {
+    fail(`${path}.sessionDeletion.supported`, "false for labHttpV4", true);
+  }
+  return capabilities;
+}
+
+interface DecodedSessionPagination {
+  readonly nextCursor: string | null;
+  readonly hasMore: boolean;
+  readonly catalogAuthority: SessionCatalogAuthority;
+  readonly paginationSupported: boolean;
+  readonly paginationUnavailableReason: SessionPaginationUnavailableReason | null;
+}
+
+function decodeSessionPagination(
+  item: Record<string, unknown>,
+  catalogRevision: string | null,
+  path: string,
+): DecodedSessionPagination {
+  const nextCursor = required(item, "nextCursor", nullableString, path);
+  const hasMore = required(item, "hasMore", boolean, path);
+  const catalogAuthority = required(
+    item,
+    "catalogAuthority",
+    (raw, field) => oneOf(["deviceSnapshot", "unavailable"] as const, raw, field ?? path),
+    path,
+  );
+  const paginationSupported = required(item, "paginationSupported", boolean, path);
+  const paginationUnavailableReason = required(
+    item,
+    "paginationUnavailableReason",
+    (raw, field) => (raw === null ? null : oneOf(["catalogRevisionUnavailable"] as const, raw, field ?? path)),
+    path,
+  );
+
+  if (nextCursor !== null && nextCursor.length === 0) {
+    fail(`${path}.nextCursor`, "non-empty string or null", nextCursor);
+  }
+  if (hasMore !== (nextCursor !== null)) {
+    fail(`${path}.hasMore`, `boolean matching nextCursor presence (${nextCursor !== null})`, hasMore);
+  }
+  if (paginationSupported) {
+    if (catalogAuthority !== "deviceSnapshot") {
+      fail(`${path}.catalogAuthority`, "deviceSnapshot when paginationSupported is true", catalogAuthority);
+    }
+    if (paginationUnavailableReason !== null) {
+      fail(`${path}.paginationUnavailableReason`, "null when paginationSupported is true", paginationUnavailableReason);
+    }
+    if (catalogRevision === null) {
+      fail(`${path}.catalogRevision`, "non-null revision when paginationSupported is true", catalogRevision);
+    }
+  } else {
+    if (catalogAuthority !== "unavailable") {
+      fail(`${path}.catalogAuthority`, "unavailable when paginationSupported is false", catalogAuthority);
+    }
+    if (paginationUnavailableReason !== "catalogRevisionUnavailable") {
+      fail(
+        `${path}.paginationUnavailableReason`,
+        "catalogRevisionUnavailable when paginationSupported is false",
+        paginationUnavailableReason,
+      );
+    }
+    if (hasMore || nextCursor !== null) {
+      fail(`${path}.hasMore`, "false when paginationSupported is false", hasMore);
+    }
+    if (catalogRevision !== null) {
+      fail(`${path}.catalogRevision`, "null when catalog authority is unavailable", catalogRevision);
+    }
+  }
+
+  return {
+    nextCursor,
+    hasMore,
+    catalogAuthority,
+    paginationSupported,
+    paginationUnavailableReason,
+  };
+}
+
+function decodeSessionPage(value: unknown, path = "payload"): SessionPageView {
+  const item = object(value, path);
+  const catalogRevision = required(
+    item,
+    "catalogRevision",
+    (raw, field) => (raw === null ? null : nonEmptyString(raw, field ?? path)),
+    path,
+  );
+  const pagination = decodeSessionPagination(item, catalogRevision, path);
+  return {
+    items: required(item, "items", (raw, field) => array(raw, decodeSessionView, field ?? path), path),
+    ...pagination,
+    catalogRevision,
+    capabilities: required(item, "capabilities", decodeSessionCapabilities, path),
+    diagnostics: required(
+      item,
+      "diagnostics",
+      (raw, field) => array(raw, decodeSessionCatalogDiagnostic, field ?? path),
+      path,
+    ),
   };
 }
 
@@ -554,6 +762,8 @@ export const decodeDeviceValue: Decoder<Device> = decodeDevice;
 export const decodeDeviceList: Decoder<Device[]> = decodeDevices;
 export const decodeSessions: Decoder<SessionView[]> = (value, path = "payload") =>
   array(value, decodeSessionView, path);
+export const decodeSessionValue: Decoder<SessionView> = decodeSessionView;
+export const decodeSessionPageValue: Decoder<SessionPageView> = decodeSessionPage;
 export const decodeLibrary: Decoder<LibraryEntry[]> = (value, path = "payload") =>
   array(value, decodeLibraryEntry, path);
 export const decodeTransfers: Decoder<Transfer[]> = (value, path = "payload") => array(value, decodeTransfer, path);
@@ -571,9 +781,25 @@ export const decodePairingTickPayload: Decoder<PairingTickPayload> = decodePairi
 export const decodePairingResolutionPayload: Decoder<PairingResolutionPayload> = decodePairingResolution;
 export const decodeSessionsUpdate = (value: unknown, path = "payload") => {
   const item = object(value, path);
+  const catalogRevision = required(
+    item,
+    "catalogRevision",
+    (raw, field) => (raw === null ? null : nonEmptyString(raw, field ?? path)),
+    path,
+  );
+  const pagination = decodeSessionPagination(item, catalogRevision, path);
   return {
     deviceId: required(item, "deviceId", canonicalDeviceId, path),
     sessions: required(item, "sessions", decodeSessions, path),
+    catalogRevision,
+    ...pagination,
+    capabilities: required(item, "capabilities", decodeSessionCapabilities, path),
+    diagnostics: required(
+      item,
+      "diagnostics",
+      (raw, field) => array(raw, decodeSessionCatalogDiagnostic, field ?? path),
+      path,
+    ),
   };
 };
 

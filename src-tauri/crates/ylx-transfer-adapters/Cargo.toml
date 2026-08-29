@@ -77,7 +77,12 @@ sha2 = { workspace = true }
 # mdns-sd: discovery_mdns.rs's mDNS browser for `_ylx-capture._tcp.local.`
 # candidates (discovery-only, never a trust anchor -- ADR-DISC-001). Pure
 # Rust, no `avahi`/`mDNSResponder` system dependency required.
-mdns-sd = "0.13"
+# 0.21 preserves the receiving interface on resolved addresses. That scope is
+# required to connect to IPv6 link-local candidates on Windows (numeric index)
+# and Unix (interface name); 0.13 flattened every address to `IpAddr` and lost
+# this information before the adapter could see it. Async/logging are disabled:
+# this adapter uses the blocking receiver and owns its own diagnostics.
+mdns-sd = { version = "0.21", default-features = false }
 # base64: decodes the PEM certificate body in
 # pi_http.rs::tls_pin_from_pem_certificate (used by
 # tests/pi_http_integration.rs to read the real Pi daemon's generated
@@ -135,6 +140,9 @@ objc2-foundation = { version = "0.3.2", features = [
 zbus = { version = "5.18.0", default-features = false, features = ["async-io", "blocking-api"] }
 
 [dev-dependencies]
+# Enable serialization only in tests so scoped IPv6 fixtures can carry a fake
+# interface name/index without depending on a host's real interfaces.
+mdns-sd = { version = "0.21", default-features = false, features = ["serde"] }
 # Re-declared with `test-support` so this crate's tests can run core's
 # shared `DownloadSource` contract suite
 # (`ylx_transfer_core::library::download_contract`) against the real

@@ -6,27 +6,45 @@
 // owns no state, calls no backend and starts no timers.
 
 import type { Dispatch } from "../../app/actions";
-import { asDeviceId, asFileId, asSessionId } from "../../ids";
+import { asDeviceId, asSessionId } from "../../ids";
 import { confirmPhaseOf, deviceRowKey, filterFor } from "../../store";
 import { confirmTargets } from "../../runtime/confirm";
-import { deviceById, devicesOf, sessionsOf, sessionsResourceOf, type AppState } from "../../runtime/reducer";
+import {
+  deviceById,
+  deviceSupportsSessionDetail,
+  deviceSupportsSessionDeletion,
+  deviceSupportsSessionDownload,
+  devicesOf,
+  sessionCatalogOf,
+  sessionDetailStateOf,
+  sessionsOf,
+  sessionsResourceOf,
+  type AppState,
+  type SessionCatalogState,
+} from "../../runtime/reducer";
 import { escapeHtml } from "../../format";
+import { sessionHasUsableVerification } from "../../types";
 import { bindings, delegate, el, elOpt, inputEl } from "../dom";
 import { connectedCountText, renderDeviceListHtml } from "../rail";
-import { deviceSummaryHtml, emptyStateHtml, sessionRowHtml } from "../deviceView";
+import { deviceSummaryHtml, emptyStateHtml, sessionPaginationHtml, sessionRowHtml } from "../deviceView";
 import { selectDeviceList } from "../listSelector";
 import { renderBulkBarHtml, renderSectionHeadingShellHtml, renderToolbarHtml } from "../toolbar";
 import { syncToolbar } from "./listEvents";
-import type { SessionView } from "../../types";
 
 const PAIRING_RING_CIRCUMFERENCE = 226.1;
 
-function supportsDeviceSessionDeletion(sessions: readonly SessionView[]): boolean {
-  // Legacy Device Session rows carry immutable file inventory in the list
-  // projection and support row/bulk DELETE. Device API v4 list rows are
-  // summary-only; the current v4 contract intentionally exposes no destructive
-  // session-deletion mutation.
-  return sessions.some((session) => session.files.length > 0);
+/**
+ * A v2 catalog is intentionally first-page-only: it has no stable revision
+ * and cannot safely claim that the visible rows are the complete device
+ * history. Keep that scope visible in the bulk action's copy.
+ */
+export function sessionDownloadButtonText(
+  catalog: Pick<SessionCatalogState, "catalogAuthority" | "paginationSupported">,
+  phase: "pending" | "complete",
+): string {
+  const firstPageOnly = !catalog.paginationSupported && catalog.catalogAuthority === "unavailable";
+  if (phase === "complete") return firstPageOnly ? "当前首批已下载" : "已全部下载";
+  return firstPageOnly ? "下载当前首批新数据" : "下载全部新数据";
 }
 
 export interface DeviceScreen {
@@ -113,6 +131,32 @@ export function createDeviceScreen(dispatch: Dispatch): DeviceScreen {
       const sessionId = matched.dataset.session;
       if (sessionId === undefined || activeDeviceId === null) return;
       dispatch({ kind: "list/toggleRow", scope: "device", rowKey: deviceRowKey(activeDeviceId, sessionId) });
+      dispatch({
+        kind: "session/loadDetail",
+        deviceId: asDeviceId(activeDeviceId),
+        sessionId: asSessionId(sessionId),
+      });
+    }),
+  );
+
+  bound.add(
+    delegate(content, "click", '[data-action="retry-session-detail"]', (matched, event) => {
+      event.stopPropagation();
+      const sessionId = matched.dataset.session;
+      if (sessionId === undefined || activeDeviceId === null) return;
+      dispatch({
+        kind: "session/loadDetail",
+        deviceId: asDeviceId(activeDeviceId),
+        sessionId: asSessionId(sessionId),
+      });
+    }),
+  );
+
+  bound.add(
+    delegate(content, "click", '[data-action="load-more-sessions"]', (_matched, event) => {
+      event.stopPropagation();
+      if (activeDeviceId === null) return;
+      dispatch({ kind: "device/loadMoreSessions", deviceId: asDeviceId(activeDeviceId) });
     }),
   );
 
@@ -125,21 +169,6 @@ export function createDeviceScreen(dispatch: Dispatch): DeviceScreen {
         kind: "session/download",
         deviceId: asDeviceId(activeDeviceId),
         sessionId: asSessionId(sessionId),
-      });
-    }),
-  );
-
-  bound.add(
-    delegate(content, "click", '[data-action="download-file"]', (matched, event) => {
-      event.stopPropagation();
-      const sessionId = matched.dataset.session;
-      const fileId = matched.dataset.fileId;
-      if (sessionId === undefined || fileId === undefined || activeDeviceId === null) return;
-      dispatch({
-        kind: "session/downloadFile",
-        deviceId: asDeviceId(activeDeviceId),
-        sessionId: asSessionId(sessionId),
-        fileId: asFileId(fileId),
       });
     }),
   );
@@ -195,19 +224,30 @@ export function createDeviceScreen(dispatch: Dispatch): DeviceScreen {
 
     const sessionsState = sessionsResourceOf(state, device.id);
     const sessions = sessionsState.value ?? [];
+    const catalog = sessionCatalogOf(state, device.id);
     const hasSessionSnapshot = sessionsState.value !== null;
     const refreshing = sessionsState.loading;
     const refreshFailed = sessionsState.error !== null;
-    const pending = sessions.filter((s) => s.downloadStatus === "none" || s.downloadStatus === "failed");
+    const pending = sessions.filter(
+      (s) => sessionHasUsableVerification(s) && (s.downloadStatus === "none" || s.downloadStatus === "failed"),
+    );
+    const hasIneligiblePending = sessions.some(
+      (s) => !sessionHasUsableVerification(s) && (s.downloadStatus === "none" || s.downloadStatus === "failed"),
+    );
     const anyDownloading = sessions.some((s) => s.downloadStatus === "downloading");
-    const canDeleteFromDevice = supportsDeviceSessionDeletion(sessions);
+    const canDeleteFromDevice = deviceSupportsSessionDeletion(state, device.id);
+    const canDownloadArtifacts = deviceSupportsSessionDownload(state, device.id);
     const downloadAllBtn = !hasSessionSnapshot
       ? `<button class="btn btn-ghost" disabled>${refreshing ? "正在读取设备数据…" : "会话列表不可用"}</button>`
-      : pending.length > 0
-        ? `<button class="btn btn-primary" id="downloadAllBtn">下载全部新数据<span class="mono" style="opacity:.8;margin-left:2px;">(${pending.length})</span></button>`
-        : anyDownloading
-          ? `<button class="btn btn-ghost" disabled>新数据下载中…</button>`
-          : `<button class="btn btn-ghost" disabled>已全部下载</button>`;
+      : !canDownloadArtifacts
+        ? `<button class="btn btn-ghost" disabled>下载不可用</button>`
+        : pending.length > 0
+          ? `<button class="btn btn-primary" id="downloadAllBtn">${sessionDownloadButtonText(catalog, "pending")}<span class="mono" style="opacity:.8;margin-left:2px;">(${pending.length})</span></button>`
+          : anyDownloading
+            ? `<button class="btn btn-ghost" disabled>新数据下载中…</button>`
+            : hasIneligiblePending
+              ? `<button class="btn btn-ghost" disabled>没有已验证的新数据</button>`
+              : `<button class="btn btn-ghost" disabled>${sessionDownloadButtonText(catalog, "complete")}</button>`;
 
     const backedUp = sessions.filter((s) => s.downloadStatus === "done" && s.backedUp);
     const cleanupConfirming =
@@ -258,7 +298,8 @@ export function createDeviceScreen(dispatch: Dispatch): DeviceScreen {
       deviceSummaryHtml(sessions) +
       renderToolbarHtml("device", filterFor(state.ui, "device")) +
       renderSectionHeadingShellHtml("录制会话") +
-      `<div class="sessions" id="sessionsList"></div>`;
+      `<div class="sessions" id="sessionsList"></div>` +
+      `<div id="sessionPagination"></div>`;
 
     renderList(state);
   }
@@ -270,8 +311,13 @@ export function createDeviceScreen(dispatch: Dispatch): DeviceScreen {
     const ui = state.ui;
     const ownerId = ui.activeDeviceId ?? "";
     const sessions = sessionsOf(state, ui.activeDeviceId) ?? [];
-    const canDeleteFromDevice = supportsDeviceSessionDeletion(sessions);
+    const catalog = sessionCatalogOf(state, ui.activeDeviceId);
+    const canDeleteFromDevice = deviceSupportsSessionDeletion(state, ui.activeDeviceId);
+    const canDownloadSessions = deviceSupportsSessionDownload(state, ui.activeDeviceId);
     const list = selectDeviceList(ui, sessions);
+    const selectedEligible = sessions.some(
+      (session) => ui.deviceSelection.has(session.id) && sessionHasUsableVerification(session),
+    );
     syncToolbar(content, filterFor(ui, "device"));
 
     const bulkConfirming = confirmPhaseOf(ui, confirmTargets.deviceBulkRemove(ownerId)).phase === "confirming";
@@ -279,6 +325,7 @@ export function createDeviceScreen(dispatch: Dispatch): DeviceScreen {
     if (right)
       right.innerHTML = renderBulkBarHtml("device", list.selectedKeys.length, bulkConfirming, {
         canRemove: canDeleteFromDevice,
+        canAct: canDownloadSessions && selectedEligible,
       });
 
     const countEl = elOpt("sessionsCount");
@@ -290,14 +337,25 @@ export function createDeviceScreen(dispatch: Dispatch): DeviceScreen {
       container.innerHTML = list.visible
         .map((session) => {
           const rowKey = deviceRowKey(ownerId, session.id);
+          const detail = sessionDetailStateOf(state, ownerId, session.id);
+          const verificationEligible = sessionHasUsableVerification(session);
           return sessionRowHtml(session, {
             open: ui.openRows.has(rowKey),
             deleting: confirmPhaseOf(ui, confirmTargets.deviceRowRemove(rowKey)).phase === "confirming",
             checked: ui.deviceSelection.has(session.id),
-            canDelete: canDeleteFromDevice && session.files.length > 0,
+            canDelete: canDeleteFromDevice,
+            canDownloadSession: canDownloadSessions && verificationEligible,
+            canLoadDetail: deviceSupportsSessionDetail(state, ui.activeDeviceId) && verificationEligible,
+            detailLoading: detail?.loading ?? false,
+            detailError: detail?.error ?? null,
           });
         })
         .join("");
+    }
+
+    const pagination = elOpt("sessionPagination");
+    if (pagination !== null) {
+      pagination.innerHTML = sessionPaginationHtml(sessions.length, catalog);
     }
 
     const selectAllBox = document.getElementById("selectAllBox") as HTMLInputElement | null;

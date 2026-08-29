@@ -1,0 +1,28 @@
+{
+  "schema": "ylx.bucket-publication-admission.v1",
+  "admission_id": "019a0031-0000-7a1b-8c2d-3e4f50617283",
+  "publication_id": "019a0020-0000-7a1b-8c2d-3e4f50617283",
+  "publication_schema": "ylx.bucket-publication.v4",
+  "marker": {
+    "object_key": "synthetic/qualification/ylx-transfer/550e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0020-0000-7a1b-8c2d-3e4f50617283/__ylx_evidence__/publication.json",
+    "bytes": 2503,
+    "sha256": "2702a8dad62ee497bc183f83b5414776e045b6bec1d0590a38ce733ed864234f"
+  },
+  "consumer": {
+    "name": "egoview-console",
+    "version": "0.1.0",
+    "build": {
+      "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "artifact_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  },
+  "admission_object_key": "synthetic/qualification/ylx-transfer/550e8400-e29b-41d4-a716-446655440000/01989f6d-2c00-7a1b-8c2d-3e4f50617283/019a0020-0000-7a1b-8c2d-3e4f50617283/__ylx_evidence__/admission-019a0031-0000-7a1b-8c2d-3e4f50617283.json",
+  "admitted_at": "2026-08-28T10:12:01Z",
+  "verdict": "rejected",
+  "diagnostics": [
+    {
+      "code": "timeline_verification_failed",
+      "summary": "Derived media timeline verification did not pass."
+    }
+  ]
+}

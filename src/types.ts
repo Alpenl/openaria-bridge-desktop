@@ -47,6 +47,87 @@ export type UploadStatus = "none" | "uploading" | "done" | "failed";
 export interface SessionView extends Session {
   downloadStatus: DownloadStatus;
   backedUp: boolean;
+  /** Exact gateway verification evidence carried by the device catalog. A
+   * missing verification is represented by explicit `null`, never omission. */
+  verification: SessionVerification | null;
+}
+
+export type SessionVerificationDiagnostic = string | { code: string; summary: string };
+
+export interface SessionValidatorIdentity {
+  name: string;
+  version: string;
+  buildSha256: string;
+}
+
+export interface SessionVerification {
+  verdict: "usable" | "unusable";
+  actor: string;
+  validator: SessionValidatorIdentity;
+  manifestSha256: string;
+  verifiedAt: string;
+  diagnostics: SessionVerificationDiagnostic[];
+}
+
+const BARE_LOWERCASE_SHA256 = /^[0-9a-f]{64}$/;
+
+/** UI eligibility only. The backend independently re-verifies every detail
+ * and download request; this helper merely prevents an ineligible row from
+ * offering an action in the first place. A nominally usable verdict with a
+ * malformed manifest digest remains visible but fails closed here. */
+export function sessionHasUsableVerification(session: Pick<SessionView, "verification"> | null | undefined): boolean {
+  const verification = session?.verification;
+  return (
+    verification !== null &&
+    verification !== undefined &&
+    verification.verdict === "usable" &&
+    BARE_LOWERCASE_SHA256.test(verification.manifestSha256)
+  );
+}
+
+export type CapabilitySource = "deviceDescriptor" | "profileContract" | "unavailable";
+
+/** One negotiated Device API capability. The source is retained so the UI
+ * never has to infer support from incidental response data. */
+export interface DeviceCapability {
+  supported: boolean;
+  source: CapabilitySource;
+}
+
+export interface SessionCapabilities {
+  profile: "legacyPinnedTlsV1" | "labHttpV4" | "unknown";
+  sessionDeletion: DeviceCapability;
+  sessionDetail: DeviceCapability;
+  artifactDownload: DeviceCapability;
+  captureStatus: DeviceCapability;
+}
+
+export type SessionCatalogAuthority = "deviceSnapshot" | "unavailable";
+export type SessionPaginationUnavailableReason = "catalogRevisionUnavailable";
+
+/** One quarantined catalog record reported by the device adapter. Only
+ * `message` is intended for display; the remaining fields are correlation
+ * evidence and never grant an operation capability. */
+export interface SessionCatalogDiagnostic {
+  quarantineId: string;
+  code: string;
+  observedAt: string;
+  message: string;
+}
+
+/** One bounded page of session summaries. `nextCursor` is opaque and must be
+ * returned to the backend unchanged together with a non-null
+ * `catalogRevision`. A revisionless compatibility page is first-page only. */
+export interface SessionPageView {
+  items: SessionView[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  catalogRevision: string | null;
+  catalogAuthority: SessionCatalogAuthority;
+  paginationSupported: boolean;
+  paginationUnavailableReason: SessionPaginationUnavailableReason | null;
+  capabilities: SessionCapabilities;
+  diagnostics: SessionCatalogDiagnostic[];
 }
 
 export interface LibraryEntry {
@@ -88,6 +169,8 @@ export const RPC_ERROR_CODES = [
   "manual_device_add_failed",
   "device_disconnect_failed",
   "session_list_failed",
+  "session_catalog_changed",
+  "session_detail_failed",
   "session_batch_failed",
   "session_not_found",
   "session_delete_failed",

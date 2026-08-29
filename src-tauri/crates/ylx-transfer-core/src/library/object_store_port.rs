@@ -244,6 +244,55 @@ pub struct ExpectedObject {
     pub source_sha256: SourceSha256,
 }
 
+/// One small immutable object written with S3 `If-None-Match: *` semantics.
+///
+/// This is deliberately separate from multipart upload: completion markers
+/// and consumer acknowledgements are identity-bearing JSON documents. A
+/// retry may confirm the exact existing bytes, but it must never overwrite a
+/// different document at the same key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImmutableObjectRequest {
+    pub key: ObjectKey,
+    pub bytes: Vec<u8>,
+    pub source_sha256: SourceSha256,
+    pub content_type: String,
+}
+
+/// Exact bytes and transport identity returned by a bounded object read.
+/// The caller still owns schema validation and any cross-object binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectReadback {
+    pub key: ObjectKey,
+    pub bytes: Vec<u8>,
+    pub etag: String,
+    pub version_id: Option<String>,
+    pub source_sha256_metadata: Option<SourceSha256>,
+    pub content_type: Option<String>,
+}
+
+/// One object descriptor returned by a bounded prefix listing.
+///
+/// The size is transport evidence from the LIST response. A consumer that
+/// subsequently reads the object must compare it with the exact GET body; it
+/// is not a substitute for hashing those bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedObject {
+    pub key: ObjectKey,
+    pub size_bytes: u64,
+    /// Transport identity used only to detect replacement between LIST and
+    /// GET. It is never interpreted as a content digest.
+    pub etag: String,
+}
+
+/// A deliberately bounded object listing. `is_truncated` is retained because
+/// callers making an exactly-one decision must fail closed when undisclosed
+/// additional keys may exist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectListPage {
+    pub objects: Vec<ListedObject>,
+    pub is_truncated: bool,
+}
+
 /// How a [`VerifiedObjectReceipt`]'s content digest was actually proven
 /// (issue #1, commit 70). Metadata alone never counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,6 +463,33 @@ fn format_retry_after(retry_after_ms: Option<u64>) -> String {
 /// adapters crate, per the plan's ports/adapters split (section 7.1,
 /// option D).
 pub trait ObjectStorePort: Send + Sync {
+    /// Create a small immutable object without replacing an existing key.
+    /// Returns `true` when this call created the object and `false` when the
+    /// store rejected it because the key already existed. Callers must read
+    /// the key back and compare exact bytes in both cases.
+    fn put_object_if_absent(
+        &self,
+        request: &ImmutableObjectRequest,
+    ) -> Result<bool, ObjectStoreError>;
+
+    /// Read one complete object into a bounded buffer. Implementations must
+    /// reject the response before allocating or reading beyond
+    /// `maximum_bytes`; truncation is never a successful read.
+    fn read_object_bounded(
+        &self,
+        key: &ObjectKey,
+        maximum_bytes: u64,
+    ) -> Result<ObjectReadback, ObjectStoreError>;
+
+    /// List at most `maximum_keys` objects whose full keys start with
+    /// `prefix`. Implementations must preserve truncation information so an
+    /// exactly-one consumer cannot mistake a partial page for a complete set.
+    fn list_objects_bounded(
+        &self,
+        prefix: &str,
+        maximum_keys: u16,
+    ) -> Result<ObjectListPage, ObjectStoreError>;
+
     /// Start a multipart upload. `request.source_sha256` is written as
     /// object metadata now — production adapters must send it as a
     /// signed header on `CreateMultipartUpload` so it lands in the
@@ -502,6 +578,9 @@ pub trait ObjectStorePort: Send + Sync {
 /// Which [`ObjectStorePort`] method a queued fault applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FaultPoint {
+    PutObjectIfAbsent,
+    ReadObjectBounded,
+    ListObjectsBounded,
     InitiateMultipartUpload,
     UploadPart,
     CompleteMultipartUpload,
@@ -522,6 +601,7 @@ struct StoredObject {
     /// [`MemoryObjectStore::corrupt_stored_metadata`], to model metadata
     /// drifting from what the client originally declared.
     source_sha256_metadata: SourceSha256,
+    content_type: Option<String>,
 }
 
 impl StoredObject {
@@ -540,6 +620,7 @@ struct PartRecord {
 struct InProgressUpload {
     key: ObjectKey,
     declared_source_sha256: SourceSha256,
+    content_type: Option<String>,
     parts: BTreeMap<u16, PartRecord>,
 }
 
@@ -751,6 +832,116 @@ fn validate_parts_against_record(
 }
 
 impl ObjectStorePort for MemoryObjectStore {
+    fn put_object_if_absent(
+        &self,
+        request: &ImmutableObjectRequest,
+    ) -> Result<bool, ObjectStoreError> {
+        let mut state = self.state.lock().expect("MemoryObjectStore lock poisoned");
+        if let Some(err) = Self::take_fault(&mut state, FaultPoint::PutObjectIfAbsent) {
+            return Err(err);
+        }
+        if state
+            .objects
+            .get(&request.key.0)
+            .is_some_and(|versions| !versions.is_empty())
+        {
+            return Ok(false);
+        }
+        if sha256_of(&request.bytes) != request.source_sha256 {
+            return Err(ObjectStoreError::Config(
+                "immutable object bytes do not match source_sha256".to_string(),
+            ));
+        }
+        state.next_seq += 1;
+        let version_id = if self.versioned {
+            Some(format!("mem-version-{}", state.next_seq))
+        } else {
+            None
+        };
+        let object = StoredObject {
+            bytes: request.bytes.clone(),
+            etag: fake_etag(&request.bytes),
+            version_id,
+            source_sha256_metadata: request.source_sha256,
+            content_type: Some(request.content_type.clone()),
+        };
+        state
+            .objects
+            .entry(request.key.0.clone())
+            .or_default()
+            .push(object);
+        Ok(true)
+    }
+
+    fn read_object_bounded(
+        &self,
+        key: &ObjectKey,
+        maximum_bytes: u64,
+    ) -> Result<ObjectReadback, ObjectStoreError> {
+        let mut state = self.state.lock().expect("MemoryObjectStore lock poisoned");
+        if let Some(err) = Self::take_fault(&mut state, FaultPoint::ReadObjectBounded) {
+            return Err(err);
+        }
+        let object = state
+            .objects
+            .get(&key.0)
+            .and_then(|versions| versions.last())
+            .ok_or_else(|| ObjectStoreError::NotFound(key.clone()))?;
+        if object.size_bytes() > maximum_bytes {
+            return Err(ObjectStoreError::VerificationMismatch {
+                key: key.clone(),
+                detail: format!(
+                    "object is {} bytes, exceeding bounded read limit {maximum_bytes}",
+                    object.size_bytes()
+                ),
+            });
+        }
+        Ok(ObjectReadback {
+            key: key.clone(),
+            bytes: object.bytes.clone(),
+            etag: object.etag.clone(),
+            version_id: object.version_id.clone(),
+            source_sha256_metadata: Some(object.source_sha256_metadata),
+            content_type: object.content_type.clone(),
+        })
+    }
+
+    fn list_objects_bounded(
+        &self,
+        prefix: &str,
+        maximum_keys: u16,
+    ) -> Result<ObjectListPage, ObjectStoreError> {
+        if maximum_keys == 0 {
+            return Err(ObjectStoreError::Config(
+                "bounded object listing requires maximum_keys >= 1".to_string(),
+            ));
+        }
+        let mut state = self.state.lock().expect("MemoryObjectStore lock poisoned");
+        if let Some(err) = Self::take_fault(&mut state, FaultPoint::ListObjectsBounded) {
+            return Err(err);
+        }
+        let mut objects = state
+            .objects
+            .iter()
+            .filter(|(key, versions)| key.starts_with(prefix) && !versions.is_empty())
+            .map(|(key, versions)| {
+                let object = versions.last().expect("nonempty versions checked above");
+                ListedObject {
+                    key: ObjectKey(key.clone()),
+                    size_bytes: object.size_bytes(),
+                    etag: object.etag.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        objects.sort_by(|left, right| left.key.0.cmp(&right.key.0));
+        let is_truncated = objects.len() > usize::from(maximum_keys);
+        objects.truncate(usize::from(maximum_keys));
+        Ok(ObjectListPage {
+            objects,
+            is_truncated,
+        })
+    }
+
     fn initiate_multipart_upload(
         &self,
         request: InitiateUploadRequest,
@@ -766,6 +957,7 @@ impl ObjectStorePort for MemoryObjectStore {
             InProgressUpload {
                 key: request.key.clone(),
                 declared_source_sha256: request.source_sha256,
+                content_type: request.content_type,
                 parts: BTreeMap::new(),
             },
         );
@@ -848,6 +1040,7 @@ impl ObjectStorePort for MemoryObjectStore {
                 etag: etag.clone(),
                 version_id: version_id.clone(),
                 source_sha256_metadata: upload.declared_source_sha256,
+                content_type: upload.content_type,
             });
 
         Ok(CompletedUpload {
@@ -1066,6 +1259,105 @@ mod tests {
         assert_eq!(hex.len(), 64);
         let parsed = SourceSha256::from_hex(&hex).expect("valid hex parses");
         assert_eq!(parsed, sha);
+    }
+
+    #[test]
+    fn immutable_put_never_replaces_an_existing_key_and_exact_readback_survives() {
+        let store = MemoryObjectStore::new();
+        let key = ObjectKey("publication/__ylx_evidence__/publication.json".to_string());
+        let first = b"{\"publication\":1}\n".to_vec();
+        let conflicting = b"{\"publication\":2}\n".to_vec();
+
+        assert!(store
+            .put_object_if_absent(&ImmutableObjectRequest {
+                key: key.clone(),
+                source_sha256: sha256_of(&first),
+                bytes: first.clone(),
+                content_type: "application/json".to_string(),
+            })
+            .expect("first writer creates the immutable marker"));
+        assert!(!store
+            .put_object_if_absent(&ImmutableObjectRequest {
+                key: key.clone(),
+                source_sha256: sha256_of(&conflicting),
+                bytes: conflicting,
+                content_type: "application/json".to_string(),
+            })
+            .expect("a conflicting retry receives the precondition result"));
+
+        let readback = store
+            .read_object_bounded(&key, first.len() as u64)
+            .expect("the original marker remains readable");
+        assert_eq!(readback.bytes, first);
+        assert_eq!(readback.source_sha256_metadata, Some(sha256_of(&first)));
+        assert_eq!(readback.content_type.as_deref(), Some("application/json"));
+        assert!(readback.version_id.is_some());
+        assert_eq!(store.object_count(), 1);
+    }
+
+    #[test]
+    fn bounded_read_rejects_oversize_without_returning_a_truncated_document() {
+        let store = MemoryObjectStore::new();
+        let key = ObjectKey("publication/admission.json".to_string());
+        let bytes = b"exact-admission-document".to_vec();
+        store
+            .put_object_if_absent(&ImmutableObjectRequest {
+                key: key.clone(),
+                source_sha256: sha256_of(&bytes),
+                bytes: bytes.clone(),
+                content_type: "application/json".to_string(),
+            })
+            .expect("fixture write succeeds");
+
+        let error = store
+            .read_object_bounded(&key, bytes.len() as u64 - 1)
+            .expect_err("an oversize JSON object must fail rather than truncate");
+        assert!(matches!(
+            error,
+            ObjectStoreError::VerificationMismatch { key: failed, .. } if failed == key
+        ));
+        assert_eq!(
+            store
+                .read_object_bounded(&key, bytes.len() as u64)
+                .expect("the exact bound is accepted")
+                .bytes,
+            bytes
+        );
+    }
+
+    #[test]
+    fn bounded_prefix_listing_preserves_exact_keys_sizes_and_truncation() {
+        let store = MemoryObjectStore::new();
+        let prefix = "publication/__ylx_evidence__/admission-";
+        for (key, bytes) in [
+            (format!("{prefix}019a0031.json"), b"one".as_slice()),
+            (format!("{prefix}019a0030.json"), b"two-two".as_slice()),
+            ("publication/f-content".to_string(), b"data".as_slice()),
+        ] {
+            store
+                .put_object_if_absent(&ImmutableObjectRequest {
+                    key: ObjectKey(key),
+                    source_sha256: sha256_of(bytes),
+                    bytes: bytes.to_vec(),
+                    content_type: "application/json".to_string(),
+                })
+                .unwrap();
+        }
+
+        let first = store.list_objects_bounded(prefix, 1).unwrap();
+        assert!(first.is_truncated);
+        assert_eq!(first.objects.len(), 1);
+        assert!(first.objects[0].key.0.ends_with("019a0030.json"));
+        assert_eq!(first.objects[0].size_bytes, 7);
+
+        let complete = store.list_objects_bounded(prefix, 2).unwrap();
+        assert!(!complete.is_truncated);
+        assert_eq!(complete.objects.len(), 2);
+        assert_eq!(complete.objects[1].size_bytes, 3);
+        assert!(matches!(
+            store.list_objects_bounded(prefix, 0),
+            Err(ObjectStoreError::Config(_))
+        ));
     }
 
     #[test]

@@ -13,6 +13,7 @@
 import type { Dispatch, UiAction } from "./actions";
 import type { AppView } from "./appView";
 import type { AppUpdater, AppUpdateProgress, PendingAppUpdate } from "../runtime/appUpdater";
+import { describeAppUpdateFailure, type AppUpdateStage } from "../runtime/appUpdateError";
 import { batchFeedback } from "../batchResult";
 import {
   asDeviceId,
@@ -51,8 +52,13 @@ import {
   createAppStore,
   deviceById,
   deviceDisplayIdOf,
+  deviceSupportsSessionDetail,
+  deviceSupportsSessionDeletion as stateSupportsSessionDeletion,
+  deviceSupportsSessionDownload,
   devicesOf,
   libraryOf,
+  sessionCatalogOf,
+  sessionDetailStateOf,
   sessionsOf,
   storageOf,
   transferJobsOf,
@@ -87,12 +93,14 @@ import { formatBytes } from "../format";
 import {
   libraryEntryCanUpload,
   libraryEntryKey,
+  sessionHasUsableVerification,
   storageConfigured,
   type Device,
   type LibraryEntry,
   type PairingResolutionPayload,
   type PairingTickPayload,
   type SaveStorageConfigInput,
+  type SessionPageView,
   type SessionView,
   type StorageConfig,
   type Transfer,
@@ -155,6 +163,15 @@ function settingsValueIntentKey(value: string | boolean): string {
   return JSON.stringify(value);
 }
 
+const CATALOG_REVISION_PATTERN = /^sha256:[0-9a-f]{64}$/;
+
+function catalogChangedRevision(error: unknown): string | null {
+  const rpcError = backendRpcError(error);
+  if (rpcError?.code !== "session_catalog_changed") return null;
+  const revision = rpcError.details?.catalogRevision;
+  return typeof revision === "string" && CATALOG_REVISION_PATTERN.test(revision) ? revision : null;
+}
+
 export function createTransferApp(options: TransferAppOptions): TransferApp {
   const { backend, clock, toast, updater } = options;
   const store = options.store ?? createAppStore();
@@ -167,6 +184,7 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
   let startPromise: Promise<void> | null = null;
   let paintedDevice: Device | undefined;
   let lastLibraryReconcileStartedAt = 0;
+  let sessionCatalogGeneration = 0;
   let trayFrameCancel: (() => void) | null = null;
   const scheduleFrame = options.frameScheduler ?? ((run: () => void) => scheduleAnimationFrame(run, clock));
 
@@ -240,8 +258,7 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
   }
 
   function deviceSupportsSessionDeletion(deviceId: DeviceId | null): boolean {
-    if (deviceId === null) return false;
-    return (sessionsOf(state(), deviceId) ?? []).some((session) => session.files.length > 0);
+    return stateSupportsSessionDeletion(state(), deviceId);
   }
 
   function reportUnsupportedDeviceSessionDeletion(): void {
@@ -485,6 +502,8 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
   let updateProgress: AppUpdateProgress | null = null;
   let updateMessage: string | null = updater === undefined ? "此构建未启用应用内更新" : null;
   let updateError: string | null = null;
+  let updateGeneration = 0;
+  let currentVersionPromise: Promise<string | null> | null = null;
 
   function updateViewModel() {
     return {
@@ -517,24 +536,45 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
   }
 
   function renderUpdateSettings(): void {
+    if (disposed) return;
     view.renderUpdateSettings(updateViewModel());
   }
 
+  function currentUpdate(generation: number): boolean {
+    return !disposed && generation === updateGeneration;
+  }
+
+  function loadCurrentAppVersion(): Promise<string | null> {
+    if (updater === undefined) return Promise.resolve(null);
+    if (currentAppVersion !== null) return Promise.resolve(currentAppVersion);
+    if (currentVersionPromise === null) {
+      currentVersionPromise = updater
+        .currentVersion()
+        .then((version) => {
+          currentAppVersion = version;
+          return version;
+        })
+        .catch(() => null)
+        .finally(() => {
+          currentVersionPromise = null;
+        });
+    }
+    return currentVersionPromise;
+  }
+
   async function openUpdateSettings(): Promise<void> {
+    if (disposed) return;
     view.openUpdateSettings(updateViewModel());
     if (updater !== undefined && currentAppVersion === null) {
-      try {
-        currentAppVersion = await updater.currentVersion();
-        if (!disposed) renderUpdateSettings();
-      } catch {
-        currentAppVersion = null;
-      }
+      await loadCurrentAppVersion();
+      renderUpdateSettings();
     }
   }
 
-  function failUpdate(error: unknown): void {
+  function failUpdate(error: unknown, stage: AppUpdateStage, generation: number): void {
+    if (!currentUpdate(generation)) return;
     updateStatus = "failed";
-    updateError = describeBackendError(error);
+    updateError = describeAppUpdateFailure(error, stage);
     updateMessage = null;
     updateProgress = null;
     renderUpdateSettings();
@@ -542,8 +582,19 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
   }
 
   async function checkForUpdate(): Promise<void> {
-    if (updater === undefined) return;
-    await pendingUpdate?.close().catch(() => undefined);
+    if (
+      updater === undefined ||
+      disposed ||
+      updateStatus === "checking" ||
+      updateStatus === "downloading" ||
+      updateStatus === "installing" ||
+      updateStatus === "restarting"
+    ) {
+      return;
+    }
+
+    const generation = ++updateGeneration;
+    const previousUpdate = pendingUpdate;
     pendingUpdate = null;
     updateProgress = null;
     updateStatus = "checking";
@@ -551,9 +602,17 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
     updateMessage = "正在检查更新";
     renderUpdateSettings();
     try {
+      await previousUpdate?.close();
+      if (!currentUpdate(generation)) return;
+
       const update = await updater.check();
+      if (!currentUpdate(generation)) {
+        await update?.close().catch(() => undefined);
+        return;
+      }
       if (update === null) {
-        currentAppVersion = currentAppVersion ?? (await updater.currentVersion().catch(() => null));
+        await loadCurrentAppVersion();
+        if (!currentUpdate(generation)) return;
         updateStatus = "current";
         updateMessage = "已是最新版本";
       } else {
@@ -564,32 +623,55 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
       }
       renderUpdateSettings();
     } catch (error) {
-      failUpdate(error);
+      failUpdate(error, "check", generation);
     }
   }
 
   async function installUpdate(): Promise<void> {
-    if (updater === undefined || pendingUpdate === null || updateStatus !== "available") return;
+    if (updater === undefined || pendingUpdate === null || updateStatus !== "available" || disposed) return;
+    const generation = ++updateGeneration;
+    const update = pendingUpdate;
     updateStatus = "downloading";
     updateError = null;
     updateMessage = "正在下载更新";
     updateProgress = { downloadedBytes: 0, totalBytes: null };
     renderUpdateSettings();
     try {
-      await pendingUpdate.downloadAndInstall((progress) => {
-        if (disposed) return;
+      await update.downloadAndInstall((progress) => {
+        if (!currentUpdate(generation)) return;
         updateStatus = "downloading";
         updateProgress = progress;
         renderUpdateSettings();
       });
+      if (!currentUpdate(generation)) return;
+      if (pendingUpdate === update) pendingUpdate = null;
+      await update.close().catch(() => undefined);
+      if (!currentUpdate(generation)) return;
       updateStatus = "restarting";
       updateMessage = "更新已安装，正在重启";
       updateProgress = null;
       renderUpdateSettings();
       await updater.relaunch();
     } catch (error) {
-      failUpdate(error);
+      failUpdate(error, "download", generation);
     }
+  }
+
+  function closeUpdateSettings(): void {
+    if (disposed) return;
+    if (updateStatus === "downloading" || updateStatus === "installing" || updateStatus === "restarting") {
+      view.closeUpdateSettings();
+      return;
+    }
+    ++updateGeneration;
+    const update = pendingUpdate;
+    pendingUpdate = null;
+    updateStatus = "idle";
+    updateProgress = null;
+    updateMessage = null;
+    updateError = null;
+    void update?.close().catch(() => undefined);
+    view.closeUpdateSettings();
   }
 
   function commitSessionMutation(
@@ -622,8 +704,9 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
   /* device navigation                                                   */
   /* ------------------------------------------------------------------ */
 
-  const deviceNavigation = createDeviceNavigationController<{ revision: number; value: SessionView[] }>({
+  const deviceNavigation = createDeviceNavigationController<{ revision: number; value: SessionPageView }>({
     onBegin: (deviceId, activate) => {
+      sessionCatalogGeneration += 1;
       if (activate) {
         invalidatePendingMediaUi();
         viewGuard.invalidate();
@@ -640,10 +723,16 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
       paintTopbar();
       paintContent();
     },
-    loadSessions: (deviceId) => backend.listSessions(asDeviceId(deviceId)),
+    loadSessions: (deviceId) => backend.listSessions(asDeviceId(deviceId), null, null),
     isCurrent: (deviceId) => isActiveDeviceView(deviceId) && deviceById(state(), deviceId)?.state === "connected",
     onLoaded: (deviceId, loaded) => {
-      commit({ type: "sessions/loaded", revision: loaded.revision, deviceId, sessions: loaded.value });
+      commit({
+        type: "sessions/pageLoaded",
+        revision: loaded.revision,
+        deviceId,
+        page: loaded.value,
+        mode: "replace",
+      });
       paintTopbar();
       paintContent();
     },
@@ -662,12 +751,220 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
       paintContent();
     },
     onInvalidated: () => {
+      sessionCatalogGeneration += 1;
       viewGuard.invalidate();
     },
   });
 
   function focusDevice(deviceId: DeviceId): Promise<unknown> {
     return deviceNavigation.focus(deviceId);
+  }
+
+  async function loadMoreSessions(deviceId: DeviceId): Promise<void> {
+    const catalog = sessionCatalogOf(state(), deviceId);
+    const cursor = catalog.nextCursor;
+    const catalogRevision = catalog.catalogRevision;
+    if (
+      !catalog.paginationSupported ||
+      !catalog.hasMore ||
+      cursor === null ||
+      catalogRevision === null ||
+      catalog.loadingMore
+    ) {
+      return;
+    }
+
+    const generation = sessionCatalogGeneration;
+    commit({ type: "sessions/loadMoreStarted", deviceId, catalogRevision, cursor });
+    paintTopbar();
+    paintList();
+    try {
+      const loaded = await backend.listSessions(deviceId, cursor, catalogRevision);
+      if (
+        disposed ||
+        generation !== sessionCatalogGeneration ||
+        !isActiveDeviceView(deviceId) ||
+        sessionCatalogOf(state(), deviceId).catalogRevision !== catalogRevision
+      ) {
+        return;
+      }
+      const committed = commit({
+        type: "sessions/pageLoaded",
+        revision: loaded.revision,
+        deviceId,
+        page: loaded.value,
+        mode: "append",
+        expectedCatalogRevision: catalogRevision,
+      });
+      if (committed.stale) {
+        // A page can be rejected after the transport succeeds (for example,
+        // a cross-page duplicate identity or a newest-first boundary
+        // violation).  The reducer must keep the authoritative rows, while
+        // the controller still settles the loading affordance so the user
+        // has a visible retry path instead of a permanent spinner.
+        const error = "设备返回了无效的会话分页，已保留当前目录，请重试";
+        const failed = commit({
+          type: "sessions/loadMoreFailed",
+          deviceId,
+          catalogRevision,
+          cursor,
+          error,
+        });
+        if (failed.changed) {
+          toast(`无法加载更多会话：${error}`, "danger");
+          paintTopbar();
+          paintList();
+        }
+        return;
+      }
+      paintTopbar();
+      paintList();
+    } catch (error) {
+      if (
+        disposed ||
+        generation !== sessionCatalogGeneration ||
+        !isActiveDeviceView(deviceId) ||
+        sessionCatalogOf(state(), deviceId).catalogRevision !== catalogRevision
+      ) {
+        return;
+      }
+      if (catalogChangedRevision(error) !== null) {
+        deviceNavigation.invalidate();
+        commit({ type: "sessions/catalogInvalidated", deviceId, catalogRevision, cursor });
+        paintTopbar();
+        paintList();
+        await deviceNavigation.refresh(deviceId);
+        return;
+      }
+      const message = describeBackendError(error);
+      commit({ type: "sessions/loadMoreFailed", deviceId, catalogRevision, cursor, error: message });
+      toast(`无法加载更多会话：${message}`, "danger");
+      paintTopbar();
+      paintList();
+    }
+  }
+
+  function sessionFor(deviceId: DeviceId, sessionId: SessionId): SessionView | undefined {
+    return (sessionsOf(state(), deviceId) ?? []).find((session) => session.id === sessionId);
+  }
+
+  async function ensureSessionDetail(
+    deviceId: DeviceId,
+    sessionId: SessionId,
+    reportUnavailable = true,
+  ): Promise<SessionView | null> {
+    const summary = sessionFor(deviceId, sessionId);
+    if (summary === undefined) return null;
+    if (!sessionHasUsableVerification(summary) || summary.verification === null) {
+      if (reportUnavailable) toast("会话未通过网关验证，无法读取详情或下载", "danger");
+      return null;
+    }
+    const catalog = sessionCatalogOf(state(), deviceId);
+    if (!deviceSupportsSessionDetail(state(), deviceId)) {
+      toast("当前设备未提供可验证的会话详情", "danger");
+      return null;
+    }
+    if (summary.files.length > 0) return summary;
+    const existing = sessionDetailStateOf(state(), deviceId, summary.id);
+    if (existing?.loading) return null;
+
+    const catalogRevision = catalog.catalogRevision;
+    const sessionRevision = summary.revision;
+    const manifestSha256 = summary.verification.manifestSha256;
+    // This local generation fences UI work independently of the device-owned
+    // catalog revision, which is legitimately null for v2 compatibility.
+    const generation = sessionCatalogGeneration;
+    const capture = viewGuard.capture();
+    commit({
+      type: "sessions/detailStarted",
+      deviceId,
+      sessionId,
+      sessionRevision,
+      catalogRevision,
+      manifestSha256,
+    });
+    paintList();
+    try {
+      const loaded = await backend.getSessionDetail(deviceId, sessionId, sessionRevision, catalogRevision);
+      if (
+        disposed ||
+        generation !== sessionCatalogGeneration ||
+        !capture.isCurrent() ||
+        !isActiveDeviceView(deviceId)
+      ) {
+        return null;
+      }
+      if (
+        loaded.value.id !== sessionId ||
+        !sessionHasUsableVerification(loaded.value) ||
+        loaded.value.verification?.manifestSha256 !== manifestSha256
+      ) {
+        const message = "会话验证证据已变化，请刷新列表后重试";
+        commit({
+          type: "sessions/detailFailed",
+          deviceId,
+          sessionId,
+          sessionRevision,
+          catalogRevision,
+          manifestSha256,
+          error: message,
+        });
+        toast(message, "danger");
+        paintList();
+        return null;
+      }
+      const committed = commit({
+        type: "sessions/detailLoaded",
+        revision: loaded.revision,
+        deviceId,
+        detail: loaded.value,
+        sessionRevision,
+        catalogRevision,
+        manifestSha256,
+      });
+      paintList();
+      return committed.stale ? null : loaded.value;
+    } catch (error) {
+      if (
+        disposed ||
+        generation !== sessionCatalogGeneration ||
+        !capture.isCurrent() ||
+        !isActiveDeviceView(deviceId)
+      ) {
+        return null;
+      }
+      const message = describeBackendError(error);
+      commit({
+        type: "sessions/detailFailed",
+        deviceId,
+        sessionId,
+        sessionRevision,
+        catalogRevision,
+        manifestSha256,
+        error: message,
+      });
+      toast(`无法读取会话详情：${message}`, "danger");
+      paintList();
+      return null;
+    }
+  }
+
+  async function downloadSessionWithDetail(deviceId: DeviceId, sessionId: SessionId): Promise<void> {
+    if (!deviceSupportsSessionDownload(state(), deviceId)) {
+      toast("当前设备未提供经过协商的文件下载能力", "danger");
+      return;
+    }
+    const summary = sessionFor(deviceId, sessionId);
+    if (!sessionHasUsableVerification(summary)) {
+      toast("会话未通过网关验证，无法下载", "danger");
+      return;
+    }
+    const detail = await ensureSessionDetail(deviceId, sessionId);
+    if (detail === null || !sessionHasUsableVerification(detail)) return;
+    await runner.run({
+      key: `device:download:${deviceId}:${sessionId}`,
+      run: () => backend.downloadSession(deviceId, sessionId),
+    });
   }
 
   /* ------------------------------------------------------------------ */
@@ -813,15 +1110,26 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
     });
   }
 
-  function downloadAllNew(deviceId: DeviceId): void {
-    const pending = (sessionsOf(state(), deviceId) ?? []).filter(
-      (s) => s.downloadStatus === "none" || s.downloadStatus === "failed",
-    );
-    if (pending.length === 0) {
-      toast("没有新数据需要下载", "success");
+  async function downloadAllNew(deviceId: DeviceId): Promise<void> {
+    if (!deviceSupportsSessionDownload(state(), deviceId)) {
+      toast("当前设备未提供经过协商的文件下载能力", "danger");
       return;
     }
-    void runner.run({
+    while (sessionCatalogOf(state(), deviceId).hasMore) {
+      const before = sessionCatalogOf(state(), deviceId);
+      if (before.loadingMore) return;
+      await loadMoreSessions(deviceId);
+      const after = sessionCatalogOf(state(), deviceId);
+      if (after.catalogRevision !== before.catalogRevision || after.nextCursor === before.nextCursor) return;
+    }
+    const pending = (sessionsOf(state(), deviceId) ?? []).filter(
+      (s) => sessionHasUsableVerification(s) && (s.downloadStatus === "none" || s.downloadStatus === "failed"),
+    );
+    if (pending.length === 0) {
+      toast("没有已验证的新数据需要下载", "success");
+      return;
+    }
+    await runner.run({
       key: `device:downloadAll:${deviceId}`,
       run: () =>
         backend.downloadSessions(
@@ -946,14 +1254,27 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
     if (scope === "device") {
       const deviceId = activeDeviceId();
       if (deviceId === null) return;
+      if (!deviceSupportsSessionDownload(state(), deviceId)) {
+        toast("当前设备未提供经过协商的会话下载能力", "danger");
+        return;
+      }
+      const eligible = selected.filter((sessionId) =>
+        sessionHasUsableVerification(sessionFor(deviceId, asSessionId(sessionId))),
+      );
+      if (eligible.length === 0) {
+        toast("所选会话均未通过网关验证，无法下载", "danger");
+        return;
+      }
+      const skipped = selected.length - eligible.length;
       await runner.run({
         key: `device:bulkDownload:${deviceId}`,
-        run: () => backend.downloadSessions(deviceId, selected.map(asSessionId)),
+        run: () => backend.downloadSessions(deviceId, eligible.map(asSessionId)),
         commit: (result) => {
           for (const id of acceptedItems(result.items)) {
             commit({ type: "ui/select", scope: "device", key: id, selected: false });
           }
           showBatchFeedback("已加入下载队列", result.items);
+          if (skipped > 0) toast(`已跳过 ${skipped} 项未通过验证的会话`, "danger");
           repaint();
         },
       });
@@ -1578,6 +1899,9 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
           if (outcome === "applied") toast("已刷新会话列表", "success");
         });
         return;
+      case "device/loadMoreSessions":
+        void loadMoreSessions(action.deviceId);
+        return;
       case "media/open":
         if (mediaRuntime === null) return;
         if (ui().view !== "media") {
@@ -1714,7 +2038,7 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
       }
 
       case "device/downloadAllNew":
-        downloadAllNew(action.deviceId);
+        void downloadAllNew(action.deviceId);
         return;
       case "device/cleanupBackedUp":
         cleanupBackedUp(action.deviceId);
@@ -1774,16 +2098,11 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
         return;
 
       case "session/download":
-        void runner.run({
-          key: `device:download:${action.deviceId}:${action.sessionId}`,
-          run: () => backend.downloadSession(action.deviceId, action.sessionId),
-        });
+        void downloadSessionWithDetail(action.deviceId, action.sessionId);
         return;
-      case "session/downloadFile":
-        void runner.run({
-          key: `device:downloadFile:${action.deviceId}:${action.sessionId}:${action.fileId}`,
-          run: () => backend.downloadFile(action.deviceId, action.sessionId, action.fileId),
-        });
+      case "session/loadDetail":
+        if (!ui().openRows.has(rowKeyFor("device", action.deviceId, action.sessionId))) return;
+        void ensureSessionDetail(action.deviceId, action.sessionId, false);
         return;
       case "session/remove":
         removeSession(action.deviceId, action.sessionId);
@@ -1919,7 +2238,7 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
         void openUpdateSettings();
         return;
       case "updates/close":
-        view.closeUpdateSettings();
+        closeUpdateSettings();
         return;
       case "updates/check":
         void checkForUpdate();
@@ -2055,6 +2374,10 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
   function dispose(): void {
     if (disposed) return;
     disposed = true;
+    ++updateGeneration;
+    const update = pendingUpdate;
+    pendingUpdate = null;
+    void update?.close().catch(() => undefined);
     ++mediaFolderGeneration;
     ++mediaBatchGeneration;
     session?.dispose();

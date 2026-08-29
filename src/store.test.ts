@@ -44,6 +44,14 @@ function session(id: string): SessionView {
     files: [],
     downloadStatus: "none",
     backedUp: false,
+    verification: {
+      verdict: "usable",
+      actor: "gateway",
+      validator: { name: "catalog-validator", version: "1", buildSha256: "b".repeat(64) },
+      manifestSha256: "a".repeat(64),
+      verifiedAt: "2026-08-03T00:00:01Z",
+      diagnostics: [],
+    },
   };
 }
 

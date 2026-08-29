@@ -19,12 +19,16 @@ use crate::application::{
 };
 use crate::composition;
 use crate::models::{
-    LibraryEntry, SaveStorageConfigInput, SessionView, StorageConfig, StorageConfigView,
+    LibraryEntry, SaveStorageConfigInput, SessionPageView, SessionView, StorageConfig,
+    StorageConfigView,
 };
 use crate::state::AppData;
 
 #[cfg(feature = "demo")]
-use crate::models::{DeviceState, TransferDirection, TransferState};
+use crate::models::{
+    DeviceState, SessionApiProfile, SessionCapability, SessionCapabilitySource,
+    SessionCatalogAuthority, SessionPageCapabilities, TransferDirection, TransferState,
+};
 #[cfg(feature = "demo")]
 use crate::sim::{self, DemoTransferContext, StartTransferArgs};
 
@@ -47,6 +51,23 @@ where
         .map_err(|error| format!("内部错误（{operation}任务异常终止）：{error}"))?
 }
 
+async fn run_session_page_blocking<T, F>(
+    operation: &str,
+    task: F,
+) -> Result<T, composition::SessionCatalogPageError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, composition::SessionCatalogPageError> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|error| {
+            composition::SessionCatalogPageError::Other(format!(
+                "内部错误（{operation}任务异常终止）：{error}"
+            ))
+        })?
+}
+
 fn unique_items(items: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     items
@@ -62,6 +83,25 @@ fn item_error(
     details: serde_json::Value,
 ) -> RpcError {
     RpcError::new(code, message, retryable, Some(details))
+}
+
+fn session_list_failure(message: impl Into<String>) -> RpcError {
+    RpcError::new("session_list_failed", message, true, None)
+}
+
+fn session_page_rpc_error(error: composition::SessionCatalogPageError) -> RpcError {
+    match error {
+        composition::SessionCatalogPageError::CatalogChanged {
+            catalog_revision,
+            message,
+        } => RpcError::new(
+            "session_catalog_changed",
+            message,
+            true,
+            Some(serde_json::json!({ "catalogRevision": catalog_revision })),
+        ),
+        composition::SessionCatalogPageError::Other(message) => session_list_failure(message),
+    }
 }
 
 impl TransferApplication {
@@ -108,6 +148,7 @@ impl TransferApplication {
         app: AppHandle,
         device_id: String,
     ) -> Result<String, String> {
+        self.invalidate_session_catalog(&device_id);
         #[cfg(feature = "demo")]
         {
             let is_demo = {
@@ -192,6 +233,7 @@ impl TransferApplication {
     }
 
     pub async fn disconnect_device(&self, device_id: String) -> Result<(), String> {
+        self.invalidate_session_catalog(&device_id);
         #[cfg(feature = "demo")]
         {
             let handled = {
@@ -237,32 +279,219 @@ impl TransferApplication {
     pub async fn list_sessions(
         &self,
         device_id: String,
-    ) -> Result<Revisioned<Vec<SessionView>>, String> {
+        cursor: Option<String>,
+        catalog_revision: Option<String>,
+    ) -> Result<Revisioned<SessionPageView>, RpcError> {
+        let (device_id, session_operation) = self
+            .acquire_session_operation(&device_id)
+            .await
+            .map_err(session_list_failure)?;
+        let application = self.clone();
+        run_session_page_blocking("刷新设备会话", move || {
+            let _session_operation = session_operation;
+            let expected_connection_epoch = application.validate_session_page_request(
+                &device_id,
+                cursor.as_deref(),
+                catalog_revision.as_deref(),
+            )?;
+            let read = application.list_session_page_sync(
+                &device_id,
+                cursor.as_deref(),
+                catalog_revision.as_deref(),
+                expected_connection_epoch,
+            )?;
+            let (publication, page) = application.publish_session_page(
+                &device_id,
+                cursor.as_deref(),
+                catalog_revision.as_deref(),
+                read.connection_epoch,
+                read.page,
+            )?;
+            Ok(Revisioned::new(publication.revision, page))
+        })
+        .await
+        .map_err(session_page_rpc_error)
+    }
+
+    fn list_session_page_sync(
+        &self,
+        device_id: &str,
+        cursor: Option<&str>,
+        catalog_revision: Option<&str>,
+        expected_connection_epoch: Option<u64>,
+    ) -> Result<composition::SessionCatalogPageRead, composition::SessionCatalogPageError> {
+        let composition = {
+            let data = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            #[cfg(feature = "demo")]
+            if data.sessions.contains_key(device_id) {
+                let items = data.session_views(device_id);
+                let revision = format!("demo:{device_id}:{}", items.len());
+                if catalog_revision.is_some_and(|expected| expected != revision) {
+                    return Err("演示会话目录已变化，请从第一页重新刷新".to_string().into());
+                }
+                let offset = match cursor {
+                    None => 0,
+                    Some(cursor) => cursor
+                        .strip_prefix("demo-page:")
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .filter(|offset| *offset <= items.len())
+                        .ok_or_else(|| {
+                            composition::SessionCatalogPageError::Other(
+                                "演示会话分页 cursor 无效".to_string(),
+                            )
+                        })?,
+                };
+                let end = offset.saturating_add(50).min(items.len());
+                let next_cursor = (end < items.len()).then(|| format!("demo-page:{end}"));
+                return Ok(composition::SessionCatalogPageRead {
+                    page: SessionPageView {
+                        items: items[offset..end].to_vec(),
+                        diagnostics: Vec::new(),
+                        has_more: next_cursor.is_some(),
+                        next_cursor,
+                        catalog_revision: Some(revision),
+                        catalog_authority: SessionCatalogAuthority::DeviceSnapshot,
+                        pagination_supported: true,
+                        pagination_unavailable_reason: None,
+                        capabilities: SessionPageCapabilities {
+                            profile: SessionApiProfile::LegacyPinnedTlsV1,
+                            session_deletion: SessionCapability {
+                                supported: true,
+                                source: SessionCapabilitySource::ProfileContract,
+                            },
+                            session_detail: SessionCapability {
+                                supported: true,
+                                source: SessionCapabilitySource::ProfileContract,
+                            },
+                            artifact_download: SessionCapability {
+                                supported: true,
+                                source: SessionCapabilitySource::ProfileContract,
+                            },
+                            capture_status: SessionCapability::unavailable(),
+                        },
+                    },
+                    connection_epoch: 0,
+                });
+            }
+            data.composition.clone()
+        };
+        let mut read = composition.read_session_page(
+            device_id,
+            cursor,
+            catalog_revision,
+            expected_connection_epoch,
+        )?;
+        let session_ids = read
+            .page
+            .items
+            .iter()
+            .map(|item| item.session.id.clone())
+            .collect::<HashSet<_>>();
+        let device_keys = composition
+            .local_library_device_keys(device_id)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let library = {
+            let data = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            clone_matching_library_entries(&data.library, &device_keys, &session_ids)
+        };
+        composition.apply_local_session_state_to_items(
+            device_id,
+            &library,
+            &mut read.page.items,
+        )?;
+        Ok(read)
+    }
+
+    pub async fn get_session_detail(
+        &self,
+        device_id: String,
+        session_id: String,
+        session_revision: String,
+        catalog_revision: Option<String>,
+    ) -> Result<Revisioned<SessionView>, String> {
         let (device_id, session_operation) = self.acquire_session_operation(&device_id).await?;
         let application = self.clone();
-        run_blocking("刷新设备会话", move || {
+        run_blocking("读取设备会话详情", move || {
             let _session_operation = session_operation;
-            let sessions = application.list_sessions_sync(&device_id)?;
-            let publication = application.publish_sessions(&device_id, sessions.clone());
-            Ok(Revisioned::new(publication.revision, sessions))
+            let authorization = application.validate_session_detail_request(
+                &device_id,
+                &session_id,
+                &session_revision,
+                catalog_revision.as_deref(),
+            )?;
+            let detail =
+                application.get_session_detail_sync(&device_id, &session_id, &authorization)?;
+            let publication = application.publish_session_detail(
+                &device_id,
+                catalog_revision.as_deref(),
+                authorization.connection_epoch,
+                detail.clone(),
+            )?;
+            Ok(Revisioned::new(publication.revision, detail))
         })
         .await
     }
 
-    fn list_sessions_sync(&self, device_id: &str) -> Result<Vec<SessionView>, String> {
-        let data = self
-            .0
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        #[cfg(feature = "demo")]
-        if data.sessions.contains_key(device_id) {
-            return Ok(data.session_views(device_id));
-        }
-        let composition = data.composition.clone();
-        let library = data.library.clone();
-        drop(data);
-        composition.list_sessions_with_local_state(device_id, &library)
+    fn get_session_detail_sync(
+        &self,
+        device_id: &str,
+        session_id: &str,
+        authorization: &crate::application::SessionReadAuthorization,
+    ) -> Result<SessionView, String> {
+        let composition = {
+            let data = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            #[cfg(feature = "demo")]
+            if data.sessions.contains_key(device_id) {
+                return data
+                    .session_views(device_id)
+                    .into_iter()
+                    .find(|item| {
+                        item.session.id == session_id
+                            && item.session.revision == authorization.session_revision
+                    })
+                    .ok_or_else(|| "演示会话 revision 已变化，请刷新列表".to_string());
+            }
+            data.composition.clone()
+        };
+        let mut detail = composition.read_session_detail(
+            device_id,
+            session_id,
+            &authorization.session_revision,
+            authorization.connection_epoch,
+            authorization.verification.as_ref(),
+        )?;
+        let session_ids = HashSet::from([detail.session.id.clone()]);
+        let device_keys = composition
+            .local_library_device_keys(device_id)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let library = {
+            let data = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            clone_matching_library_entries(&data.library, &device_keys, &session_ids)
+        };
+        composition.apply_local_session_state_to_items(
+            device_id,
+            &library,
+            std::slice::from_mut(&mut detail),
+        )?;
+        Ok(detail)
     }
 
     pub async fn delete_sessions(
@@ -667,7 +896,7 @@ impl TransferApplication {
     fn remove_library_entries_sync(&self, keys: Vec<String>) -> LibraryMutationResult {
         enum DeleteBatchError {
             Busy(String),
-            Failed(String),
+            Failed(crate::library_delete::DeleteFailure),
         }
 
         let keys = unique_items(keys);
@@ -722,11 +951,19 @@ impl TransferApplication {
         if !candidates.is_empty() {
             let result = (|| -> Result<crate::library_delete::DeleteOutcome, DeleteBatchError> {
                 let store = ylx_transfer_core::persistence::AppStore::open(&store_path).map_err(
-                    |error| DeleteBatchError::Failed(format!("无法打开本地资料库存储：{error}")),
+                    |error| {
+                        DeleteBatchError::Failed(crate::library_delete::DeleteFailure::from(
+                            format!("无法打开本地资料库存储：{error}"),
+                        ))
+                    },
                 )?;
                 for key in &candidate_keys {
                     if let Some(reason) = crate::library_delete::entry_busy_reason(&store, key)
-                        .map_err(DeleteBatchError::Failed)?
+                        .map_err(|error| {
+                            DeleteBatchError::Failed(crate::library_delete::DeleteFailure::from(
+                                error,
+                            ))
+                        })?
                     {
                         return Err(DeleteBatchError::Busy(reason));
                     }
@@ -758,25 +995,51 @@ impl TransferApplication {
                         .state
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    data.release_library_delete_keys(&candidate_keys);
-                    let (code, message, retryable) = match error {
-                        DeleteBatchError::Busy(message) => ("library_delete_busy", message, true),
-                        DeleteBatchError::Failed(message) => {
-                            ("library_delete_failed", message, false)
+                    let (code, message, retryable, incomplete, operation_id, committed_revision) =
+                        match error {
+                            DeleteBatchError::Busy(message) => {
+                                ("library_delete_busy", message, true, false, None, None)
+                            }
+                            DeleteBatchError::Failed(failure) => {
+                                let operation_id = failure.operation_id.clone();
+                                let committed_revision = failure.committed_revision;
+                                let incomplete = failure.incomplete;
+                                let code = if incomplete {
+                                    "library_delete_cleanup_incomplete"
+                                } else {
+                                    "library_delete_failed"
+                                };
+                                (
+                                    code,
+                                    failure.message,
+                                    failure.retryable,
+                                    incomplete,
+                                    operation_id,
+                                    committed_revision,
+                                )
+                            }
+                        };
+                    if incomplete {
+                        if let Some(committed_revision) = committed_revision {
+                            data.library.retain(|entry| {
+                                !candidate_keys.iter().any(|key| key == &entry.key())
+                            });
+                            data.set_store_revision(committed_revision);
                         }
-                    };
+                    }
+                    data.release_library_delete_keys(&candidate_keys);
                     results.extend(candidate_keys.into_iter().map(|item| {
+                        let mut details = serde_json::json!({
+                            "key": item,
+                            "cause": message,
+                            "incomplete": incomplete,
+                        });
+                        if let Some(operation_id) = operation_id.as_deref() {
+                            details["operationId"] = serde_json::json!(operation_id);
+                        }
                         BatchItemResult::failure(
                             item.clone(),
-                            item_error(
-                                code,
-                                message.clone(),
-                                retryable,
-                                serde_json::json!({
-                                    "key": item,
-                                    "cause": message,
-                                }),
-                            ),
+                            item_error(code, message.clone(), retryable, details),
                         )
                     }));
                 }
@@ -825,8 +1088,10 @@ impl TransferApplication {
         device_id: String,
         session_id: String,
     ) -> Result<String, String> {
+        let (device_id, session_operation) = self.acquire_session_operation(&device_id).await?;
         let application = self.clone();
         run_blocking("创建会话下载任务", move || {
+            let _session_operation = session_operation;
             application.download_session_sync(&app, device_id, session_id)
         })
         .await
@@ -871,7 +1136,8 @@ impl TransferApplication {
         }
         #[cfg(not(feature = "demo"))]
         let _app = app;
-        composition::download_session(&self.0.composition, &device_id, &session_id)
+        let authorization = self.authorize_session_artifact_request(&device_id, &session_id)?;
+        composition::download_session(&self.0.composition, &device_id, &session_id, &authorization)
     }
 
     pub async fn download_sessions(
@@ -880,8 +1146,10 @@ impl TransferApplication {
         device_id: String,
         session_ids: Vec<String>,
     ) -> Result<BatchJobResult, String> {
+        let (device_id, session_operation) = self.acquire_session_operation(&device_id).await?;
         let application = self.clone();
         run_blocking("批量创建会话下载任务", move || {
+            let _session_operation = session_operation;
             let mut results = Vec::new();
             for session_id in unique_items(session_ids) {
                 match application.download_session_sync(&app, device_id.clone(), session_id.clone())
@@ -902,58 +1170,6 @@ impl TransferApplication {
                 }
             }
             Ok(BatchJobResult { results })
-        })
-        .await
-    }
-
-    pub async fn download_file(
-        &self,
-        app: AppHandle,
-        device_id: String,
-        session_id: String,
-        file_id: String,
-    ) -> Result<String, String> {
-        let application = self.clone();
-        run_blocking("创建文件下载任务", move || {
-            #[cfg(feature = "demo")]
-            {
-                let file = {
-                    let data = application
-                        .0
-                        .state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    data.sessions
-                        .get(&device_id)
-                        .and_then(|sessions| {
-                            sessions.iter().find(|session| session.id == session_id)
-                        })
-                        .and_then(|session| {
-                            session.files.iter().find(|file| file.file_id == file_id)
-                        })
-                        .cloned()
-                };
-                if let Some(file) = file {
-                    return Ok(sim::start_transfer(
-                        &app,
-                        StartTransferArgs {
-                            label: format!("{session_id}/{file_id}"),
-                            total_bytes: file.bytes,
-                            direction: TransferDirection::Down,
-                            target_label: device_id,
-                            context: DemoTransferContext::DownloadFile,
-                        },
-                    ));
-                }
-            }
-            #[cfg(not(feature = "demo"))]
-            let _app = app;
-            composition::download_file(
-                &application.0.composition,
-                &device_id,
-                &session_id,
-                &file_id,
-            )
         })
         .await
     }
@@ -1505,6 +1721,25 @@ fn downloaded_cleanup_skip(
     }
 }
 
+/// Copies only the local-library rows that can affect the already-fetched
+/// remote page/detail. `AppData.library` remains a compatibility `Vec`, so
+/// selection scans borrowed rows while holding the mutex, but allocation and
+/// cloning are bounded by the current page's matches rather than the whole
+/// application library.
+fn clone_matching_library_entries(
+    library: &[LibraryEntry],
+    device_keys: &HashSet<String>,
+    session_ids: &HashSet<String>,
+) -> Vec<LibraryEntry> {
+    library
+        .iter()
+        .filter(|entry| {
+            device_keys.contains(&entry.device_id) && session_ids.contains(&entry.session_id)
+        })
+        .cloned()
+        .collect()
+}
+
 fn checked_library_file_path(
     library_root: &Path,
     entry: &LibraryEntry,
@@ -1564,6 +1799,23 @@ mod tests {
     #[cfg(feature = "demo")]
     use std::sync::Arc;
 
+    #[test]
+    fn catalog_changed_becomes_a_stable_rpc_error_with_the_new_revision() {
+        let catalog_revision = format!("sha256:{}", "d".repeat(64));
+        let error = session_page_rpc_error(composition::SessionCatalogPageError::CatalogChanged {
+            catalog_revision: catalog_revision.clone(),
+            message: "catalog changed".to_string(),
+        });
+
+        assert_eq!(error.code, "session_catalog_changed");
+        assert_eq!(error.message, "catalog changed");
+        assert!(error.retryable);
+        assert_eq!(
+            error.details,
+            Some(serde_json::json!({ "catalogRevision": catalog_revision }))
+        );
+    }
+
     fn test_application(label: &str) -> (PathBuf, TransferApplication) {
         let root = std::env::temp_dir().join(format!(
             "ylx-application-workflow-{label}-{}",
@@ -1608,6 +1860,7 @@ mod tests {
                 String::new(),
             )],
             complete: true,
+            download_projection_sequence: 0,
             publication: None,
             library_root: None,
             object_receipts: Vec::new(),
@@ -1617,6 +1870,45 @@ mod tests {
             uploaded_at: None,
             upload_error: None,
         }
+    }
+
+    #[test]
+    fn fifty_row_page_clones_only_matches_from_a_large_unrelated_library() {
+        let device_keys =
+            HashSet::from(["ylx-canonical-device".to_string(), "YLX-LEGACY".to_string()]);
+        let session_ids = (0..50)
+            .map(|index| format!("page-session-{index:02}"))
+            .collect::<HashSet<_>>();
+        let mut library = Vec::with_capacity(25_100);
+        for index in 0..25_000 {
+            let mut entry = test_entry();
+            entry.device_id = format!("unrelated-device-{index:05}");
+            entry.session_id = format!("unrelated-session-{index:05}");
+            library.push(entry);
+        }
+        for index in 0..50 {
+            let mut entry = test_entry();
+            entry.device_id = if index % 2 == 0 {
+                "ylx-canonical-device".to_string()
+            } else {
+                "YLX-LEGACY".to_string()
+            };
+            entry.session_id = format!("page-session-{index:02}");
+            library.push(entry);
+        }
+        for index in 0..50 {
+            let mut wrong_device = test_entry();
+            wrong_device.device_id = "other-device".to_string();
+            wrong_device.session_id = format!("page-session-{index:02}");
+            library.push(wrong_device);
+        }
+
+        let selected = clone_matching_library_entries(&library, &device_keys, &session_ids);
+
+        assert_eq!(selected.len(), 50);
+        assert!(selected.iter().all(|entry| {
+            device_keys.contains(&entry.device_id) && session_ids.contains(&entry.session_id)
+        }));
     }
 
     #[test]
@@ -1837,8 +2129,12 @@ mod tests {
         let sink = Arc::new(RecordingEventSink::default());
         let _subscription = application.subscribe(sink.clone());
 
-        let response = tauri::async_runtime::block_on(application.list_sessions(device_id.clone()))
-            .expect("refresh sessions");
+        let response = tauri::async_runtime::block_on(application.list_sessions(
+            device_id.clone(),
+            None,
+            None,
+        ))
+        .expect("refresh sessions");
         let event = sink.events().pop().expect("sessions update");
 
         assert_eq!(event.name, "sessions:update");
@@ -1846,7 +2142,11 @@ mod tests {
         assert_eq!(event.payload["value"]["deviceId"], device_id);
         assert_eq!(
             event.payload["value"]["sessions"],
-            serde_json::to_value(&response.value).unwrap()
+            serde_json::to_value(&response.value.items).unwrap()
+        );
+        assert_eq!(
+            event.payload["value"]["catalogRevision"],
+            serde_json::to_value(&response.value.catalog_revision).unwrap()
         );
 
         std::fs::remove_dir_all(root).ok();

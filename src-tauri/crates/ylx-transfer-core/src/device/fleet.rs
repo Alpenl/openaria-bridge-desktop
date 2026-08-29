@@ -70,11 +70,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::device::actor::{
     AuthenticatedCatalogPort, AuthenticatedDevicePort, AuthenticatedPiSession,
-    DeleteSessionReceiptView, DeviceActor, DeviceInfoView, HeartbeatApplyOutcome,
-    HeartbeatOutcomeView, PairingPort, PiClientError, PiClientErrorKind, PollPairingOutcome,
-    SessionCatalogPort, SessionDetailView, SessionsPageView,
+    DeleteSessionReceiptView, DeviceActor, DeviceInfoView, GatewayVerificationView,
+    HeartbeatApplyOutcome, HeartbeatOutcomeView, PairingPort, PiClientError, PiClientErrorKind,
+    PollPairingOutcome, SessionCatalogPort, SessionDetailView, SessionsPageView,
 };
-use crate::device::{ConnectionState, Device, DeviceFingerprint};
+use crate::device::{ConnectionState, Device, DeviceFingerprint, DiscoveryState};
 
 /// Everything a display DTO needs about one device, read in one short
 /// handle-lock acquisition: the full identity, its short label, and a
@@ -85,6 +85,15 @@ pub struct DeviceSnapshot {
     /// `fingerprint.short_display_id()`, materialized for convenience.
     pub short_id: String,
     pub device: Device,
+}
+
+/// The capability negotiation that belongs to one currently connected
+/// epoch. Reading both values under the actor's single lock prevents a
+/// reconnect from pairing an old capability snapshot with a new epoch.
+#[derive(Debug, Clone)]
+pub struct NegotiatedDeviceSnapshot {
+    pub epoch: u64,
+    pub info: DeviceInfoView,
 }
 
 // =====================================================================
@@ -285,9 +294,35 @@ impl DeviceHandle {
         }
     }
 
+    /// Updates one device's discovery axis under its per-device lock. The
+    /// boolean lets composition avoid redundant UI emissions.
+    pub fn set_discovery_state(&self, state: DiscoveryState) -> bool {
+        self.actor().set_discovery_state(state)
+    }
+
     #[must_use]
     pub fn connection_state(&self) -> ConnectionState {
         self.actor().connection_state().clone()
+    }
+
+    /// Returns the last authenticated device/capability snapshot without
+    /// issuing network I/O. The snapshot is cleared whenever the connection
+    /// is cleared or a new pairing attempt supersedes it.
+    #[must_use]
+    pub fn negotiated_device_info(&self) -> Option<DeviceInfoView> {
+        self.actor().negotiated_device_info().cloned()
+    }
+
+    /// Returns negotiation evidence only when it belongs to the currently
+    /// connected epoch. Pairing, disconnect, expiry, and reconnect clear the
+    /// actor's cached negotiation before this method can expose it again.
+    #[must_use]
+    pub fn negotiated_device_snapshot(&self) -> Option<NegotiatedDeviceSnapshot> {
+        let actor = self.actor();
+        Some(NegotiatedDeviceSnapshot {
+            epoch: actor.current_epoch()?,
+            info: actor.negotiated_device_info()?.clone(),
+        })
     }
 
     #[must_use]
@@ -364,6 +399,50 @@ impl DeviceHandle {
             epoch: session.epoch(),
         };
         let result = client.get_device(&session);
+        self.apply_device_info(ticket, result)
+    }
+
+    /// Fetches descriptor/capability negotiation for one newly connected
+    /// epoch, with the network call outside the actor lock and the result
+    /// applied only while that epoch remains current.
+    pub fn negotiate_device_with(
+        &self,
+        client: &dyn AuthenticatedDevicePort,
+    ) -> RefreshApplyOutcome {
+        let Some(session) = self.checkout_authenticated_session() else {
+            return RefreshApplyOutcome::NotConnected;
+        };
+        self.negotiate_device_for_session(client, session)
+    }
+
+    /// Negotiates only if the authenticated session still belongs to the
+    /// connection epoch that produced the setup task. This pre-I/O fence is
+    /// paired with [`Self::apply_device_info`]'s post-I/O fence: an old
+    /// pairing task can therefore neither send a descriptor request through
+    /// a newer token nor install its late reply into that newer connection.
+    pub fn negotiate_device_with_for_epoch(
+        &self,
+        client: &dyn AuthenticatedDevicePort,
+        expected_epoch: u64,
+    ) -> RefreshApplyOutcome {
+        let Some(session) = self.checkout_authenticated_session() else {
+            return RefreshApplyOutcome::NotConnected;
+        };
+        if session.epoch() != expected_epoch {
+            return RefreshApplyOutcome::Stale;
+        }
+        self.negotiate_device_for_session(client, session)
+    }
+
+    fn negotiate_device_for_session(
+        &self,
+        client: &dyn AuthenticatedDevicePort,
+        session: AuthenticatedPiSession,
+    ) -> RefreshApplyOutcome {
+        let ticket = EpochTicket {
+            epoch: session.epoch(),
+        };
+        let result = client.negotiate_device(&session);
         self.apply_device_info(ticket, result)
     }
 
@@ -474,6 +553,54 @@ impl DeviceHandle {
         }
     }
 
+    /// v4 counterpart to [`Self::get_session_with`]: detail bytes are
+    /// accepted only when they still match the selected usable gateway
+    /// verification. Network I/O remains outside the actor lock and the
+    /// response is fenced on the same connection epoch.
+    pub fn get_verified_session_with(
+        &self,
+        client: &dyn AuthenticatedCatalogPort,
+        session_id: &str,
+        verification: &GatewayVerificationView,
+    ) -> SessionDetailOutcome {
+        let Some(ticket) = self.issue_epoch_ticket() else {
+            return SessionDetailOutcome::NotConnected;
+        };
+        let mut session = match self.checkout_authenticated_session() {
+            Some(session) => session,
+            None => return SessionDetailOutcome::NotConnected,
+        };
+        if session.publication_key_fingerprint().is_none() {
+            let info = match client.get_device(&session) {
+                Ok(info) => info,
+                Err(error) => return SessionDetailOutcome::Failed(error),
+            };
+            match self.apply_device_info(ticket, Ok(info)) {
+                RefreshApplyOutcome::Refreshed => {}
+                RefreshApplyOutcome::Stale => return SessionDetailOutcome::Stale,
+                RefreshApplyOutcome::NotConnected => return SessionDetailOutcome::NotConnected,
+                RefreshApplyOutcome::Failed(error) => return SessionDetailOutcome::Failed(error),
+            }
+            session = match self.checkout_authenticated_session() {
+                Some(session) => session,
+                None => return SessionDetailOutcome::NotConnected,
+            };
+        }
+        if self.current_epoch() != Some(ticket.epoch()) {
+            return SessionDetailOutcome::Stale;
+        }
+        match client.get_verified_session(&session, session_id, verification) {
+            Ok(detail) => {
+                if self.current_epoch() == Some(ticket.epoch()) {
+                    SessionDetailOutcome::Fetched(Box::new(detail))
+                } else {
+                    SessionDetailOutcome::Stale
+                }
+            }
+            Err(error) => SessionDetailOutcome::Failed(error),
+        }
+    }
+
     // -----------------------------------------------------------------
     // Disconnect
     // -----------------------------------------------------------------
@@ -507,6 +634,19 @@ impl DeviceHandle {
     pub fn disconnect_local(&self) {
         self.inner.pairing_attempts.fetch_add(1, Ordering::SeqCst);
         self.actor().clear_connection_state();
+    }
+
+    /// Clears only the connection generation whose setup failed. A late
+    /// negotiation result from an older epoch therefore cannot disconnect a
+    /// newer session.
+    pub fn disconnect_local_if_epoch(&self, expected_epoch: u64) -> bool {
+        let mut actor = self.actor();
+        if actor.current_epoch() != Some(expected_epoch) {
+            return false;
+        }
+        self.inner.pairing_attempts.fetch_add(1, Ordering::SeqCst);
+        actor.clear_connection_state();
+        true
     }
 
     // -----------------------------------------------------------------
@@ -851,6 +991,7 @@ mod tests {
         HeartbeatOutcomeView {
             idle_timeout_ms: 15_000,
             absolute_expires_at: "2026-08-01T05:00:00Z".to_string(),
+            capture_activity: Some(CaptureActivityState::Recording),
         }
     }
 
@@ -910,6 +1051,8 @@ mod tests {
                 publication_signature: Vec::new(),
                 publication_public_key: Vec::new(),
                 publication_key_fingerprint: format!("sha256:{}", "a".repeat(64)),
+                gateway_verification: None,
+                publication_origin: crate::device::PublicationEnvelopeOriginView::DeviceSigned,
             }
         }
     }
@@ -986,6 +1129,11 @@ mod tests {
                         capture_activity: CaptureActivityState::Recording,
                         media_admission: "allowed".to_string(),
                         publication_key_fingerprint: format!("sha256:{}", "a".repeat(64)),
+                        profile: crate::device::DeviceApiProfileView::LegacyPinnedHttpsV1,
+                        capabilities: crate::device::DeviceCapabilitiesView::default(),
+                        capture_status: None,
+                        publication_origin:
+                            crate::device::PublicationEnvelopeOriginView::DeviceSigned,
                     })
                 })
         }
@@ -1143,6 +1291,26 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn discovery_state_updates_only_the_discovery_axis_and_reports_changes() {
+        let fingerprint = format!("sha256:{}", "d".repeat(64));
+        let fleet = DeviceFleet::new();
+        let handle = fleet.get_or_create(fingerprint.as_str(), || device_for(&fingerprint));
+
+        assert!(handle.set_discovery_state(DiscoveryState::Offline));
+        assert!(!handle.set_discovery_state(DiscoveryState::Offline));
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.device.discovery, DiscoveryState::Offline);
+        assert_eq!(snapshot.device.connection, ConnectionState::Disconnected);
+        assert_eq!(
+            snapshot.device.capture_activity,
+            CaptureActivityState::Unknown
+        );
+
+        assert!(handle.set_discovery_state(DiscoveryState::Online));
+        assert_eq!(handle.snapshot().device.discovery, DiscoveryState::Online);
+    }
+
     // -----------------------------------------------------------------
     // Commit 58 — one blocked device does not stall the fleet
     // -----------------------------------------------------------------
@@ -1223,6 +1391,64 @@ mod tests {
         for report in reports {
             assert_eq!(report.outcome, HeartbeatApplyOutcome::Renewed);
         }
+    }
+
+    #[test]
+    fn heartbeat_sweep_runs_at_most_four_devices_concurrently() {
+        let sink: RecordingSink<String> = RecordingSink::new();
+        let gate: Deferred<()> = Deferred::new();
+        let fleet = Arc::new(DeviceFleet::new());
+        let mut clients: HashMap<DeviceFingerprint, Arc<dyn AuthenticatedDevicePort>> =
+            HashMap::new();
+
+        for (name, byte) in [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4"), ("e", "5")] {
+            let fingerprint = format!("sha256:{}", byte.repeat(64));
+            let handle = fleet.get_or_create(fingerprint.as_str(), || device_for(&fingerprint));
+            connect(
+                &handle,
+                &FakeClient::new(name, "connect", RecordingSink::new()),
+            );
+            clients.insert(
+                DeviceFingerprint::new(&fingerprint),
+                Arc::new(FakeClient::new(name, "poll", sink.clone()).gated(gate.clone())),
+            );
+        }
+
+        let sweeper = {
+            let fleet = fleet.clone();
+            std::thread::spawn(move || {
+                fleet.heartbeat_all(4, |fingerprint| clients.get(fingerprint).cloned())
+            })
+        };
+
+        assert!(
+            sink.wait_for(4, DEFAULT_TEST_TIMEOUT),
+            "four worker slots must enter their network calls"
+        );
+        let blocked = sink.events();
+        assert_eq!(blocked.len(), 4, "a fifth request must wait for a slot");
+        assert!(blocked
+            .iter()
+            .all(|event| event.ends_with(":heartbeat-enter")));
+
+        assert!(gate.release(()));
+        let reports = sweeper.join().expect("heartbeat sweep thread");
+        assert_eq!(reports.len(), 5);
+        let completed = sink.events();
+        assert_eq!(
+            completed
+                .iter()
+                .filter(|event| event.ends_with(":heartbeat-enter"))
+                .count(),
+            5
+        );
+        assert_eq!(
+            completed
+                .iter()
+                .filter(|event| event.ends_with(":heartbeat-done"))
+                .count(),
+            5
+        );
     }
 
     /// The same regression for the paths a *user* is waiting on rather
@@ -1419,15 +1645,10 @@ mod tests {
         connect(&handle, &client2);
         assert_eq!(handle.current_epoch(), Some(2));
 
-        // … and only now does the epoch-1 reply arrive.
+        // … and only now does the epoch-1 reply arrive. Even a successful
+        // Lab-v4 poll must not project its capture state into epoch 2.
         assert_eq!(
-            handle.apply_heartbeat(
-                ticket,
-                Err(client_error(
-                    PiClientErrorKind::Unauthorized,
-                    "401 from the connection the user already ended",
-                ))
-            ),
+            handle.apply_heartbeat(ticket, Ok(heartbeat_ok())),
             HeartbeatApplyOutcome::Stale
         );
         assert!(
@@ -1437,6 +1658,11 @@ mod tests {
             ),
             "the live epoch-2 session must survive the stale 401, got {:?}",
             handle.connection_state()
+        );
+        assert_eq!(
+            handle.snapshot().device.capture_activity,
+            CaptureActivityState::Unknown,
+            "stale epoch-1 capture evidence must not enter epoch 2"
         );
     }
 
@@ -1456,21 +1682,27 @@ mod tests {
         assert!(second.attempt() > first.attempt());
 
         assert_eq!(
-            handle.apply_heartbeat(
-                first,
-                Err(client_error(PiClientErrorKind::Unauthorized, "late 401")),
-            ),
+            handle.apply_heartbeat(first, Ok(heartbeat_ok())),
             HeartbeatApplyOutcome::Stale
         );
         assert!(matches!(
             handle.connection_state(),
             ConnectionState::Connected { .. }
         ));
+        assert_eq!(
+            handle.snapshot().device.capture_activity,
+            CaptureActivityState::Unknown,
+            "superseded same-epoch capture evidence must be discarded"
+        );
 
         // The current attempt still applies normally.
         assert_eq!(
             handle.apply_heartbeat(second, Ok(heartbeat_ok())),
             HeartbeatApplyOutcome::Renewed
+        );
+        assert_eq!(
+            handle.snapshot().device.capture_activity,
+            CaptureActivityState::Recording
         );
     }
 
@@ -1591,6 +1823,55 @@ mod tests {
     /// A `GET /device` reply is likewise fenced on the epoch it was issued
     /// under.
     #[test]
+    fn a_late_connection_negotiation_cannot_enter_or_disconnect_a_new_epoch() {
+        let fingerprint = format!("sha256:{}", "6".repeat(64));
+        let sink: RecordingSink<String> = RecordingSink::new();
+        let gate: Deferred<()> = Deferred::new();
+        let fleet = DeviceFleet::new();
+        let handle = fleet.get_or_create(fingerprint.as_str(), || device_for(&fingerprint));
+        let first = FakeClient::new("a", "attempt-1", sink.clone()).gated(gate.clone());
+        connect(
+            &handle,
+            &FakeClient::new("a", "attempt-1", RecordingSink::new()),
+        );
+
+        let negotiating = {
+            let handle = handle.clone();
+            std::thread::spawn(move || handle.negotiate_device_with_for_epoch(&first, 1))
+        };
+        assert!(
+            sink.wait_for(1, DEFAULT_TEST_TIMEOUT),
+            "descriptor request must be in flight"
+        );
+
+        assert!(handle.disconnect_local_if_epoch(1));
+        let second = FakeClient::new("a", "attempt-2", RecordingSink::new());
+        connect(&handle, &second);
+        assert_eq!(handle.current_epoch(), Some(2));
+        assert!(!handle.disconnect_local_if_epoch(1));
+        let stale_sink = RecordingSink::new();
+        let stale = FakeClient::new("stale", "attempt-1", stale_sink.clone());
+        assert_eq!(
+            handle.negotiate_device_with_for_epoch(&stale, 1),
+            RefreshApplyOutcome::Stale
+        );
+        assert!(
+            stale_sink.is_empty(),
+            "an old connection setup must not issue descriptor I/O through the new epoch"
+        );
+
+        assert!(gate.release(()));
+        assert_eq!(
+            negotiating.join().expect("negotiation thread"),
+            RefreshApplyOutcome::Stale
+        );
+        assert_eq!(handle.current_epoch(), Some(2));
+        assert!(handle.negotiated_device_snapshot().is_none());
+    }
+
+    /// A `GET /device` reply is likewise fenced on the epoch it was issued
+    /// under.
+    #[test]
     fn a_late_device_info_reply_from_a_superseded_epoch_is_discarded() {
         let fingerprint = format!("sha256:{}", "6".repeat(64));
         let sink: RecordingSink<String> = RecordingSink::new();
@@ -1598,16 +1879,28 @@ mod tests {
         let fleet = DeviceFleet::new();
         let handle = fleet.get_or_create(fingerprint.as_str(), || device_for(&fingerprint));
         connect(&handle, &client);
+        assert!(
+            handle.negotiated_device_snapshot().is_none(),
+            "a connected epoch has no negotiation until GET /device succeeds"
+        );
 
         let ticket = handle.issue_epoch_ticket().expect("connected");
         handle.actor().disconnect_with(&client).expect("disconnect");
         let client2 = FakeClient::new("a", "attempt-2", sink.clone());
         connect(&handle, &client2);
+        assert!(
+            handle.negotiated_device_snapshot().is_none(),
+            "reconnect must not expose the prior epoch's negotiation"
+        );
 
         let info = DeviceInfoView {
             capture_activity: CaptureActivityState::Recording,
             media_admission: "allowed".to_string(),
             publication_key_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            profile: crate::device::DeviceApiProfileView::LegacyPinnedHttpsV1,
+            capabilities: crate::device::DeviceCapabilitiesView::default(),
+            capture_status: None,
+            publication_origin: crate::device::PublicationEnvelopeOriginView::DeviceSigned,
         };
         assert_eq!(
             handle.apply_device_info(ticket, Ok(info)),
@@ -1624,6 +1917,14 @@ mod tests {
         );
         assert_eq!(
             handle.snapshot().device.capture_activity,
+            CaptureActivityState::Recording
+        );
+        let negotiated = handle
+            .negotiated_device_snapshot()
+            .expect("current refresh installs current negotiation");
+        assert_eq!(negotiated.epoch, 2);
+        assert_eq!(
+            negotiated.info.capture_activity,
             CaptureActivityState::Recording
         );
     }

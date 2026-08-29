@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ylx:schema:bucket-publication:v4",
+  "title": "YLX Bucket Publication v4",
+  "description": "Create-if-absent completion marker for one client-derived media publication. The marker binds exactly one Device Session v2 source manifest, one Derived Media Receipt v1, and one media.derived MP4. Marker byte identity is transport metadata validated outside these self-describing bytes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "publication_id",
+    "publication_kind",
+    "sealed",
+    "published_at",
+    "source_device",
+    "publication_object_key",
+    "assets",
+    "provenance"
+  ],
+  "properties": {
+    "schema": {"const": "ylx.bucket-publication.v4"},
+    "publication_id": {"$ref": "#/$defs/uuidV7"},
+    "publication_kind": {"const": "client-derived"},
+    "sealed": {
+      "const": true,
+      "description": "The v4 JSON marker is written only after every referenced object has passed readback verification."
+    },
+    "published_at": {"type": "string", "format": "date-time"},
+    "source_device": {"$ref": "#/$defs/sourceDevice"},
+    "publication_object_key": {"$ref": "#/$defs/publicationObjectKey"},
+    "assets": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": {
+        "oneOf": [
+          {"$ref": "#/$defs/sourceManifestReference"},
+          {"$ref": "#/$defs/derivedMediaReceiptReference"},
+          {"$ref": "#/$defs/derivedOutputReference"}
+        ]
+      },
+      "allOf": [
+        {
+          "contains": {
+            "type": "object",
+            "required": ["role"],
+            "properties": {"role": {"const": "source.manifest"}}
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "type": "object",
+            "required": ["role"],
+            "properties": {"role": {"const": "media.derived-receipt"}}
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "type": "object",
+            "required": ["role"],
+            "properties": {"role": {"const": "media.derived"}}
+          },
+          "minContains": 1,
+          "maxContains": 1
+        }
+      ]
+    },
+    "provenance": {"$ref": "#/$defs/provenance"}
+  },
+  "$defs": {
+    "uuidV7": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "uuidV4": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "contentObjectKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*[\\u0000-\\u001f\\u007f-\\u009f])(?!.*(?:^|/)\\.{1,2}(?:/|$))(?:(?!__ylx_evidence__(?:/|$))[^/]+/)*[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/f-[0-9a-f]{64}$",
+      "description": "Relative content key shaped as configured-prefix/source-device-UUIDv4/source-session-UUIDv7/publication-UUIDv7/f-sha256."
+    },
+    "publicationObjectKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*[\\u0000-\\u001f\\u007f-\\u009f])(?!.*(?:^|/)\\.{1,2}(?:/|$))(?:(?!__ylx_evidence__(?:/|$))[^/]+/)*[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/__ylx_evidence__/publication\\.json$",
+      "description": "Full object key for the create-if-absent v4 completion marker. Its own bytes and digest are supplied by the admission transport envelope to avoid impossible self-reference."
+    },
+    "sourceDevice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device_id", "device_label"],
+      "properties": {
+        "device_id": {"$ref": "#/$defs/uuidV4"},
+        "device_label": {
+          "type": "string",
+          "pattern": "^YLX-[0-9A-F]{8}$"
+        }
+      }
+    },
+    "sourceManifestReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "schema",
+        "manifest_id",
+        "session_id",
+        "volume_id",
+        "object_key",
+        "media_type",
+        "bytes",
+        "sha256"
+      ],
+      "properties": {
+        "role": {"const": "source.manifest"},
+        "schema": {"const": "ylx.device-session.v2"},
+        "manifest_id": {"$ref": "#/$defs/uuidV7"},
+        "session_id": {"$ref": "#/$defs/uuidV7"},
+        "volume_id": {"$ref": "#/$defs/uuidV4"},
+        "object_key": {"$ref": "#/$defs/contentObjectKey"},
+        "media_type": {"const": "application/json"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "derivedMediaReceiptReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "schema",
+        "receipt_id",
+        "object_key",
+        "media_type",
+        "bytes",
+        "sha256"
+      ],
+      "properties": {
+        "role": {"const": "media.derived-receipt"},
+        "schema": {"const": "ylx.derived-media-receipt.v1"},
+        "receipt_id": {"$ref": "#/$defs/uuidV7"},
+        "object_key": {"$ref": "#/$defs/contentObjectKey"},
+        "media_type": {"const": "application/json"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "derivedOutputReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "artifact_id",
+        "object_key",
+        "media_type",
+        "bytes",
+        "sha256"
+      ],
+      "properties": {
+        "role": {"const": "media.derived"},
+        "artifact_id": {"$ref": "#/$defs/sha256"},
+        "object_key": {"$ref": "#/$defs/contentObjectKey"},
+        "media_type": {"const": "video/mp4"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "derived_authorship",
+        "source_manifest_signature",
+        "device_signature_inheritance",
+        "derived_output_signature"
+      ],
+      "properties": {
+        "derived_authorship": {"const": "openaria-bridge-desktop"},
+        "source_manifest_signature": {
+          "const": "not-declared-by-device-session-v2"
+        },
+        "device_signature_inheritance": {"const": "forbidden"},
+        "derived_output_signature": {"const": "not-device-signed"}
+      }
+    }
+  }
+}

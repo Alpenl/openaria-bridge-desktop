@@ -43,7 +43,7 @@ pub fn seed_devices() -> (Vec<Device>, HashMap<String, Vec<Session>>) {
         vec![
             session(
                 "20260731-142233",
-                "07-31 14:22",
+                "2026-07-31T14:22:33Z",
                 121.4,
                 483_920_112,
                 14_520,
@@ -57,7 +57,7 @@ pub fn seed_devices() -> (Vec<Device>, HashMap<String, Vec<Session>>) {
             ),
             session(
                 "20260731-091045",
-                "07-31 09:10",
+                "2026-07-31T09:10:45Z",
                 62.8,
                 198_220_144,
                 7_534,
@@ -70,7 +70,7 @@ pub fn seed_devices() -> (Vec<Device>, HashMap<String, Vec<Session>>) {
             ),
             session(
                 "20260730-173318",
-                "07-30 17:33",
+                "2026-07-30T17:33:18Z",
                 305.1,
                 1_042_399_201,
                 36_611,
@@ -85,7 +85,7 @@ pub fn seed_devices() -> (Vec<Device>, HashMap<String, Vec<Session>>) {
             ),
             session(
                 "20260729-201107",
-                "07-29 20:11",
+                "2026-07-29T20:11:07Z",
                 44.0,
                 139_920_442,
                 5_280,
@@ -102,7 +102,7 @@ pub fn seed_devices() -> (Vec<Device>, HashMap<String, Vec<Session>>) {
         device_b_id,
         vec![session(
             "20260728-113302",
-            "07-28 11:33",
+            "2026-07-28T11:33:02Z",
             88.6,
             279_310_221,
             10_632,

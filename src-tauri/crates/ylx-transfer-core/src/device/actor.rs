@@ -47,7 +47,7 @@
 use std::fmt;
 use std::io::{Cursor, Read};
 
-use crate::device::{CaptureActivityState, ConnectionState, Device, PairingPhase};
+use crate::device::{CaptureActivityState, ConnectionState, Device, DiscoveryState, PairingPhase};
 use crate::secret::Secret;
 
 /// Coarse classification of a Pi capability call failure -- just
@@ -56,13 +56,17 @@ use crate::secret::Secret;
 /// wire error registry (that's
 /// `ylx_transfer_adapters::pi_http::PiApiErrorCode`'s job, one layer
 /// down, on the other side of this port).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PiClientErrorKind {
     /// The Pi rejected the credential (401) -- session token invalid,
     /// revoked, or never valid.
     Unauthorized,
     /// The call did not complete in time.
     Timeout,
+    /// An opaque session-list cursor was bound to an older complete catalog.
+    /// The current device revision is retained so application callers can
+    /// discard the old chain and restart from the first page.
+    CatalogChanged { catalog_revision: String },
     /// Any other failure (network, decode, wire-protocol error, ...).
     Other,
 }
@@ -118,14 +122,85 @@ pub struct PairingStatusView {
     pub sas_publication_key_fingerprint: Option<String>,
 }
 
-/// Result of `POST /session/heartbeat`, trimmed to what the actor needs.
+/// Result of one periodic liveness poll, trimmed to what the actor needs.
+/// Legacy heartbeat responses carry no capture evidence; Device API v4 uses
+/// its authoritative capture-status snapshot as both liveness and activity
+/// evidence so one fenced response updates both axes.
 #[derive(Debug, Clone)]
 pub struct HeartbeatOutcomeView {
     pub idle_timeout_ms: u64,
     pub absolute_expires_at: String,
+    pub capture_activity: Option<CaptureActivityState>,
 }
 
 /// Result of `GET /device`, trimmed to what the actor needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeviceApiProfileView {
+    #[default]
+    LegacyPinnedHttpsV1,
+    LabHttpV4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CapabilitySourceView {
+    DeviceDescriptor,
+    ProfileContract,
+    #[default]
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NegotiatedCapabilityView {
+    pub supported: bool,
+    pub source: CapabilitySourceView,
+}
+
+/// Explicit command/query capabilities negotiated for the authenticated
+/// device. Callers must gate operations on these facts rather than infer
+/// support from a profile name or from whether a session has files.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeviceCapabilitiesView {
+    pub capture: NegotiatedCapabilityView,
+    pub preview: NegotiatedCapabilityView,
+    pub range_download: NegotiatedCapabilityView,
+    pub network_mutation: NegotiatedCapabilityView,
+    pub calibration_capture: NegotiatedCapabilityView,
+    pub session_list: NegotiatedCapabilityView,
+    pub session_detail: NegotiatedCapabilityView,
+    pub artifact_download: NegotiatedCapabilityView,
+    pub capture_status: NegotiatedCapabilityView,
+    pub session_deletion: NegotiatedCapabilityView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureDeviceStateView {
+    Idle,
+    Recording,
+    Finalizing,
+    Encoding,
+    Verifying,
+    Blocked,
+    Unknown(String),
+}
+
+/// Authoritative Device API v4 capture status. In particular,
+/// `active_recording` comes from `/capture/status`, never from preview or
+/// live-IMU availability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureStatusView {
+    pub authority_epoch: String,
+    pub source_revision: u64,
+    pub device_state: CaptureDeviceStateView,
+    pub active_recording: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PublicationEnvelopeOriginView {
+    #[default]
+    DeviceSigned,
+    ClientDerivedLabCompatibility,
+}
+
 #[derive(Debug, Clone)]
 pub struct DeviceInfoView {
     pub capture_activity: CaptureActivityState,
@@ -133,6 +208,10 @@ pub struct DeviceInfoView {
     /// Authenticated `GET /device` identity of the Pi's current
     /// publication-signing key (`sha256:<64 lowercase hex>`).
     pub publication_key_fingerprint: String,
+    pub profile: DeviceApiProfileView,
+    pub capabilities: DeviceCapabilitiesView,
+    pub capture_status: Option<CaptureStatusView>,
+    pub publication_origin: PublicationEnvelopeOriginView,
 }
 
 /// One completed recording session's summary, mirroring
@@ -148,6 +227,58 @@ pub struct DeviceInfoView {
 /// [`DeviceActor::download_file_with`]/[`DeviceActor::head_file_with`] for what is
 /// possible once a `FileId` is already known (from `SessionDetailView` or
 /// any other source).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayVerificationVerdictView {
+    Usable,
+    Unusable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayVerificationDiagnosticView {
+    LegacyMessage(String),
+    Structured { code: String, summary: String },
+}
+
+/// Exact gateway verification facts returned by Device API v4. This view
+/// preserves the device verdict and validator identity; callers may derive
+/// availability, but must not invent additional wire verdicts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayVerificationView {
+    pub actor: String,
+    pub validator_name: String,
+    pub validator_version: String,
+    pub validator_build_sha256: String,
+    pub manifest_sha256: String,
+    /// Whether the adapter accepted `manifest_sha256` as exactly 64
+    /// lowercase hexadecimal characters. The raw safe value remains visible
+    /// for diagnostics even when this is false.
+    pub manifest_digest_valid: bool,
+    pub verified_at: String,
+    pub verdict: GatewayVerificationVerdictView,
+    pub diagnostics: Vec<GatewayVerificationDiagnosticView>,
+}
+
+impl GatewayVerificationView {
+    #[must_use]
+    pub fn is_usable(&self) -> bool {
+        self.verdict == GatewayVerificationVerdictView::Usable
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> String {
+        if self.manifest_digest_valid {
+            format!("sha256:{}", self.manifest_sha256)
+        } else {
+            String::new()
+        }
+    }
+
+    #[must_use]
+    pub fn is_detail_eligible(&self) -> bool {
+        self.is_usable() && self.manifest_digest_valid
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionSummaryView {
     pub session_id: String,
@@ -158,6 +289,8 @@ pub struct SessionSummaryView {
     pub total_bytes: u64,
     pub video_bytes: u64,
     pub file_count: u64,
+    /// `None` means missing or stale, never an implicit usable verdict.
+    pub gateway_verification: Option<GatewayVerificationView>,
 }
 
 /// One entry in [`SessionDetailView::files`], mirroring the Conductor wire
@@ -212,14 +345,49 @@ pub struct SessionDetailView {
     /// Envelope fingerprint, already compared with the authenticated
     /// `/device` identity by the production session-catalog adapter.
     pub publication_key_fingerprint: String,
+    pub gateway_verification: Option<GatewayVerificationView>,
+    pub publication_origin: PublicationEnvelopeOriginView,
 }
 
 /// Result of `GET /sessions` (paginated via `cursor`/`limit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CatalogRevisionAuthorityView {
+    #[default]
+    LegacyDevice,
+    DeviceStable,
+    LocalFirstPageCompatibility,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaginationUnavailableReasonView {
+    FirmwareUpgradeRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionDiscoveryDiagnosticCodeView {
+    ManifestUnreadable,
+    UnsupportedSchema,
+    ManifestInvalid,
+    ManifestNotSealed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDiscoveryDiagnosticView {
+    pub quarantine_id: String,
+    pub code: SessionDiscoveryDiagnosticCodeView,
+    pub observed_at: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionsPageView {
-    pub catalog_revision: String,
+    pub catalog_revision: Option<String>,
     pub sessions: Vec<SessionSummaryView>,
     pub next_cursor: Option<String>,
+    pub catalog_authority: CatalogRevisionAuthorityView,
+    pub pagination_supported: bool,
+    pub pagination_unavailable_reason: Option<PaginationUnavailableReasonView>,
+    pub diagnostics: Vec<SessionDiscoveryDiagnosticView>,
 }
 
 /// Result of `DELETE /sessions/{id}`.
@@ -304,6 +472,17 @@ pub trait AuthenticatedDevicePort: Send + Sync {
 
     fn get_device(&self, session: &AuthenticatedPiSession)
         -> Result<DeviceInfoView, PiClientError>;
+
+    /// Negotiates descriptor/capability facts for a newly connected epoch.
+    /// Legacy transports use their ordinary authenticated device read. A
+    /// transport with an independently polled activity endpoint may override
+    /// this so connection setup does not duplicate that periodic request.
+    fn negotiate_device(
+        &self,
+        session: &AuthenticatedPiSession,
+    ) -> Result<DeviceInfoView, PiClientError> {
+        self.get_device(session)
+    }
 }
 
 /// The authenticated session-catalog capability. Publication identity is
@@ -322,6 +501,21 @@ pub trait SessionCatalogPort: Send + Sync {
         session: &AuthenticatedPiSession,
         session_id: &str,
     ) -> Result<SessionDetailView, PiClientError>;
+
+    /// Fetches detail while binding the exact response bytes to a current,
+    /// known-usable gateway verification selected from the session list.
+    /// Implementations that cannot provide that binding fail closed.
+    fn get_verified_session(
+        &self,
+        _session: &AuthenticatedPiSession,
+        _session_id: &str,
+        _verification: &GatewayVerificationView,
+    ) -> Result<SessionDetailView, PiClientError> {
+        Err(PiClientError {
+            kind: PiClientErrorKind::Other,
+            message: "verified session detail is not supported by this catalog port".to_string(),
+        })
+    }
 
     fn delete_session(
         &self,
@@ -652,6 +846,7 @@ pub struct DeviceActor {
     next_epoch: u64,
     media_admission: Option<String>,
     publication_key_fingerprint: Option<String>,
+    negotiated_device_info: Option<DeviceInfoView>,
     /// Publication-key identity offered by the *in-flight* pairing attempt's
     /// SAS transcript. Promoted to `sas_publication_key_fingerprint` only
     /// once that attempt is actually allowed (i.e. the user confirmed the
@@ -672,6 +867,7 @@ impl DeviceActor {
             next_epoch: 0,
             media_admission: None,
             publication_key_fingerprint: None,
+            negotiated_device_info: None,
             pending_sas_publication_key_fingerprint: None,
             sas_publication_key_fingerprint: None,
         }
@@ -679,6 +875,17 @@ impl DeviceActor {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Updates only the network-discovery axis. Connection/session and
+    /// capture state deliberately remain owned by their independent actor
+    /// transitions.
+    pub fn set_discovery_state(&mut self, state: DiscoveryState) -> bool {
+        if self.device.discovery == state {
+            return false;
+        }
+        self.device.discovery = state;
+        true
     }
 
     pub fn connection_state(&self) -> &ConnectionState {
@@ -700,6 +907,14 @@ impl DeviceActor {
 
     pub fn media_admission(&self) -> Option<&str> {
         self.media_admission.as_deref()
+    }
+
+    /// The last authenticated `/device` result applied to this connection.
+    /// This is a read-only snapshot: consumers can project negotiated
+    /// capabilities without issuing another device-wide request.
+    #[must_use]
+    pub fn negotiated_device_info(&self) -> Option<&DeviceInfoView> {
+        self.negotiated_device_info.as_ref()
     }
 
     /// The signing-key identity most recently obtained from authenticated
@@ -782,6 +997,7 @@ impl DeviceActor {
         self.poll_secret = Some(created.poll_secret.clone());
         self.authenticated_session = None;
         self.publication_key_fingerprint = None;
+        self.negotiated_device_info = None;
         // A new SAS confirmation is about to replace whatever identity the
         // previous one anchored -- until it is actually confirmed, this
         // device has no confirmed publication key at all.
@@ -884,6 +1100,7 @@ impl DeviceActor {
                     ) {
                         (Some(created), Some(polled)) if created != polled => {
                             self.poll_secret = None;
+                            self.negotiated_device_info = None;
                             self.device.connection = ConnectionState::Disconnected;
                             return PollPairingOutcome::Error(PiClientErrorKind::Other);
                         }
@@ -901,6 +1118,7 @@ impl DeviceActor {
                         Err(_error) => {
                             self.poll_secret = None;
                             self.authenticated_session = None;
+                            self.negotiated_device_info = None;
                             self.sas_publication_key_fingerprint = None;
                             self.device.connection = ConnectionState::Disconnected;
                             return PollPairingOutcome::Error(PiClientErrorKind::Other);
@@ -920,6 +1138,7 @@ impl DeviceActor {
                     self.poll_secret = None;
                     self.authenticated_session = None;
                     self.publication_key_fingerprint = None;
+                    self.negotiated_device_info = None;
                     self.pending_sas_publication_key_fingerprint = None;
                     self.sas_publication_key_fingerprint = None;
                     self.device.connection = ConnectionState::Disconnected;
@@ -929,6 +1148,7 @@ impl DeviceActor {
                     self.poll_secret = None;
                     self.authenticated_session = None;
                     self.publication_key_fingerprint = None;
+                    self.negotiated_device_info = None;
                     self.pending_sas_publication_key_fingerprint = None;
                     self.sas_publication_key_fingerprint = None;
                     self.device.connection = ConnectionState::Expired {
@@ -971,10 +1191,16 @@ impl DeviceActor {
         }
 
         match result {
-            Ok(_outcome) => HeartbeatApplyOutcome::Renewed,
+            Ok(outcome) => {
+                if let Some(capture_activity) = outcome.capture_activity {
+                    self.device.capture_activity = capture_activity;
+                }
+                HeartbeatApplyOutcome::Renewed
+            }
             Err(e) if e.kind == PiClientErrorKind::Unauthorized => {
                 self.authenticated_session = None;
                 self.publication_key_fingerprint = None;
+                self.negotiated_device_info = None;
                 self.sas_publication_key_fingerprint = None;
                 self.device.connection = ConnectionState::Expired {
                     reason: format!("heartbeat failed: {}", e.message),
@@ -1006,6 +1232,7 @@ impl DeviceActor {
         self.authenticated_session = None;
         self.poll_secret = None;
         self.publication_key_fingerprint = None;
+        self.negotiated_device_info = None;
         self.pending_sas_publication_key_fingerprint = None;
         self.sas_publication_key_fingerprint = None;
         self.device.connection = ConnectionState::Disconnected;
@@ -1047,8 +1274,9 @@ impl DeviceActor {
             self.authenticated_session = Some(bound);
         }
         self.device.capture_activity = info.capture_activity;
-        self.media_admission = Some(info.media_admission);
-        self.publication_key_fingerprint = Some(info.publication_key_fingerprint);
+        self.media_admission = Some(info.media_admission.clone());
+        self.publication_key_fingerprint = Some(info.publication_key_fingerprint.clone());
+        self.negotiated_device_info = Some(info);
         Ok(())
     }
 
@@ -1086,6 +1314,24 @@ impl DeviceActor {
                 message: "get_session called without an authenticated session".to_string(),
             })?;
         client.get_session(session, session_id)
+    }
+
+    /// Fetches v4 detail bound to the usable gateway verification selected
+    /// from the current list generation.
+    pub fn get_verified_session_with(
+        &self,
+        client: &dyn SessionCatalogPort,
+        session_id: &str,
+        verification: &GatewayVerificationView,
+    ) -> Result<SessionDetailView, PiClientError> {
+        let session = self
+            .authenticated_session
+            .as_ref()
+            .ok_or_else(|| PiClientError {
+                kind: PiClientErrorKind::Other,
+                message: "get_verified_session called without an authenticated session".to_string(),
+            })?;
+        client.get_verified_session(session, session_id, verification)
     }
 
     /// Deletes one session through the catalog capability, forwarding the
@@ -1523,6 +1769,10 @@ mod tests {
             capture_activity: CaptureActivityState::Recording,
             media_admission: "allowed".to_string(),
             publication_key_fingerprint: fingerprint.to_string(),
+            profile: DeviceApiProfileView::LegacyPinnedHttpsV1,
+            capabilities: DeviceCapabilitiesView::default(),
+            capture_status: None,
+            publication_origin: PublicationEnvelopeOriginView::DeviceSigned,
         }
     }
 
@@ -1813,6 +2063,11 @@ mod tests {
         );
         assert_eq!(actor.current_epoch(), Some(1));
         assert!(actor.authenticated_session.is_some());
+        assert_eq!(
+            actor.device().capture_activity,
+            CaptureActivityState::Unknown,
+            "a timeout carries no new capture evidence"
+        );
     }
 
     #[test]
@@ -1821,6 +2076,7 @@ mod tests {
         client.push_heartbeat(Ok(HeartbeatOutcomeView {
             idle_timeout_ms: 30_000,
             absolute_expires_at: "2026-08-01T06:00:00Z".to_string(),
+            capture_activity: Some(CaptureActivityState::Recording),
         }));
 
         let mut actor = DeviceActor::new(test_device("fp-1"));
@@ -1835,6 +2091,10 @@ mod tests {
         let outcome = actor.heartbeat_with(&client);
         assert_eq!(outcome, HeartbeatApplyOutcome::Renewed);
         assert_eq!(actor.current_epoch(), Some(1));
+        assert_eq!(
+            actor.device().capture_activity,
+            CaptureActivityState::Recording
+        );
         assert_eq!(
             actor.publication_key_fingerprint(),
             Some(format!("sha256:{}", "a".repeat(64)).as_str())
@@ -1855,6 +2115,7 @@ mod tests {
         healthy_client.push_heartbeat(Ok(HeartbeatOutcomeView {
             idle_timeout_ms: 30_000,
             absolute_expires_at: "2026-08-01T06:00:00Z".to_string(),
+            capture_activity: None,
         }));
 
         let mut broken_actor = DeviceActor::new(test_device("fp-broken"));
@@ -1934,6 +2195,13 @@ mod tests {
     #[test]
     fn refresh_capture_activity_updates_view_when_connected() {
         let client = FakeClient::new();
+        let capabilities = DeviceCapabilitiesView {
+            artifact_download: NegotiatedCapabilityView {
+                supported: true,
+                source: CapabilitySourceView::ProfileContract,
+            },
+            ..DeviceCapabilitiesView::default()
+        };
         client
             .device_info
             .lock()
@@ -1942,6 +2210,10 @@ mod tests {
                 capture_activity: CaptureActivityState::Recording,
                 media_admission: "allowed".to_string(),
                 publication_key_fingerprint: format!("sha256:{}", "a".repeat(64)),
+                profile: DeviceApiProfileView::LegacyPinnedHttpsV1,
+                capabilities,
+                capture_status: None,
+                publication_origin: PublicationEnvelopeOriginView::DeviceSigned,
             }));
 
         let mut actor = DeviceActor::new(test_device("fp-1"));
@@ -1958,6 +2230,17 @@ mod tests {
         assert_eq!(
             actor.publication_key_fingerprint(),
             Some(format!("sha256:{}", "a".repeat(64)).as_str())
+        );
+        assert_eq!(
+            actor
+                .negotiated_device_info()
+                .expect("authenticated snapshot is cached")
+                .capabilities
+                .artifact_download,
+            NegotiatedCapabilityView {
+                supported: true,
+                source: CapabilitySourceView::ProfileContract,
+            }
         );
     }
 
@@ -1989,7 +2272,7 @@ mod tests {
     fn list_sessions_uses_the_held_token_and_returns_the_page() {
         let client = FakeClient::new();
         client.push_list_sessions(Ok(SessionsPageView {
-            catalog_revision: "rev-1".to_string(),
+            catalog_revision: Some("rev-1".to_string()),
             sessions: vec![SessionSummaryView {
                 session_id: "sess-1".to_string(),
                 revision: "rev-a".to_string(),
@@ -1999,8 +2282,13 @@ mod tests {
                 total_bytes: 1000,
                 video_bytes: 900,
                 file_count: 2,
+                gateway_verification: None,
             }],
             next_cursor: None,
+            catalog_authority: CatalogRevisionAuthorityView::LegacyDevice,
+            pagination_supported: true,
+            pagination_unavailable_reason: None,
+            diagnostics: Vec::new(),
         }));
 
         let actor = connected_actor("fp-1", "secret-token");
@@ -2033,6 +2321,10 @@ mod tests {
                 capture_activity: CaptureActivityState::Idle,
                 media_admission: "open".to_string(),
                 publication_key_fingerprint: expected_fingerprint.clone(),
+                profile: DeviceApiProfileView::LegacyPinnedHttpsV1,
+                capabilities: DeviceCapabilitiesView::default(),
+                capture_status: None,
+                publication_origin: PublicationEnvelopeOriginView::DeviceSigned,
             }));
         client.push_get_session(Err(other_error("detail sentinel")));
         let mut actor = connected_actor("fp-1", "secret-token");
@@ -2073,6 +2365,8 @@ mod tests {
             publication_signature: Vec::new(),
             publication_public_key: Vec::new(),
             publication_key_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            gateway_verification: None,
+            publication_origin: PublicationEnvelopeOriginView::DeviceSigned,
         }));
         let actor = connected_actor("fp-1", "secret-token");
         let summary = actor
@@ -2127,6 +2421,8 @@ mod tests {
             publication_signature: Vec::new(),
             publication_public_key: Vec::new(),
             publication_key_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            gateway_verification: None,
+            publication_origin: PublicationEnvelopeOriginView::DeviceSigned,
         }));
         let actor = connected_actor("fp-1", "secret-token");
         let detail = actor

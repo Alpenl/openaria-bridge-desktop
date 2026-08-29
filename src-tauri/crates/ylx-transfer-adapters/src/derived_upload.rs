@@ -1021,7 +1021,9 @@ mod tests {
 
     use super::*;
     use ylx_transfer_core::ingest::{InventoryDigest, SourceContentRevision};
-    use ylx_transfer_core::library::object_store_port::{FaultPoint, MemoryObjectStore};
+    use ylx_transfer_core::library::object_store_port::{
+        FaultPoint, ImmutableObjectRequest, MemoryObjectStore, ObjectListPage, ObjectReadback,
+    };
     use ylx_transfer_core::media_pipeline::{
         ObjectNamespace, UploadBundleInput, UploadObjectInput,
     };
@@ -1070,6 +1072,29 @@ mod tests {
     }
 
     impl ObjectStorePort for ObservedStore {
+        fn put_object_if_absent(
+            &self,
+            request: &ImmutableObjectRequest,
+        ) -> Result<bool, ObjectStoreError> {
+            self.inner.put_object_if_absent(request)
+        }
+
+        fn read_object_bounded(
+            &self,
+            key: &ObjectKey,
+            maximum_bytes: u64,
+        ) -> Result<ObjectReadback, ObjectStoreError> {
+            self.inner.read_object_bounded(key, maximum_bytes)
+        }
+
+        fn list_objects_bounded(
+            &self,
+            prefix: &str,
+            maximum_keys: u16,
+        ) -> Result<ObjectListPage, ObjectStoreError> {
+            self.inner.list_objects_bounded(prefix, maximum_keys)
+        }
+
         fn initiate_multipart_upload(
             &self,
             request: InitiateUploadRequest,

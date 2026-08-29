@@ -1,13 +1,20 @@
 //! mDNS candidate browser for `_ylx-capture._tcp.local.`.
 //!
-//! # Scope: deliberately minimal (this task's own brief)
+//! # Scope
 //!
-//! This module browses the Conductor-advertised service and returns a list of
-//! *candidates*. It does not attempt resolution retry
-//! policy, TTL/staleness tracking beyond "did we see a removal event", or
-//! any kind of ranking/preference logic. A caller can build that on
-//! top of [`MdnsDiscovery::poll_events`]'s output if/when it's actually
-//! needed.
+//! This module owns the lossless conversion from `mdns-sd` browse events into
+//! deterministic endpoint candidates and lifecycle changes. It preserves the
+//! advertised port, every address, the interface that received each address,
+//! and the scope required by IPv6 link-local connections. It does not probe a
+//! Device API endpoint or decide that an unauthenticated service is a device.
+//!
+//! `mdns-sd` emits the same `ServiceRemoved` event for an explicit goodbye and
+//! for cache/TTL expiry. [`MdnsLossReason::RemovedOrExpired`] deliberately
+//! preserves that uncertainty instead of inventing a local explanation. Browse
+//! restart recovery and endpoint health are caller concerns; this module only
+//! supplies ordered events and a generation/sequence cursor so late work from
+//! an older browse cannot overwrite newer state.
+//! It does not restart a stopped browse or recover interrupted operations.
 //!
 //! # mDNS is discovery-only, never a trust anchor (ADR-DISC-001)
 //!
@@ -56,7 +63,7 @@
 //! live `_ylx-capture._tcp.local.` advertiser is not started by the test
 //! suite). The tests in this
 //! module therefore split into two honest categories: (1) real,
-//! non-`#[ignore]`d unit tests of the pure `ServiceInfo` -> [`MdnsCandidate`]
+//! non-`#[ignore]`d unit tests of the pure `ResolvedService` -> [`MdnsCandidate`]
 //! mapping, the URL-composition helpers, and the poll/teardown state
 //! machine driven through an in-memory [`BrowseTransport`] -- none of
 //! which needs a network at all; and (2) an `#[ignore]`d
@@ -68,15 +75,157 @@
 //! that test's own doc comment for exactly what it does and does not
 //! prove.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{InterfaceId, ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent};
 
 /// The Conductor Device API's mDNS service type.
 pub const YLX_CAPTURE_SERVICE_TYPE: &str = "_ylx-capture._tcp.local.";
+
+static NEXT_DISCOVERY_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Case-normalised DNS-SD service identity. DNS names are case-insensitive;
+/// retaining a canonical key prevents a casing-only re-announcement from
+/// creating another service entry. The original spelling remains available in
+/// [`MdnsCandidate::fullname`] and [`MdnsServiceLoss::fullname`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MdnsServiceId(String);
+
+impl MdnsServiceId {
+    pub fn from_fullname(fullname: &str) -> Self {
+        let mut canonical = fullname.trim().to_ascii_lowercase();
+        if !canonical.ends_with('.') {
+            canonical.push('.');
+        }
+        Self(canonical)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for MdnsServiceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Monotonic position of one lifecycle observation. A newly-created browser
+/// receives a new `generation`; `sequence` increases for every resolved,
+/// removed, stopped, or disconnected transition within that browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MdnsEventCursor {
+    pub generation: u64,
+    pub sequence: u64,
+}
+
+/// Interface on which an address was learned. `index` is the Windows IPv6
+/// zone identifier; `name` is the conventional Unix URL zone identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MdnsInterface {
+    pub name: String,
+    pub index: u32,
+}
+
+impl MdnsInterface {
+    fn from_mdns(value: &InterfaceId) -> Option<Self> {
+        if value.name.is_empty() && value.index == 0 {
+            None
+        } else {
+            Some(Self {
+                name: value.name.clone(),
+                index: value.index,
+            })
+        }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        (self.index != 0 && other.index != 0 && self.index == other.index)
+            || (!self.name.is_empty() && !other.name.is_empty() && self.name == other.name)
+    }
+}
+
+/// Which OS representation to use for an IPv6 link-local zone identifier.
+/// Exposed so both Windows numeric-scope and Unix interface-name formatting
+/// can be covered on every CI host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MdnsScopeStyle {
+    InterfaceName,
+    InterfaceIndex,
+}
+
+/// One scoped address advertised for a service instance. IPv4 addresses can
+/// appear once per receiving interface; keeping those rows separate lets the
+/// caller prefer its active interface without discarding alternate routes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MdnsEndpoint {
+    pub address: IpAddr,
+    pub interface: Option<MdnsInterface>,
+}
+
+impl MdnsEndpoint {
+    pub fn is_connectable(&self) -> bool {
+        if self.address.is_unspecified() || self.address.is_multicast() {
+            return false;
+        }
+        match self.address {
+            IpAddr::V6(address) if is_ipv6_link_local(&address) => self.interface.is_some(),
+            _ => true,
+        }
+    }
+
+    /// Raw host passed to the Device API probe. Only IPv6 link-local literals
+    /// carry a zone; global IPv6 and IPv4 literals never do.
+    pub fn host_with_scope_style(
+        &self,
+        style: MdnsScopeStyle,
+    ) -> Result<String, MdnsDiscoveryError> {
+        match self.address {
+            IpAddr::V6(address) if is_ipv6_link_local(&address) => {
+                let interface = self
+                    .interface
+                    .as_ref()
+                    .ok_or_else(|| MdnsDiscoveryError::MissingIpv6Scope(address.to_string()))?;
+                let zone = match style {
+                    MdnsScopeStyle::InterfaceName if !interface.name.is_empty() => {
+                        Some(interface.name.clone())
+                    }
+                    MdnsScopeStyle::InterfaceName if interface.index != 0 => {
+                        Some(interface.index.to_string())
+                    }
+                    MdnsScopeStyle::InterfaceIndex if interface.index != 0 => {
+                        Some(interface.index.to_string())
+                    }
+                    _ => None,
+                }
+                .ok_or_else(|| MdnsDiscoveryError::MissingIpv6Scope(address.to_string()))?;
+                Ok(format!("{address}%{zone}"))
+            }
+            _ => Ok(self.address.to_string()),
+        }
+    }
+
+    pub fn host(&self) -> Result<String, MdnsDiscoveryError> {
+        #[cfg(windows)]
+        let style = MdnsScopeStyle::InterfaceIndex;
+        #[cfg(not(windows))]
+        let style = MdnsScopeStyle::InterfaceName;
+        self.host_with_scope_style(style)
+    }
+
+    pub fn url(&self, scheme: &str, port: u16, path: &str) -> Result<String, MdnsDiscoveryError> {
+        candidate_url(scheme, &self.host()?, port, path)
+    }
+}
+
+fn is_ipv6_link_local(address: &std::net::Ipv6Addr) -> bool {
+    address.segments()[0] & 0xffc0 == 0xfe80
+}
 
 /// One unauthenticated mDNS candidate. See module doc comment's
 /// ADR-DISC-001 section -- nothing here is trusted on its own.
@@ -86,37 +235,114 @@ pub struct MdnsCandidate {
     /// used as the stable key for update/removal tracking -- not a trusted
     /// device identifier.
     pub fullname: String,
+    /// Canonical identity used for update/removal/reappearance matching.
+    pub service_id: MdnsServiceId,
     pub hostname: String,
-    /// Every advertised address, IPv4 **and** IPv6 (loopback/link-local
-    /// included, no filtering -- a caller attempting a pairing connection
-    /// decides which to try, this module does not guess). Sorted
-    /// ascending, which puts IPv4 before IPv6 (`IpAddr`'s own `Ord`), so a
-    /// caller that just takes `addresses.first()` keeps the historical
-    /// IPv4-preferring behaviour while still seeing v6-only devices.
+    /// Deduplicated, scope-free compatibility projection of every IPv4/IPv6
+    /// address. It is sorted but must not drive connection attempts because an
+    /// `IpAddr` cannot represent an IPv6 zone; use [`Self::ordered_endpoints`].
     pub addresses: Vec<IpAddr>,
+    /// Every address/interface pair, deterministically sorted. Callers should
+    /// probe this collection instead of selecting `addresses.first()`.
+    pub endpoints: Vec<MdnsEndpoint>,
     pub port: u16,
     pub txt: HashMap<String, String>,
+    pub cursor: MdnsEventCursor,
 }
 
 impl MdnsCandidate {
-    /// Composes a URL against this candidate's first address (see
-    /// [`Self::addresses`] for the ordering), bracketing IPv6 literals
-    /// correctly. `None` when the candidate advertised no address at all;
+    /// Composes a URL against this candidate's first default-ordered endpoint,
+    /// bracketing IPv6 literals correctly. `None` when the candidate advertised no endpoint;
     /// `Err` when the address cannot be expressed as a URL host (which
     /// should not happen for daemon-produced candidates, but is surfaced
     /// rather than silently papered over).
     pub fn url(&self, scheme: &str, path: &str) -> Option<Result<String, MdnsDiscoveryError>> {
-        let addr = self.addresses.first()?;
-        Some(candidate_url(scheme, &addr.to_string(), self.port, path))
+        let endpoints = self.ordered_endpoints(None);
+        let endpoint = endpoints.first()?;
+        Some(endpoint.url(scheme, self.port, path))
+    }
+
+    /// Returns a stable probe order. Connectable endpoints come first, then an
+    /// optional active interface preference, then IPv4/global-IPv6/scoped
+    /// link-local, address bytes, and interface identity. No port is invented:
+    /// every returned endpoint uses [`Self::port`].
+    pub fn ordered_endpoints(
+        &self,
+        preferred_interface: Option<&MdnsInterface>,
+    ) -> Vec<MdnsEndpoint> {
+        let mut endpoints = self.endpoints.clone();
+        endpoints.sort_by_key(|endpoint| endpoint_sort_key(endpoint, preferred_interface));
+        endpoints
     }
 }
 
-fn candidate_from_service_info(info: &ServiceInfo) -> MdnsCandidate {
-    let mut addresses: Vec<IpAddr> = info.get_addresses().iter().copied().collect();
-    // `get_addresses` hands back a `HashSet`, whose iteration order is
-    // unspecified; sort so `addresses.first()` is deterministic (and, per
-    // `IpAddr: Ord`, IPv4-first).
-    addresses.sort();
+fn endpoint_sort_key(
+    endpoint: &MdnsEndpoint,
+    preferred_interface: Option<&MdnsInterface>,
+) -> (u8, u8, u8, IpAddr, Option<MdnsInterface>) {
+    let connectability = u8::from(!endpoint.is_connectable());
+    let preferred = match (preferred_interface, endpoint.interface.as_ref()) {
+        (None, _) => 0,
+        (Some(expected), Some(actual)) if expected.matches(actual) => 0,
+        _ => 1,
+    };
+    let family = match endpoint.address {
+        IpAddr::V4(address) if address.is_loopback() => 3,
+        IpAddr::V4(_) => 0,
+        IpAddr::V6(address) if address.is_loopback() => 3,
+        IpAddr::V6(address) if is_ipv6_link_local(&address) => 2,
+        IpAddr::V6(_) => 1,
+    };
+    (
+        connectability,
+        preferred,
+        family,
+        endpoint.address,
+        endpoint.interface.clone(),
+    )
+}
+
+fn endpoints_from_scoped(addresses: &std::collections::HashSet<ScopedIp>) -> Vec<MdnsEndpoint> {
+    let mut endpoints = BTreeSet::new();
+    for scoped in addresses {
+        match scoped {
+            ScopedIp::V4(address) => {
+                if address.interface_ids().is_empty() {
+                    endpoints.insert(MdnsEndpoint {
+                        address: IpAddr::V4(*address.addr()),
+                        interface: None,
+                    });
+                } else {
+                    for interface in address.interface_ids() {
+                        endpoints.insert(MdnsEndpoint {
+                            address: IpAddr::V4(*address.addr()),
+                            interface: MdnsInterface::from_mdns(interface),
+                        });
+                    }
+                }
+            }
+            ScopedIp::V6(address) => {
+                endpoints.insert(MdnsEndpoint {
+                    address: IpAddr::V6(*address.addr()),
+                    interface: MdnsInterface::from_mdns(address.scope_id()),
+                });
+            }
+            _ => {}
+        }
+    }
+    let mut endpoints: Vec<_> = endpoints.into_iter().collect();
+    endpoints.sort_by_key(|endpoint| endpoint_sort_key(endpoint, None));
+    endpoints
+}
+
+fn candidate_from_resolved(info: &ResolvedService, cursor: MdnsEventCursor) -> MdnsCandidate {
+    let endpoints = endpoints_from_scoped(info.get_addresses());
+    let addresses = endpoints
+        .iter()
+        .map(|endpoint| endpoint.address)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let txt = info
         .get_properties()
         .iter()
@@ -124,10 +350,13 @@ fn candidate_from_service_info(info: &ServiceInfo) -> MdnsCandidate {
         .collect();
     MdnsCandidate {
         fullname: info.get_fullname().to_string(),
+        service_id: MdnsServiceId::from_fullname(info.get_fullname()),
         hostname: info.get_hostname().to_string(),
         addresses,
+        endpoints,
         port: info.get_port(),
         txt,
+        cursor,
     }
 }
 
@@ -143,6 +372,9 @@ pub enum MdnsDiscoveryError {
     /// literal at all, or an IP literal carrying a malformed/misplaced
     /// zone id. See [`url_host_literal`].
     InvalidAddress(String),
+    /// A link-local IPv6 address was learned without the receiving interface
+    /// needed to form a usable socket/URL zone identifier.
+    MissingIpv6Scope(String),
 }
 
 impl fmt::Display for MdnsDiscoveryError {
@@ -151,6 +383,9 @@ impl fmt::Display for MdnsDiscoveryError {
             Self::DaemonUnavailable(msg) => write!(f, "mdns daemon unavailable: {msg}"),
             Self::Operation(msg) => write!(f, "mdns operation failed: {msg}"),
             Self::InvalidAddress(msg) => write!(f, "invalid mdns address: {msg}"),
+            Self::MissingIpv6Scope(msg) => {
+                write!(f, "mdns link-local IPv6 address is missing scope: {msg}")
+            }
         }
     }
 }
@@ -219,7 +454,7 @@ pub fn candidate_url(
 /// One attempt to take an event off the browse channel.
 #[derive(Debug)]
 pub enum BrowseRecv {
-    /// Boxed because `ServiceEvent` embeds a whole `ServiceInfo`, which
+    /// Boxed because `ServiceEvent` embeds a whole `ResolvedService`, which
     /// would otherwise make every `Empty`/`Disconnected` result carry the
     /// same ~230 bytes around (clippy::large_enum_variant).
     Event(Box<ServiceEvent>),
@@ -330,6 +565,48 @@ impl<T: BrowseTransport> Drop for BrowseGuard<T> {
     }
 }
 
+/// Why a previously resolved service is no longer advertised. `mdns-sd`
+/// intentionally uses one event for a goodbye packet and TTL/cache expiry, so
+/// those two causes remain combined here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MdnsLossReason {
+    RemovedOrExpired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MdnsServiceLoss {
+    pub service_id: MdnsServiceId,
+    pub fullname: String,
+    pub cursor: MdnsEventCursor,
+    pub reason: MdnsLossReason,
+}
+
+/// Terminal reason for one browse generation. The listed service IDs are the
+/// final known set for that generation and should be marked stale/offline by
+/// the owner; the records themselves remain useful for manual reconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MdnsBrowseLossReason {
+    SearchStopped,
+    ChannelDisconnected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MdnsBrowseLoss {
+    pub generation: u64,
+    pub cursor: MdnsEventCursor,
+    pub service_ids: Vec<MdnsServiceId>,
+    pub reason: MdnsBrowseLossReason,
+}
+
+/// State-changing observations from one poll, in wire order. Consumers should
+/// compare cursors before applying asynchronous probe results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MdnsChange {
+    Resolved(MdnsCandidate),
+    Lost(MdnsServiceLoss),
+    BrowseLost(MdnsBrowseLoss),
+}
+
 /// What one [`MdnsDiscovery::poll_events`] call observed. The point of the
 /// tag is that `Idle` and `Disconnected` demand *opposite* reactions from a
 /// polling caller ("try again later" vs "stop, this browser is dead"), and
@@ -348,6 +625,21 @@ pub enum PollOutcome {
     Disconnected { processed: usize },
 }
 
+/// One atomic drain of the browse channel. Unlike [`PollOutcome`] alone, this
+/// carries the exact resolved/removal lifecycle needed to reconcile UI state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MdnsPollBatch {
+    pub generation: u64,
+    pub outcome: PollOutcome,
+    pub changes: Vec<MdnsChange>,
+}
+
+impl MdnsPollBatch {
+    pub fn is_disconnected(&self) -> bool {
+        self.outcome.is_disconnected()
+    }
+}
+
 impl PollOutcome {
     /// Number of events applied during this call.
     pub fn processed(self) -> usize {
@@ -364,14 +656,17 @@ impl PollOutcome {
 }
 
 /// Browses for [`YLX_CAPTURE_SERVICE_TYPE`] candidates. Holds an in-memory
-/// table of the most recently seen resolution per `fullname`, updated by
-/// calling [`Self::poll_events`] -- this module does not spawn its own
+/// table of the most recently seen resolution per canonical service ID,
+/// updated by calling [`Self::poll_batch`] -- this module does not spawn its own
 /// background thread to keep that table current; a caller (e.g. a future
 /// PC-02 actor's event loop) is expected to poll periodically, and to stop
 /// when [`PollOutcome::is_disconnected`] says so.
 pub struct MdnsDiscovery<T: BrowseTransport = DaemonTransport> {
     guard: BrowseGuard<T>,
-    candidates: HashMap<String, MdnsCandidate>,
+    candidates: HashMap<MdnsServiceId, MdnsCandidate>,
+    generation: u64,
+    sequence: u64,
+    terminal: bool,
 }
 
 impl MdnsDiscovery<DaemonTransport> {
@@ -396,40 +691,120 @@ impl<T: BrowseTransport> MdnsDiscovery<T> {
     /// Wraps an already-started browse. Primarily the seam that lets the
     /// lifecycle be tested without multicast.
     pub fn with_transport(transport: T) -> Self {
+        let generation = NEXT_DISCOVERY_GENERATION.fetch_add(1, Ordering::Relaxed);
+        Self::with_transport_generation(transport, generation)
+    }
+
+    /// Deterministic-generation constructor for fake transports. Production
+    /// callers should use [`Self::with_transport`] or [`MdnsDiscovery::start`].
+    pub fn with_transport_generation(transport: T, generation: u64) -> Self {
         Self {
             guard: BrowseGuard::new(transport),
             candidates: HashMap::new(),
+            generation,
+            sequence: 0,
+            terminal: false,
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn next_cursor(&mut self) -> MdnsEventCursor {
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .expect("mDNS event sequence exhausted u64");
+        MdnsEventCursor {
+            generation: self.generation,
+            sequence: self.sequence,
+        }
+    }
+
+    /// Drains every currently pending event into an ordered lifecycle batch.
+    /// This is the preferred integration API: unlike a candidate snapshot, it
+    /// makes removals and terminal browse loss explicit.
+    pub fn poll_batch(&mut self) -> MdnsPollBatch {
+        let first = if self.terminal {
+            BrowseRecv::Disconnected
+        } else {
+            self.guard.transport.try_recv()
+        };
+        self.poll_batch_from(first)
+    }
+
+    /// Blocking counterpart to [`Self::poll_batch`].
+    pub fn poll_batch_blocking(&mut self, timeout: Duration) -> MdnsPollBatch {
+        let first = if self.terminal {
+            BrowseRecv::Disconnected
+        } else {
+            self.guard.transport.recv_timeout(timeout)
+        };
+        self.poll_batch_from(first)
+    }
+
+    fn poll_batch_from(&mut self, first: BrowseRecv) -> MdnsPollBatch {
+        let mut processed = 0;
+        let mut changes = Vec::new();
+        let mut next = Some(first);
+        loop {
+            let received = next
+                .take()
+                .unwrap_or_else(|| self.guard.transport.try_recv());
+            match received {
+                BrowseRecv::Event(event) => {
+                    processed += 1;
+                    if self.apply_event(*event, &mut changes) {
+                        return MdnsPollBatch {
+                            generation: self.generation,
+                            outcome: PollOutcome::Disconnected { processed },
+                            changes,
+                        };
+                    }
+                }
+                BrowseRecv::Empty => {
+                    let outcome = if processed == 0 {
+                        PollOutcome::Idle
+                    } else {
+                        PollOutcome::Events { processed }
+                    };
+                    return MdnsPollBatch {
+                        generation: self.generation,
+                        outcome,
+                        changes,
+                    };
+                }
+                BrowseRecv::Disconnected => {
+                    if !self.terminal {
+                        self.mark_browse_lost(
+                            MdnsBrowseLossReason::ChannelDisconnected,
+                            &mut changes,
+                        );
+                    }
+                    return MdnsPollBatch {
+                        generation: self.generation,
+                        outcome: PollOutcome::Disconnected { processed },
+                        changes,
+                    };
+                }
+            }
         }
     }
 
     /// Drains every currently-pending mDNS event (non-blocking) and
     /// updates the internal candidate table: `ServiceResolved` inserts/
     /// replaces the entry for that `fullname`; `ServiceRemoved` deletes
-    /// it. Other event kinds (`SearchStarted`/`ServiceFound` without a
-    /// resolution yet/`SearchStopped`) are observed but do not change the
-    /// candidate table -- `ServiceFound` in particular is *not* enough
-    /// information yet (`mdns-sd` still needs to resolve host/port/TXT),
-    /// so surfacing it as a candidate would be premature.
+    /// it. `SearchStopped` is terminal and clears the live candidate table;
+    /// `SearchStarted` and unresolved `ServiceFound` events do not change it.
+    /// `ServiceFound` in particular is not enough information yet (`mdns-sd`
+    /// still needs to resolve host/port/TXT), so surfacing it as a candidate
+    /// would be premature.
     ///
     /// See [`PollOutcome`] for how "nothing pending" and "the browser is
     /// dead" are told apart.
     pub fn poll_events(&mut self) -> PollOutcome {
-        let mut processed = 0;
-        loop {
-            match self.guard.transport.try_recv() {
-                BrowseRecv::Event(event) => {
-                    processed += 1;
-                    self.apply_event(*event);
-                }
-                BrowseRecv::Empty => break,
-                BrowseRecv::Disconnected => return PollOutcome::Disconnected { processed },
-            }
-        }
-        if processed == 0 {
-            PollOutcome::Idle
-        } else {
-            PollOutcome::Events { processed }
-        }
+        self.poll_batch().outcome
     }
 
     /// Blocks up to `timeout` waiting for at least one more mDNS event,
@@ -437,22 +812,7 @@ impl<T: BrowseTransport> MdnsDiscovery<T> {
     /// [`Self::poll_events`]). Useful for tests/short-lived callers that
     /// want a bounded wait rather than a tight non-blocking poll loop.
     pub fn poll_events_blocking(&mut self, timeout: Duration) -> PollOutcome {
-        match self.guard.transport.recv_timeout(timeout) {
-            BrowseRecv::Event(event) => {
-                self.apply_event(*event);
-                match self.poll_events() {
-                    PollOutcome::Idle => PollOutcome::Events { processed: 1 },
-                    PollOutcome::Events { processed } => PollOutcome::Events {
-                        processed: processed + 1,
-                    },
-                    PollOutcome::Disconnected { processed } => PollOutcome::Disconnected {
-                        processed: processed + 1,
-                    },
-                }
-            }
-            BrowseRecv::Empty => PollOutcome::Idle,
-            BrowseRecv::Disconnected => PollOutcome::Disconnected { processed: 0 },
-        }
+        self.poll_batch_blocking(timeout).outcome
     }
 
     /// Event count only -- kept so pre-[`PollOutcome`] call sites still
@@ -469,26 +829,55 @@ impl<T: BrowseTransport> MdnsDiscovery<T> {
         self.poll_events_blocking(timeout).processed()
     }
 
-    fn apply_event(&mut self, event: ServiceEvent) {
+    fn apply_event(&mut self, event: ServiceEvent, changes: &mut Vec<MdnsChange>) -> bool {
         match event {
             ServiceEvent::ServiceResolved(info) => {
-                let candidate = candidate_from_service_info(&info);
+                let cursor = self.next_cursor();
+                let candidate = candidate_from_resolved(&info, cursor);
                 self.candidates
-                    .insert(candidate.fullname.clone(), candidate);
+                    .insert(candidate.service_id.clone(), candidate.clone());
+                changes.push(MdnsChange::Resolved(candidate));
+                false
             }
             ServiceEvent::ServiceRemoved(_service_type, fullname) => {
-                self.candidates.remove(&fullname);
+                let service_id = MdnsServiceId::from_fullname(&fullname);
+                self.candidates.remove(&service_id);
+                let cursor = self.next_cursor();
+                changes.push(MdnsChange::Lost(MdnsServiceLoss {
+                    service_id,
+                    fullname,
+                    cursor,
+                    reason: MdnsLossReason::RemovedOrExpired,
+                }));
+                false
             }
-            ServiceEvent::SearchStarted(_)
-            | ServiceEvent::ServiceFound(_, _)
-            | ServiceEvent::SearchStopped(_) => {}
+            ServiceEvent::SearchStopped(_) => {
+                self.mark_browse_lost(MdnsBrowseLossReason::SearchStopped, changes);
+                true
+            }
+            ServiceEvent::SearchStarted(_) | ServiceEvent::ServiceFound(_, _) => false,
+            _ => false,
         }
     }
 
-    /// The current candidate snapshot, as of the last poll call. Order is
-    /// unspecified.
+    fn mark_browse_lost(&mut self, reason: MdnsBrowseLossReason, changes: &mut Vec<MdnsChange>) {
+        let service_ids = self.candidates.keys().cloned().collect::<BTreeSet<_>>();
+        let cursor = self.next_cursor();
+        self.candidates.clear();
+        self.terminal = true;
+        changes.push(MdnsChange::BrowseLost(MdnsBrowseLoss {
+            generation: self.generation,
+            cursor,
+            service_ids: service_ids.into_iter().collect(),
+            reason,
+        }));
+    }
+
+    /// The current candidate snapshot, sorted by canonical service identity.
     pub fn candidates(&self) -> Vec<MdnsCandidate> {
-        self.candidates.values().cloned().collect()
+        let mut candidates: Vec<_> = self.candidates.values().cloned().collect();
+        candidates.sort_by_key(|candidate| candidate.service_id.clone());
+        candidates
     }
 
     /// Stops browsing and shuts down the daemon thread, returning any
@@ -504,15 +893,18 @@ impl<T: BrowseTransport> MdnsDiscovery<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mdns_sd::{ScopedIpV4, ServiceInfo};
+    use serde_json::json;
     use std::cell::RefCell;
-    use std::collections::VecDeque;
+    use std::collections::{HashSet, VecDeque};
+    use std::net::Ipv4Addr;
     use std::rc::Rc;
 
     /// Builds a `ServiceInfo` the same way PI-06's advertiser would (same
     /// crate, same constructor), purely in-memory -- no network involved.
-    /// This is what lets [`candidate_from_service_info`] be tested for
+    /// This is what lets [`candidate_from_resolved`] be tested for
     /// real without needing a real multicast round trip.
-    fn fake_resolved_service_info() -> ServiceInfo {
+    fn fake_resolved_service() -> ResolvedService {
         ServiceInfo::new(
             YLX_CAPTURE_SERVICE_TYPE,
             "ylx-pi-01",
@@ -522,9 +914,10 @@ mod tests {
             &[("device_id", "DEV00001"), ("display_name", "YLX Capture")][..],
         )
         .expect("valid ServiceInfo constructs")
+        .as_resolved_service()
     }
 
-    fn service_info_with_addresses(addrs: &str) -> ServiceInfo {
+    fn resolved_service_with_addresses(addrs: &str) -> ResolvedService {
         ServiceInfo::new(
             YLX_CAPTURE_SERVICE_TYPE,
             "ylx-pi-01",
@@ -534,6 +927,26 @@ mod tests {
             &[("device_id", "DEV00001")][..],
         )
         .expect("valid ServiceInfo constructs")
+        .as_resolved_service()
+    }
+
+    fn scoped_v6(address: &str, interface_name: &str, interface_index: u32) -> ScopedIp {
+        serde_json::from_value(json!({
+            "V6": {
+                "addr": address,
+                "scope_id": {
+                    "name": interface_name,
+                    "index": interface_index
+                }
+            }
+        }))
+        .expect("scoped IPv6 fixture deserializes")
+    }
+
+    fn resolved_service_with_scoped_addresses(addresses: HashSet<ScopedIp>) -> ResolvedService {
+        let mut service = fake_resolved_service();
+        service.addresses = addresses;
+        service
     }
 
     /// Shared record of what a [`FakeTransport`] was asked to do, readable
@@ -597,8 +1010,8 @@ mod tests {
         }
     }
 
-    fn resolved(info: ServiceInfo) -> BrowseRecv {
-        event(ServiceEvent::ServiceResolved(info))
+    fn resolved(info: ResolvedService) -> BrowseRecv {
+        event(ServiceEvent::ServiceResolved(Box::new(info)))
     }
 
     fn event(event: ServiceEvent) -> BrowseRecv {
@@ -606,12 +1019,17 @@ mod tests {
     }
 
     #[test]
-    fn candidate_from_service_info_maps_address_port_and_txt() {
-        let info = fake_resolved_service_info();
-        let candidate = candidate_from_service_info(&info);
+    fn candidate_from_resolved_maps_address_port_and_txt() {
+        let info = fake_resolved_service();
+        let candidate = candidate_from_resolved(
+            &info,
+            MdnsEventCursor {
+                generation: 7,
+                sequence: 1,
+            },
+        );
 
         assert!(candidate.fullname.starts_with("ylx-pi-01."));
-        assert_eq!(candidate.port, 8080);
         assert!(
             candidate
                 .addresses
@@ -627,6 +1045,9 @@ mod tests {
             candidate.txt.get("display_name").map(String::as_str),
             Some("YLX Capture")
         );
+        assert_eq!(candidate.port, 8080, "advertised port must be retained");
+        assert_eq!(candidate.hostname, "ylx-pi-01.local.");
+        assert_eq!(candidate.cursor.generation, 7);
     }
 
     // --- requirement 3: IPv6 candidates + URL literals -----------------
@@ -636,8 +1057,14 @@ mod tests {
     /// undiscoverable).
     #[test]
     fn candidate_keeps_ipv6_addresses() {
-        let info = service_info_with_addresses("2001:db8::42");
-        let candidate = candidate_from_service_info(&info);
+        let info = resolved_service_with_addresses("2001:db8::42");
+        let candidate = candidate_from_resolved(
+            &info,
+            MdnsEventCursor {
+                generation: 1,
+                sequence: 1,
+            },
+        );
         assert_eq!(
             candidate.addresses,
             vec!["2001:db8::42".parse::<IpAddr>().unwrap()]
@@ -648,14 +1075,182 @@ mod tests {
     /// first so `addresses.first()` callers behave as before.
     #[test]
     fn candidate_keeps_both_families_ipv4_first() {
-        let info = service_info_with_addresses("2001:db8::42,192.168.1.42");
-        let candidate = candidate_from_service_info(&info);
+        let info = resolved_service_with_addresses("2001:db8::42,192.168.1.42");
+        let candidate = candidate_from_resolved(
+            &info,
+            MdnsEventCursor {
+                generation: 1,
+                sequence: 1,
+            },
+        );
         assert_eq!(
             candidate.addresses,
             vec![
                 "192.168.1.42".parse::<IpAddr>().unwrap(),
                 "2001:db8::42".parse::<IpAddr>().unwrap(),
             ]
+        );
+    }
+
+    #[test]
+    fn candidate_preserves_each_address_interface_pair() {
+        let ethernet = InterfaceId {
+            name: "Ethernet 2".into(),
+            index: 17,
+        };
+        let wifi = InterfaceId {
+            name: "Wi-Fi".into(),
+            index: 23,
+        };
+        let ipv4 = Ipv4Addr::new(192, 168, 110, 36);
+        let info = resolved_service_with_scoped_addresses(HashSet::from([
+            ScopedIp::V4(ScopedIpV4::new(ipv4, ethernet.clone())),
+            ScopedIp::V4(ScopedIpV4::new(ipv4, wifi.clone())),
+            scoped_v6("fe80::36", &ethernet.name, ethernet.index),
+            scoped_v6("2001:db8::36", &wifi.name, wifi.index),
+        ]));
+        let candidate = candidate_from_resolved(
+            &info,
+            MdnsEventCursor {
+                generation: 3,
+                sequence: 9,
+            },
+        );
+
+        assert_eq!(
+            candidate.addresses.len(),
+            3,
+            "plain addresses are deduplicated"
+        );
+        assert_eq!(
+            candidate.endpoints.len(),
+            4,
+            "interface routes are not deduplicated"
+        );
+        assert!(candidate.endpoints.contains(&MdnsEndpoint {
+            address: IpAddr::V4(ipv4),
+            interface: Some(MdnsInterface {
+                name: ethernet.name,
+                index: ethernet.index,
+            }),
+        }));
+        assert!(candidate.endpoints.contains(&MdnsEndpoint {
+            address: "fe80::36".parse().unwrap(),
+            interface: Some(MdnsInterface {
+                name: "Ethernet 2".into(),
+                index: 17,
+            }),
+        }));
+        assert_eq!(candidate.port, 8080);
+    }
+
+    #[test]
+    fn scoped_link_local_uses_unix_name_and_windows_numeric_index() {
+        let endpoint = MdnsEndpoint {
+            address: "fe80::36".parse().unwrap(),
+            interface: Some(MdnsInterface {
+                name: "eth0".into(),
+                index: 17,
+            }),
+        };
+
+        let unix_host = endpoint
+            .host_with_scope_style(MdnsScopeStyle::InterfaceName)
+            .unwrap();
+        let windows_host = endpoint
+            .host_with_scope_style(MdnsScopeStyle::InterfaceIndex)
+            .unwrap();
+        assert_eq!(unix_host, "fe80::36%eth0");
+        assert_eq!(windows_host, "fe80::36%17");
+        assert_eq!(
+            candidate_url("http", &unix_host, 8080, "/api/v4/device").unwrap(),
+            "http://[fe80::36%25eth0]:8080/api/v4/device"
+        );
+        assert_eq!(
+            candidate_url("http", &windows_host, 8080, "/api/v4/device").unwrap(),
+            "http://[fe80::36%2517]:8080/api/v4/device"
+        );
+        assert_eq!(
+            endpoint.url("http", 8080, "/api/v4/device").unwrap(),
+            if cfg!(windows) {
+                "http://[fe80::36%2517]:8080/api/v4/device"
+            } else {
+                "http://[fe80::36%25eth0]:8080/api/v4/device"
+            }
+        );
+    }
+
+    #[test]
+    fn unscoped_link_local_is_not_a_connectable_candidate() {
+        let endpoint = MdnsEndpoint {
+            address: "fe80::36".parse().unwrap(),
+            interface: None,
+        };
+        assert!(!endpoint.is_connectable());
+        assert!(matches!(
+            endpoint.host(),
+            Err(MdnsDiscoveryError::MissingIpv6Scope(_))
+        ));
+    }
+
+    #[test]
+    fn ordered_endpoints_are_stable_and_honor_interface_preference() {
+        let ethernet = MdnsInterface {
+            name: "Ethernet".into(),
+            index: 7,
+        };
+        let wifi = MdnsInterface {
+            name: "Wi-Fi".into(),
+            index: 11,
+        };
+        let candidate = MdnsCandidate {
+            fullname: "RP-YLX._ylx-capture._tcp.local.".into(),
+            service_id: MdnsServiceId::from_fullname("RP-YLX._ylx-capture._tcp.local."),
+            hostname: "rp-ylx.local.".into(),
+            addresses: vec![],
+            endpoints: vec![
+                MdnsEndpoint {
+                    address: "192.168.110.36".parse().unwrap(),
+                    interface: Some(ethernet),
+                },
+                MdnsEndpoint {
+                    address: "2001:db8::36".parse().unwrap(),
+                    interface: Some(wifi.clone()),
+                },
+                MdnsEndpoint {
+                    address: "fe80::36".parse().unwrap(),
+                    interface: None,
+                },
+            ],
+            port: 8080,
+            txt: HashMap::new(),
+            cursor: MdnsEventCursor {
+                generation: 1,
+                sequence: 1,
+            },
+        };
+
+        let default = candidate.ordered_endpoints(None);
+        assert_eq!(
+            default[0].address,
+            "192.168.110.36".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            default.last().unwrap().address,
+            "fe80::36".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            candidate.ordered_endpoints(Some(&wifi))[0].address,
+            "2001:db8::36".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(default, candidate.ordered_endpoints(None));
+    }
+
+    #[test]
+    fn service_identity_is_case_insensitive_and_dot_normalized() {
+        assert_eq!(
+            MdnsServiceId::from_fullname("RP-YLX._YLX-CAPTURE._TCP.LOCAL"),
+            MdnsServiceId::from_fullname("rp-ylx._ylx-capture._tcp.local.")
         );
     }
 
@@ -707,19 +1302,25 @@ mod tests {
             "http://192.168.1.42:8080/api/v4"
         );
         assert_eq!(
-            candidate_url("https", "2001:db8::42", 8443, "api/v1").unwrap(),
-            "https://[2001:db8::42]:8443/api/v1"
+            candidate_url("http", "2001:db8::42", 18080, "api/v4").unwrap(),
+            "http://[2001:db8::42]:18080/api/v4"
         );
         assert_eq!(
-            candidate_url("http", "fe80::1%eth0", 8080, "/api/v1").unwrap(),
-            "http://[fe80::1%25eth0]:8080/api/v1"
+            candidate_url("http", "fe80::1%eth0", 8080, "/api/v4").unwrap(),
+            "http://[fe80::1%25eth0]:8080/api/v4"
         );
         assert!(candidate_url("http", "nope", 8080, "/").is_err());
     }
 
     #[test]
     fn candidate_url_helper_uses_first_address() {
-        let candidate = candidate_from_service_info(&service_info_with_addresses("2001:db8::42"));
+        let candidate = candidate_from_resolved(
+            &resolved_service_with_addresses("2001:db8::42"),
+            MdnsEventCursor {
+                generation: 1,
+                sequence: 1,
+            },
+        );
         assert_eq!(
             candidate.url("http", "/api/v4").unwrap().unwrap(),
             "http://[2001:db8::42]:8080/api/v4"
@@ -727,10 +1328,16 @@ mod tests {
 
         let empty = MdnsCandidate {
             fullname: "x".into(),
+            service_id: MdnsServiceId::from_fullname("x"),
             hostname: "x.local.".into(),
             addresses: vec![],
+            endpoints: vec![],
             port: 1,
             txt: HashMap::new(),
+            cursor: MdnsEventCursor {
+                generation: 1,
+                sequence: 1,
+            },
         };
         assert!(empty.url("https", "/").is_none());
     }
@@ -747,7 +1354,7 @@ mod tests {
 
     #[test]
     fn poll_reports_events_and_updates_candidates() {
-        let info = fake_resolved_service_info();
+        let info = fake_resolved_service();
         let fullname = info.get_fullname().to_string();
         let (transport, _log) = FakeTransport::new(
             vec![
@@ -769,8 +1376,33 @@ mod tests {
     }
 
     #[test]
+    fn candidate_snapshot_is_sorted_by_stable_service_identity() {
+        let mut later = fake_resolved_service();
+        later.fullname = "z-device._ylx-capture._tcp.local.".into();
+        let mut earlier = fake_resolved_service();
+        earlier.fullname = "a-device._ylx-capture._tcp.local.".into();
+        let (transport, _log) =
+            FakeTransport::new(vec![resolved(later), resolved(earlier)], BrowseRecv::Empty);
+        let mut discovery = MdnsDiscovery::with_transport(transport);
+        assert_eq!(
+            discovery.poll_events(),
+            PollOutcome::Events { processed: 2 }
+        );
+
+        let candidates = discovery.candidates();
+        assert_eq!(
+            candidates[0].service_id.as_str(),
+            "a-device._ylx-capture._tcp.local."
+        );
+        assert_eq!(
+            candidates[1].service_id.as_str(),
+            "z-device._ylx-capture._tcp.local."
+        );
+    }
+
+    #[test]
     fn poll_removes_candidate_on_removal_event() {
-        let info = fake_resolved_service_info();
+        let info = fake_resolved_service();
         let fullname = info.get_fullname().to_string();
         let (transport, _log) = FakeTransport::new(
             vec![
@@ -784,11 +1416,84 @@ mod tests {
         );
         let mut discovery = MdnsDiscovery::with_transport(transport);
 
-        assert_eq!(
-            discovery.poll_events(),
-            PollOutcome::Events { processed: 2 }
-        );
+        let batch = discovery.poll_batch();
+        assert_eq!(batch.outcome, PollOutcome::Events { processed: 2 });
+        assert!(matches!(
+            batch.changes.as_slice(),
+            [
+                MdnsChange::Resolved(_),
+                MdnsChange::Lost(MdnsServiceLoss {
+                    reason: MdnsLossReason::RemovedOrExpired,
+                    ..
+                })
+            ]
+        ));
         assert!(discovery.candidates().is_empty());
+    }
+
+    #[test]
+    fn removed_or_ttl_expired_then_reappeared_keeps_identity_and_advances_cursor() {
+        let info = fake_resolved_service();
+        let fullname = info.get_fullname().to_string();
+        let service_id = MdnsServiceId::from_fullname(&fullname);
+        let mut reappeared_info = info.clone();
+        reappeared_info.port = 18080;
+        let (transport, _log) = FakeTransport::new(
+            vec![
+                resolved(info.clone()),
+                BrowseRecv::Empty,
+                event(ServiceEvent::ServiceRemoved(
+                    YLX_CAPTURE_SERVICE_TYPE.to_string(),
+                    fullname,
+                )),
+                BrowseRecv::Empty,
+                resolved(reappeared_info),
+                BrowseRecv::Empty,
+            ],
+            BrowseRecv::Empty,
+        );
+        let mut discovery = MdnsDiscovery::with_transport_generation(transport, 42);
+
+        let first = discovery.poll_batch();
+        let first_cursor = match &first.changes[0] {
+            MdnsChange::Resolved(candidate) => {
+                assert_eq!(candidate.service_id, service_id);
+                candidate.cursor
+            }
+            other => panic!("expected resolved change, got {other:?}"),
+        };
+        let lost = discovery.poll_batch();
+        let lost_cursor = match &lost.changes[0] {
+            MdnsChange::Lost(loss) => {
+                assert_eq!(loss.service_id, service_id);
+                loss.cursor
+            }
+            other => panic!("expected loss change, got {other:?}"),
+        };
+        assert!(discovery.candidates().is_empty());
+        let reappeared = discovery.poll_batch();
+        let reappeared_candidate = match &reappeared.changes[0] {
+            MdnsChange::Resolved(candidate) => candidate,
+            other => panic!("expected resolved change, got {other:?}"),
+        };
+
+        assert_eq!(reappeared_candidate.service_id, service_id);
+        assert!(first_cursor < lost_cursor && lost_cursor < reappeared_candidate.cursor);
+        assert_eq!(reappeared_candidate.cursor.generation, 42);
+        assert_eq!(
+            reappeared_candidate.port, 18080,
+            "port updates are not pinned"
+        );
+        assert_eq!(discovery.candidates().len(), 1);
+    }
+
+    #[test]
+    fn discovery_generations_increase_across_browser_instances() {
+        let (first_transport, _log) = FakeTransport::new(vec![], BrowseRecv::Empty);
+        let (second_transport, _log) = FakeTransport::new(vec![], BrowseRecv::Empty);
+        let first = MdnsDiscovery::with_transport(first_transport);
+        let second = MdnsDiscovery::with_transport(second_transport);
+        assert!(first.generation() < second.generation());
     }
 
     /// The bug this commit exists for: a dead browse channel used to be
@@ -811,15 +1516,21 @@ mod tests {
     /// reported, so a final resolution is not lost when the daemon dies.
     #[test]
     fn poll_drains_buffered_events_before_reporting_disconnect() {
-        let info = fake_resolved_service_info();
+        let info = fake_resolved_service();
         let (transport, _log) = FakeTransport::new(vec![resolved(info)], BrowseRecv::Disconnected);
         let mut discovery = MdnsDiscovery::with_transport(transport);
 
-        assert_eq!(
-            discovery.poll_events(),
-            PollOutcome::Disconnected { processed: 1 }
-        );
-        assert_eq!(discovery.candidates().len(), 1);
+        let batch = discovery.poll_batch();
+        assert_eq!(batch.outcome, PollOutcome::Disconnected { processed: 1 });
+        assert!(matches!(
+            batch.changes.as_slice(),
+            [MdnsChange::Resolved(_), MdnsChange::BrowseLost(MdnsBrowseLoss {
+                reason: MdnsBrowseLossReason::ChannelDisconnected,
+                service_ids,
+                ..
+            })] if service_ids.len() == 1
+        ));
+        assert!(discovery.candidates().is_empty());
     }
 
     #[test]
@@ -840,8 +1551,8 @@ mod tests {
     }
 
     #[test]
-    fn blocking_poll_counts_first_event_plus_drained_tail() {
-        let info = fake_resolved_service_info();
+    fn search_stopped_is_terminal_and_carries_known_services() {
+        let info = fake_resolved_service();
         let (transport, _log) = FakeTransport::new(
             vec![
                 resolved(info),
@@ -852,17 +1563,24 @@ mod tests {
             BrowseRecv::Empty,
         );
         let mut discovery = MdnsDiscovery::with_transport(transport);
-        assert_eq!(
-            discovery.poll_events_blocking(Duration::from_millis(1)),
-            PollOutcome::Events { processed: 2 }
-        );
+        let batch = discovery.poll_batch_blocking(Duration::from_millis(1));
+        assert_eq!(batch.outcome, PollOutcome::Disconnected { processed: 2 });
+        assert!(matches!(
+            batch.changes.last(),
+            Some(MdnsChange::BrowseLost(MdnsBrowseLoss {
+                reason: MdnsBrowseLossReason::SearchStopped,
+                service_ids,
+                ..
+            })) if service_ids.len() == 1
+        ));
+        assert!(discovery.candidates().is_empty());
     }
 
     /// The legacy `usize` surface still compiles and still counts events,
     /// so existing call sites keep working while they migrate.
     #[test]
     fn legacy_poll_returns_event_count() {
-        let info = fake_resolved_service_info();
+        let info = fake_resolved_service();
         let (transport, _log) = FakeTransport::new(vec![resolved(info)], BrowseRecv::Empty);
         let mut discovery = MdnsDiscovery::with_transport(transport);
         assert_eq!(discovery.poll(), 1);

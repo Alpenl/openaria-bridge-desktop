@@ -37,6 +37,7 @@ fn commits(decision: &ylx_transfer_core::transfer::Decision) -> Vec<(u64, Transf
             Effect::Commit {
                 expected_version,
                 to,
+                ..
             } => Some((*expected_version, to.clone())),
             _ => None,
         })
@@ -115,13 +116,16 @@ fn an_illegal_command_produces_no_effects() {
         }
     }
 
-    // A specific illegal edge: a job in `committing` has no cancel path.
-    let decision = JobAggregate::new(TransferJobState::Committing).decide(JobCommand::Cancel);
+    // A specific illegal edge: canonical publication cannot jump back to a
+    // capture-active pause state.
+    let decision = JobAggregate::new(TransferJobState::Committing).decide(JobCommand::Transition(
+        TransferJobState::PausedCaptureActive,
+    ));
     assert_eq!(
         decision.outcome,
         CommandOutcome::Rejected(RejectReason::IllegalTransition {
             from: TransferJobState::Committing,
-            to: TransferJobState::Cancelling,
+            to: TransferJobState::PausedCaptureActive,
         })
     );
     assert!(decision.effects.is_empty());

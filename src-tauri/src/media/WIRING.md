@@ -1,28 +1,38 @@
-# Media application wiring contract
+# Frozen Linux compatibility wiring
 
-This note is intentionally colocated with the facade. It lists the remaining
-composition-root work without moving filesystem, FFmpeg, persistence, or
-object-store decisions into Tauri commands.
+This note documents the retained Ubuntu mounted-media adapter for compatibility
+fixtures and legacy harnesses. It is not a current product plan or a Windows
+release contract. D-049 fixes the supported path to fixed `/data` storage and
+LAN delivery; D-052 makes the shipped Desktop app Windows x86_64 only. The
+production Windows composition uses fail-closed media ports and must not mount
+removable media, expose eject/safe-swap controls, or replay work after a
+restart. It also never replays local-library delete intents at startup: a
+staged or metadata-committed delete remains untouched until its owning process
+explicitly retries with the known operation context. This wiring is retained
+for source compatibility only; no CI or release job executes its removable-media
+or interruption/recovery tests.
 
-## Crate root and Tauri lifecycle
+## Retained compatibility lifecycle
 
-1. Add `mod media;` in `src-tauri/src/lib.rs`.
-2. Build the concrete port adapters after opening `MediaStore` and the other
+1. The historical composition root declares `mod media;` in
+   `src-tauri/src/lib.rs` only so the compatibility facade remains buildable.
+2. The Linux-only path builds concrete port adapters after opening `MediaStore` and the other
    production dependencies. Load one exact `MediaProjectionSet` before any
    watcher or worker can run, then construct and `manage` `MediaApplication`.
-3. Call `MediaApplication::start(app.handle().clone())` only after both the
+3. The Linux-only path calls `MediaApplication::start(app.handle().clone())` only after both the
    existing `TransferApplication` and the new media facade are managed.
-4. On `RunEvent::Exit`, call `MediaApplication::stop()` before destroying the
+4. On `RunEvent::Exit`, the Linux compatibility path calls `MediaApplication::stop()` before destroying the
    composition. `stop` must wait for scanner watchers, import readers, encoder
    child processes, and upload workers to release their resources.
    The facade serializes the lifecycle start/stop boundary so a recovery that
    loses the epoch race cannot start workers after `stop` returns.
-5. Register all functions in `media::commands` in the invoke handler. Their
+5. The compatibility facade registers functions in `media::commands` in the
+   invoke handler. Their
    Rust names exactly match the command names frozen by the frontend.
 
 ## Concrete port mapping
 
-- `MediaScannerPort` maps platform volume discovery plus the bounded scanner.
+- `MediaScannerPort` maps Linux compatibility volume discovery plus the bounded scanner.
   Its `source_version` is a process-monotonic observation sequence that never
   resets while the facade is alive. `release_media_handles` drains readers and
   watchers before publishing `handleState=released`; `eject_media` calls the
@@ -39,7 +49,7 @@ object-store decisions into Tauri commands.
   The application facade never holds a lock across probe/encode/validate and
   never owns a `Child`. Pause/cancel is successful only after the adapter has
   killed/reaped the full process tree and released files.
-- `SessionPipelinePort` maps core `media_pipeline::SessionPipeline` plus its
+- `SessionPipelinePort` maps the retained core `media_pipeline::SessionPipeline` plus its
   durable repository. It translates the pure replay decision into idempotent
   import/derivation/upload enqueue operations and returns every changed full
   projection in one `MediaEffect`. It must not copy child-job state into a
@@ -52,8 +62,9 @@ object-store decisions into Tauri commands.
   revision lease, and `UploadCheckpointSink`. It publishes
   `object_store_verified` only from `DerivedUploadReceipt`; V1 source archival
   remains disabled and must never be inferred from derivative verification.
-- `MediaLifecyclePort::recover` replays media-store jobs/outboxes and returns
-  exact full projections. `start` installs volume/job observers only after
+- `MediaLifecyclePort::recover` replays retained Linux media-store jobs/outboxes
+  and returns exact full projections. It is never a Windows product startup
+  operation. `start` installs volume/job observers only after this compatibility
   recovery. Every callback is made after the owning transaction commits and
   contains complete replacement values, not row/progress patches.
 

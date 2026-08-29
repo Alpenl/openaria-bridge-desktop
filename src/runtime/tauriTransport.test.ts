@@ -68,28 +68,153 @@ test("revisionedApi.addManualDevice preserves the server revision", async () => 
   assert.equal((await revisionedApi.addManualDevice("192.0.2.10")).revision, 9);
 });
 
-test("downloadFile sends only trusted identifiers to the real backend command", async () => {
+test("session pagination returns opaque cursors unchanged and detail sends both revision fences", async () => {
+  const invocations: Array<{ command: string; payload: unknown }> = [];
+  const session = {
+    id: "session-1",
+    revision: "session-revision-1",
+    dateLabel: "2026-08-28T00:00:00Z",
+    durationSeconds: 1,
+    totalBytes: 10,
+    videoBytes: 10,
+    imuSamples: null,
+    files: [],
+    downloadStatus: "none",
+    backedUp: false,
+    verification: {
+      verdict: "usable",
+      actor: "gateway",
+      validator: { name: "catalog-validator", version: "1", buildSha256: "b".repeat(64) },
+      manifestSha256: "a".repeat(64),
+      verifiedAt: "2026-08-28T00:00:01Z",
+      diagnostics: [],
+    },
+  };
+  const capabilities = {
+    profile: "labHttpV4",
+    sessionDeletion: { supported: false, source: "profileContract" },
+    sessionDetail: { supported: true, source: "profileContract" },
+    artifactDownload: { supported: false, source: "unavailable" },
+    captureStatus: { supported: true, source: "profileContract" },
+  };
   clearMocks();
-  let invocation: { command: string; payload: unknown } | undefined;
   mockIPC((command, payload) => {
-    invocation = { command, payload };
-    return "job-real-1";
+    invocations.push({ command, payload });
+    return command === "list_sessions"
+      ? {
+          revision: 5,
+          value: {
+            items: [session],
+            nextCursor: "opaque://cursor?keep=%2F",
+            hasMore: true,
+            catalogRevision: "catalog-revision-1",
+            catalogAuthority: "deviceSnapshot",
+            paginationSupported: true,
+            paginationUnavailableReason: null,
+            capabilities,
+            diagnostics: [],
+          },
+        }
+      : { revision: 6, value: session };
   });
 
-  const jobId = await api.downloadFile("device-1", "session-1", "opaque-file-1");
-
-  assert.equal(jobId, "job-real-1");
-  assert.equal(
-    JSON.stringify(invocation),
-    JSON.stringify({
-      command: "download_file",
-      payload: {
-        deviceId: "device-1",
-        sessionId: "session-1",
-        fileId: "opaque-file-1",
-      },
-    }),
+  const page = await revisionedApi.listSessions(DEVICE_ID, "opaque://incoming", "catalog-revision-1");
+  const detail = await revisionedApi.getSessionDetail(
+    DEVICE_ID,
+    "session-1",
+    "session-revision-1",
+    "catalog-revision-1",
   );
+
+  assert.equal(page.value.nextCursor, "opaque://cursor?keep=%2F");
+  assert.equal(detail.value.id, "session-1");
+  assert.deepEqual(invocations, [
+    {
+      command: "list_sessions",
+      payload: { deviceId: DEVICE_ID, cursor: "opaque://incoming", catalogRevision: "catalog-revision-1" },
+    },
+    {
+      command: "get_session_detail",
+      payload: {
+        deviceId: DEVICE_ID,
+        sessionId: "session-1",
+        sessionRevision: "session-revision-1",
+        catalogRevision: "catalog-revision-1",
+      },
+    },
+  ]);
+});
+
+test("revisionless session pages and detail preserve catalogRevision null across IPC", async () => {
+  const invocations: Array<{ command: string; payload: unknown }> = [];
+  const session = {
+    id: "session-v2",
+    revision: "sha256:" + "a".repeat(64),
+    dateLabel: "2026-08-28T00:00:00Z",
+    durationSeconds: 1,
+    totalBytes: 10,
+    videoBytes: 10,
+    imuSamples: null,
+    files: [],
+    downloadStatus: "none",
+    backedUp: false,
+    verification: {
+      verdict: "usable",
+      actor: "gateway",
+      validator: { name: "catalog-validator", version: "1", buildSha256: "b".repeat(64) },
+      manifestSha256: "a".repeat(64),
+      verifiedAt: "2026-08-28T00:00:01Z",
+      diagnostics: [],
+    },
+  };
+  const capabilities = {
+    profile: "labHttpV4",
+    sessionDeletion: { supported: false, source: "profileContract" },
+    sessionDetail: { supported: true, source: "profileContract" },
+    artifactDownload: { supported: true, source: "deviceDescriptor" },
+    captureStatus: { supported: true, source: "profileContract" },
+  };
+  clearMocks();
+  mockIPC((command, payload) => {
+    invocations.push({ command, payload });
+    return command === "list_sessions"
+      ? {
+          revision: 7,
+          value: {
+            items: [session],
+            nextCursor: null,
+            hasMore: false,
+            catalogRevision: null,
+            catalogAuthority: "unavailable",
+            paginationSupported: false,
+            paginationUnavailableReason: "catalogRevisionUnavailable",
+            capabilities,
+            diagnostics: [],
+          },
+        }
+      : { revision: 8, value: session };
+  });
+
+  const page = await revisionedApi.listSessions(DEVICE_ID, null, null);
+  await revisionedApi.getSessionDetail(DEVICE_ID, session.id, session.revision, null);
+
+  assert.equal(page.value.catalogRevision, null);
+  assert.deepEqual(invocations, [
+    { command: "list_sessions", payload: { deviceId: DEVICE_ID, cursor: null, catalogRevision: null } },
+    {
+      command: "get_session_detail",
+      payload: {
+        deviceId: DEVICE_ID,
+        sessionId: session.id,
+        sessionRevision: session.revision,
+        catalogRevision: null,
+      },
+    },
+  ]);
+});
+
+test("the real transport exposes no selected-file download command", () => {
+  assert.equal(Object.prototype.hasOwnProperty.call(api, "downloadFile"), false);
 });
 
 test("downloaded Pi cleanup previews and executes against one connected device", async () => {
@@ -512,6 +637,27 @@ test("structured command rejections preserve stable RPC error fields", async () 
   if (failure instanceof RpcInvocationError) assert.deepEqual(failure.rpcError, rpcError);
 });
 
+test("catalog_changed command rejections preserve the replacement catalog revision", async () => {
+  const catalogRevision = `sha256:${"d".repeat(64)}`;
+  const rpcError = {
+    code: "session_catalog_changed",
+    message: "The cursor belongs to an older catalog revision.",
+    retryable: true,
+    details: { catalogRevision },
+  } as const;
+  clearMocks();
+  mockIPC(() => {
+    throw { error: rpcError };
+  });
+
+  const failure = await revisionedApi.listSessions(DEVICE_ID, "opaque-cursor", "old-revision").then(
+    () => null,
+    (error: unknown) => error,
+  );
+  assert.ok(failure instanceof RpcInvocationError);
+  if (failure instanceof RpcInvocationError) assert.deepEqual(failure.rpcError, rpcError);
+});
+
 test("malformed structured command rejections fail closed", async () => {
   clearMocks();
   mockIPC(() => {
@@ -537,11 +683,28 @@ test("sessions:update reuses canonical device identity validation", async () => 
   const seen: string[] = [];
   const diagnostics: string[] = [];
   const originalConsoleError = console.error;
+  const catalog = {
+    sessions: [],
+    catalogRevision: "catalog-1",
+    nextCursor: null,
+    hasMore: false,
+    catalogAuthority: "deviceSnapshot",
+    paginationSupported: true,
+    paginationUnavailableReason: null,
+    capabilities: {
+      profile: "labHttpV4",
+      sessionDeletion: { supported: false, source: "profileContract" },
+      sessionDetail: { supported: true, source: "profileContract" },
+      artifactDownload: { supported: false, source: "unavailable" },
+      captureStatus: { supported: true, source: "profileContract" },
+    },
+    diagnostics: [],
+  };
   console.error = (...values: unknown[]) => diagnostics.push(values.map(String).join(" "));
   const unlisten = await onSessionsUpdate((payload) => seen.push(payload.deviceId));
   try {
-    await emit("sessions:update", { revision: 1, value: { deviceId: DEVICE_DISPLAY_ID, sessions: [] } });
-    await emit("sessions:update", { revision: 2, value: { deviceId: DEVICE_ID, sessions: [] } });
+    await emit("sessions:update", { revision: 1, value: { deviceId: DEVICE_DISPLAY_ID, ...catalog } });
+    await emit("sessions:update", { revision: 2, value: { deviceId: DEVICE_ID, ...catalog } });
   } finally {
     await unlisten();
     console.error = originalConsoleError;
