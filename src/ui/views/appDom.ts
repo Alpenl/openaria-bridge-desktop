@@ -57,6 +57,7 @@ export function createDomAppView(dispatch: Dispatch): AppView {
     hidePairing: () => device.hidePairing(),
     openAddDevice: () => device.openAddDevice(),
     closeAddDevice: () => device.closeAddDevice(),
+    setAddDeviceStatus: (message, tone, busy) => device.setAddDeviceStatus(message, tone, busy),
     openStorageSettings: (config: StorageConfig) => settings.openStorageSettings(config),
     closeStorageSettings: () => settings.closeStorageSettings(),
     setStorageDownloadRootField: (value) => settings.setStorageDownloadRootField(value),

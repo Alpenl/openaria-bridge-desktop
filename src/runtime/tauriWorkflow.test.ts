@@ -119,6 +119,7 @@ function createViewRecorder(): ViewRecorder {
     hidePairing: () => {},
     openAddDevice: () => {},
     closeAddDevice: () => {},
+    setAddDeviceStatus: () => {},
     openStorageSettings: () => {},
     closeStorageSettings: () => {},
     setStorageDownloadRootField: () => {},

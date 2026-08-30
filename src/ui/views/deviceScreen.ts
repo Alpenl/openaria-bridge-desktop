@@ -57,6 +57,7 @@ export interface DeviceScreen {
   hidePairing(): void;
   openAddDevice(): void;
   closeAddDevice(): void;
+  setAddDeviceStatus(message: string | null, tone: "progress" | "danger", busy: boolean): void;
   setBusy(label: string | null): void;
   dispose(): void;
 }
@@ -362,6 +363,23 @@ export function createDeviceScreen(dispatch: Dispatch): DeviceScreen {
     if (selectAllBox) selectAllBox.checked = list.allVisibleSelected;
   }
 
+  function setAddDeviceStatus(message: string | null, tone: "progress" | "danger", busy: boolean): void {
+    const status = elOpt("manualAddStatus");
+    if (status !== null) {
+      status.textContent = message ?? "";
+      status.dataset.tone = message === null ? "hidden" : tone;
+    }
+
+    const submit = elOpt("submitAddDevice") as HTMLButtonElement | null;
+    if (submit !== null) {
+      submit.disabled = busy;
+      submit.textContent = busy ? "探测中..." : "连接";
+    }
+
+    const input = elOpt("manualIp") as HTMLInputElement | null;
+    if (input !== null) input.disabled = busy;
+  }
+
   return {
     renderRail,
     renderTopbar,
@@ -384,11 +402,14 @@ export function createDeviceScreen(dispatch: Dispatch): DeviceScreen {
     },
     openAddDevice(): void {
       inputEl("manualIp").value = "";
+      setAddDeviceStatus(null, "progress", false);
       el("addDeviceOverlay").dataset.open = "true";
     },
     closeAddDevice(): void {
+      setAddDeviceStatus(null, "progress", false);
       el("addDeviceOverlay").dataset.open = "false";
     },
+    setAddDeviceStatus,
     setBusy(label: string | null): void {
       const button = elOpt("cleanupDownloadedBtn") as HTMLButtonElement | null;
       if (!button) return;

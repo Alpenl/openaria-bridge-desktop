@@ -83,6 +83,7 @@ function createRecordedView(): RecordedView {
     hidePairing: (): void => {},
     openAddDevice: (): void => {},
     closeAddDevice: (): void => {},
+    setAddDeviceStatus: (): void => {},
     openStorageSettings: (_config): void => {
       storageSettingsOpens += 1;
     },
