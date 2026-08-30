@@ -53,6 +53,7 @@ export interface AppView {
   hidePairing(): void;
   openAddDevice(): void;
   closeAddDevice(): void;
+  setAddDeviceStatus(message: string | null, tone: "progress" | "danger", busy: boolean): void;
   openStorageSettings(config: StorageConfig): void;
   closeStorageSettings(): void;
   setStorageDownloadRootField(value: string): void;

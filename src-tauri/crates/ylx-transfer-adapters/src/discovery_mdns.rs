@@ -1664,4 +1664,37 @@ mod tests {
         eprintln!("real_daemon_starts_and_can_be_stopped: outcome {outcome:?} after 2s");
         discovery.stop().expect("daemon stops cleanly");
     }
+
+    #[test]
+    #[ignore = "requires a live YLX mDNS advertiser; set YLX_LIVE_PI_HOST and run manually"]
+    fn live_daemon_discovers_the_expected_device_address() {
+        let expected: IpAddr = std::env::var("YLX_LIVE_PI_HOST")
+            .expect("YLX_LIVE_PI_HOST is required")
+            .parse()
+            .expect("YLX_LIVE_PI_HOST must be an IP address");
+        let mut discovery = MdnsDiscovery::start().expect("real mdns-sd daemon starts");
+        let mut found = None;
+        for _ in 0..10 {
+            discovery.poll_events_blocking(Duration::from_secs(1));
+            found = discovery
+                .candidates()
+                .into_iter()
+                .find(|candidate| candidate.addresses.contains(&expected));
+            if found.is_some() {
+                break;
+            }
+        }
+
+        let candidate = found.expect("expected live device was not resolved over mDNS");
+        assert_eq!(candidate.port, 8080);
+        assert_eq!(
+            candidate.txt.get("api").map(String::as_str),
+            Some("/api/v4/device")
+        );
+        assert_eq!(
+            candidate.txt.get("scheme").map(String::as_str),
+            Some("http")
+        );
+        discovery.stop().expect("daemon stops cleanly");
+    }
 }

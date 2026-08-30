@@ -1487,6 +1487,19 @@ button {
   font-size: 11.5px;
   color: var(--text-tertiary);
 }
+.modal-status {
+  margin: -2px 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+.modal-status[data-tone="hidden"] {
+  display: none;
+}
+.modal-status[data-tone="danger"] {
+  color: var(--danger-500);
+}
 .modal-actions {
   display: flex;
   justify-content: flex-end;

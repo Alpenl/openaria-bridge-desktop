@@ -118,6 +118,7 @@ pub const DEVICE_API_V4_INFO_VERSION: &str = "4.0.0";
 pub const DEVICE_API_V4_BASE_PATH: &str = "/api/v4";
 const DEVICE_API_V4_DESCRIPTOR_SCHEMA: &str = "ylx.device.v4";
 const DEVICE_API_V4_DESCRIPTOR_VERSION: &str = "4.0";
+const DEVICE_API_V4_SESSION_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const LAB_V4_LOCAL_PAIRING_EXPIRY: &str = "2099-01-01T00:00:00Z";
 const LAB_V4_PUBLICATION_KEY_SEED: [u8; 32] = [
     0x74, 0x93, 0x4f, 0x27, 0x6d, 0x8b, 0x1c, 0x55, 0xa0, 0xf2, 0x42, 0x38, 0x91, 0x63, 0xd4, 0x2a,
@@ -1760,6 +1761,7 @@ fn read_bounded_response_body(reader: impl Read) -> Result<Vec<u8>, PiHttpError>
 /// TLS trust model and error-mapping contract.
 pub struct PiHttpClient {
     control_agent: Agent,
+    session_catalog_agent: Agent,
     stream_agent: Agent,
     base_url: String,
     tls_pin: Option<PiTlsPin>,
@@ -1834,6 +1836,9 @@ impl PiHttpClient {
         let control_connector =
             ().chain(TcpConnector::default())
                 .chain(PinnedTlsConnector::new(pin_bytes)?);
+        let session_catalog_connector =
+            ().chain(TcpConnector::default())
+                .chain(PinnedTlsConnector::new(pin_bytes)?);
         let stream_connector =
             ().chain(TcpConnector::default())
                 .chain(PinnedTlsConnector::new(pin_bytes)?);
@@ -1864,9 +1869,22 @@ impl PiHttpClient {
             .http_status_as_error(false)
             .max_redirects(0)
             .build();
+        let session_catalog_config = Agent::config_builder()
+            .timeout_global(Some(std::cmp::max(
+                config.request_timeout,
+                DEVICE_API_V4_SESSION_CATALOG_TIMEOUT,
+            )))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build();
         let control_agent = Agent::with_parts(
             control_config,
             control_connector,
+            DefaultResolver::default(),
+        );
+        let session_catalog_agent = Agent::with_parts(
+            session_catalog_config,
+            session_catalog_connector,
             DefaultResolver::default(),
         );
         let stream_agent =
@@ -1887,6 +1905,7 @@ impl PiHttpClient {
         let base_url = format!("https://{}:{}/api/v1", host_literal, config.port);
         Ok(Self {
             control_agent,
+            session_catalog_agent,
             stream_agent,
             base_url,
             tls_pin: Some(PiTlsPin(format!("sha256:{}", hex_encode(&pin_bytes)))),
@@ -1903,6 +1922,9 @@ impl PiHttpClient {
     ) -> Result<Self, PiHttpError> {
         let pin_bytes = parse_tls_pin(&synthetic_identity_pin)?;
         let control_connector =
+            ().chain(TcpConnector::default())
+                .chain(PinnedTlsConnector::new([0u8; 32])?);
+        let session_catalog_connector =
             ().chain(TcpConnector::default())
                 .chain(PinnedTlsConnector::new([0u8; 32])?);
         let stream_connector =
@@ -1922,9 +1944,22 @@ impl PiHttpClient {
             .http_status_as_error(false)
             .max_redirects(0)
             .build();
+        let session_catalog_config = Agent::config_builder()
+            .timeout_global(Some(std::cmp::max(
+                request_timeout,
+                DEVICE_API_V4_SESSION_CATALOG_TIMEOUT,
+            )))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build();
         let control_agent = Agent::with_parts(
             control_config,
             control_connector,
+            DefaultResolver::default(),
+        );
+        let session_catalog_agent = Agent::with_parts(
+            session_catalog_config,
+            session_catalog_connector,
             DefaultResolver::default(),
         );
         let stream_agent =
@@ -1941,6 +1976,7 @@ impl PiHttpClient {
         );
         Ok(Self {
             control_agent,
+            session_catalog_agent,
             stream_agent,
             base_url,
             tls_pin: Some(PiTlsPin(format!("sha256:{}", hex_encode(&pin_bytes)))),
@@ -1989,6 +2025,9 @@ impl PiHttpClient {
         let control_connector = ()
             .chain(TcpConnector::default())
             .chain(PinnedTlsConnector::new([0u8; 32]).expect("dummy pin parses"));
+        let session_catalog_connector = ()
+            .chain(TcpConnector::default())
+            .chain(PinnedTlsConnector::new([0u8; 32]).expect("dummy pin parses"));
         let stream_connector = ()
             .chain(TcpConnector::default())
             .chain(PinnedTlsConnector::new([0u8; 32]).expect("dummy pin parses"));
@@ -2006,15 +2045,29 @@ impl PiHttpClient {
             .http_status_as_error(false)
             .max_redirects(0)
             .build();
+        let session_catalog_config = Agent::config_builder()
+            .timeout_global(Some(std::cmp::max(
+                request_timeout,
+                DEVICE_API_V4_SESSION_CATALOG_TIMEOUT,
+            )))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build();
         let control_agent = Agent::with_parts(
             control_config,
             control_connector,
+            DefaultResolver::default(),
+        );
+        let session_catalog_agent = Agent::with_parts(
+            session_catalog_config,
+            session_catalog_connector,
             DefaultResolver::default(),
         );
         let stream_agent =
             Agent::with_parts(stream_config, stream_connector, DefaultResolver::default());
         Self {
             control_agent,
+            session_catalog_agent,
             stream_agent,
             base_url,
             tls_pin: None,
@@ -2141,6 +2194,22 @@ impl PiHttpClient {
         body: Option<Vec<u8>>,
     ) -> Result<RawResponse, PiHttpError> {
         let response = self.execute(&self.control_agent, method, path, query, headers, body)?;
+        let (parts, body) = response.into_parts();
+        RawStreamResponse {
+            status: parts.status.as_u16(),
+            headers: parts.headers,
+            body: Box::new(body.into_reader()),
+        }
+        .into_bounded()
+    }
+
+    fn send_session_catalog(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<RawResponse, PiHttpError> {
+        let response = self.execute(&self.session_catalog_agent, method, path, query, &[], None)?;
         let (parts, body) = response.into_parts();
         RawStreamResponse {
             status: parts.status.as_u16(),
@@ -2543,7 +2612,7 @@ impl PiHttpClient {
             limit_str = requested_limit.to_string();
             query.push(("limit", &limit_str));
         }
-        let resp = self.send(Method::GET, "/sessions", &query, &[], None)?;
+        let resp = self.send_session_catalog(Method::GET, "/sessions", &query)?;
         if resp.status != 200 {
             return Err(Self::map_error(resp));
         }
@@ -3450,11 +3519,6 @@ fn validate_v4_device_descriptor(descriptor: &V4DeviceDescriptor) -> Result<(), 
         return Err(PiHttpError::InvalidResponse(
             "Device API v4 descriptor contradicts required session transfer capabilities"
                 .to_string(),
-        ));
-    }
-    if capabilities.network_mutation {
-        return Err(PiHttpError::InvalidResponse(
-            "Device API v4 lab profile must declare network_mutation=false".to_string(),
         ));
     }
     validate_v4_calibration_capability(&capabilities.calibration_capture)?;
@@ -4434,6 +4498,53 @@ mod tests {
         (base_url, rx, handle)
     }
 
+    fn spawn_delayed_fake_server(
+        delay: Duration,
+        response_body: Vec<u8>,
+    ) -> (
+        String,
+        mpsc::Receiver<CapturedRequest>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let server = Server::http("127.0.0.1:0").expect("bind loopback test server");
+        let addr = server.server_addr();
+        let port = addr.to_ip().expect("loopback server has an IP addr").port();
+        let base_url = format!("http://127.0.0.1:{port}/api/v1");
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut request = server
+                .recv_timeout(Duration::from_secs(5))
+                .expect("receive delayed request")
+                .expect("delayed request");
+            let mut captured_body = Vec::new();
+            request
+                .as_reader()
+                .read_to_end(&mut captured_body)
+                .expect("read delayed request body");
+            let _ = tx.send(CapturedRequest {
+                method: request.method().as_str().to_string(),
+                url: request.url().to_string(),
+                headers: request
+                    .headers()
+                    .iter()
+                    .map(|header| {
+                        (
+                            header.field.as_str().as_str().to_string(),
+                            header.value.as_str().to_string(),
+                        )
+                    })
+                    .collect(),
+                body: captured_body,
+            });
+            std::thread::sleep(delay);
+            let response = TinyResponse::from_data(response_body)
+                .with_status_code(StatusCode(200))
+                .with_chunked_threshold(usize::MAX);
+            let _ = request.respond(response);
+        });
+        (base_url, rx, handle)
+    }
+
     fn test_client(base_url: String) -> PiHttpClient {
         PiHttpClient::new_insecure_for_test(base_url, Duration::from_secs(5))
     }
@@ -4466,7 +4577,7 @@ mod tests {
                 "capture": true,
                 "preview": true,
                 "range_download": true,
-                "network_mutation": false,
+                "network_mutation": true,
                 "session_list": true,
                 "session_detail": true,
                 "artifact_download": true,
@@ -4596,6 +4707,79 @@ mod tests {
         assert_eq!(status_request.method, "GET");
         assert_eq!(status_request.url, "/api/v4/capture/status");
         handle.join().expect("fake server exits");
+    }
+
+    #[test]
+    fn lab_v4_session_catalog_has_a_cold_start_timeout_budget() {
+        let page = serde_json::json!({
+            "schema": "ylx.session-list.v3",
+            "catalog_revision": format!("sha256:{}", "e".repeat(64)),
+            "items": [],
+            "diagnostics": [],
+            "next_cursor": null
+        })
+        .to_string()
+        .into_bytes();
+        let (base_url, rx, handle) = spawn_delayed_fake_server(Duration::from_millis(150), page);
+        let client = PiHttpClient::new_lab_v4_http(
+            "127.0.0.1".to_string(),
+            loopback_port_from_base_url(&base_url),
+            lab_v4_device_identity_pin("550e8400-e29b-41d4-a716-446655440000"),
+            Duration::from_millis(50),
+        )
+        .expect("lab v4 client");
+
+        let result = client.list_sessions("lab-token-is-local", None, Some(50));
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("session catalog request")
+                .url,
+            "/api/v4/sessions?limit=50"
+        );
+        assert!(
+            result.is_ok(),
+            "cold session catalog should outlive control timeout: {result:?}"
+        );
+        handle.join().expect("fake server exits");
+    }
+
+    #[test]
+    #[ignore = "requires a live Lab Device API v4 device; set YLX_LIVE_PI_HOST and run manually"]
+    fn live_lab_v4_manual_probe_and_session_catalog_succeed() {
+        let host = std::env::var("YLX_LIVE_PI_HOST").expect("YLX_LIVE_PI_HOST is required");
+        let port = std::env::var("YLX_LIVE_PI_PORT")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<u16>()
+                    .expect("YLX_LIVE_PI_PORT must be a port")
+            })
+            .unwrap_or(8080);
+        let probe = probe_lab_v4_device(&host, port, Duration::from_secs(6))
+            .expect("live Lab v4 descriptor probe");
+        let client = PiHttpClient::new_lab_v4_http(
+            host,
+            port,
+            probe.synthetic_identity_pin,
+            Duration::from_secs(6),
+        )
+        .expect("live Lab v4 client");
+
+        let descriptor = client
+            .negotiate_device("lab-token-is-local")
+            .expect("live Lab v4 negotiation");
+        let sessions = client
+            .list_sessions("lab-token-is-local", None, Some(50))
+            .expect("live Lab v4 session catalog");
+
+        assert_eq!(descriptor.profile, DeviceApiProfile::LabHttpV4);
+        assert!(descriptor.capabilities.network_mutation.supported);
+        assert!(!probe.device_id.is_empty());
+        assert_eq!(
+            sessions.catalog_authority,
+            CatalogRevisionAuthority::DeviceStable
+        );
     }
 
     #[test]

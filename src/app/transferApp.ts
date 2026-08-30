@@ -2018,10 +2018,11 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
       case "device/submitAdd": {
         const ip = action.ip.trim();
         if (!ip) {
+          view.setAddDeviceStatus("请输入 IP 地址", "danger", false);
           toast("请输入 IP 地址", "danger");
           return;
         }
-        toast(`正在探测 ${ip} 的 Device API v4（HTTP 8080）`, "success");
+        view.setAddDeviceStatus(`正在探测 ${ip} 的 Device API v4（HTTP 8080）`, "progress", true);
         void runner.run({
           key: `device:add:${ip}`,
           run: () => backend.addManualDevice(ip),
@@ -2029,9 +2030,15 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
             const devices = devicesOf(state()).filter((candidate) => candidate.id !== device.id);
             devices.push(device);
             commit({ type: "devices/loaded", revision, devices });
+            view.setAddDeviceStatus(null, "progress", false);
             view.closeAddDevice();
             paintRail();
             void beginPairing(asDeviceId(device.id));
+          },
+          failure: (error) => {
+            const message = `无法连接 ${ip}：${describeBackendError(error)}`;
+            view.setAddDeviceStatus(message, "danger", false);
+            return message;
           },
         });
         return;
