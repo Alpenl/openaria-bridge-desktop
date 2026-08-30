@@ -18,7 +18,7 @@ ylx-transfer-core = { path = "crates/ylx-transfer-core" }
 
 [package]
 name = "ylx-transfer"
-version = "0.1.7"
+version = "0.1.8"
 description = "Open Aria Bridge desktop client for verified recording import and publication"
 authors = ["Alpenl"]
 edition.workspace = true
