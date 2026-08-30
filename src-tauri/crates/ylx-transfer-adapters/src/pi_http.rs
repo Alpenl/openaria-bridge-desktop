@@ -794,8 +794,8 @@ struct V4DeviceBuild {
     build_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct V4DeviceCapabilities {
     capture: bool,
     preview: bool,
@@ -806,7 +806,7 @@ struct V4DeviceCapabilities {
     artifact_download: bool,
     capture_status: bool,
     session_deletion: bool,
-    calibration_capture: V4CalibrationCaptureCapability,
+    calibration_capture: Option<V4CalibrationCaptureCapability>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1766,6 +1766,7 @@ pub struct PiHttpClient {
     base_url: String,
     tls_pin: Option<PiTlsPin>,
     api_mode: PiApiMode,
+    v4_capabilities: Mutex<Option<V4DeviceCapabilities>>,
     pairing_transcripts: Mutex<HashMap<String, SasTranscript>>,
 }
 
@@ -1910,6 +1911,7 @@ impl PiHttpClient {
             base_url,
             tls_pin: Some(PiTlsPin(format!("sha256:{}", hex_encode(&pin_bytes)))),
             api_mode: PiApiMode::V1PinnedHttps,
+            v4_capabilities: Mutex::new(None),
             pairing_transcripts: Mutex::new(HashMap::new()),
         })
     }
@@ -1981,6 +1983,7 @@ impl PiHttpClient {
             base_url,
             tls_pin: Some(PiTlsPin(format!("sha256:{}", hex_encode(&pin_bytes)))),
             api_mode: PiApiMode::V4LabHttp,
+            v4_capabilities: Mutex::new(None),
             pairing_transcripts: Mutex::new(HashMap::new()),
         })
     }
@@ -2072,6 +2075,7 @@ impl PiHttpClient {
             base_url,
             tls_pin: None,
             api_mode: PiApiMode::V1PinnedHttps,
+            v4_capabilities: Mutex::new(None),
             pairing_transcripts: Mutex::new(HashMap::new()),
         }
     }
@@ -2352,6 +2356,11 @@ impl PiHttpClient {
         let resp = self.send(Method::GET, "/device", &[], &[], None)?;
         let descriptor: V4DeviceDescriptor = Self::json_response(resp, 200)?;
         validate_v4_device_descriptor(&descriptor)?;
+        *self
+            .v4_capabilities
+            .lock()
+            .map_err(|_| PiHttpError::Network("v4 capability lock poisoned".to_string()))? =
+            Some(descriptor.capabilities.clone());
         Ok(descriptor)
     }
 
@@ -2520,12 +2529,15 @@ impl PiHttpClient {
             range_download: NegotiatedCapability::declared(declared.range_download),
             network_mutation: NegotiatedCapability::declared(declared.network_mutation),
             calibration_capture: NegotiatedCapability::declared(
-                declared.calibration_capture.supported,
+                declared
+                    .calibration_capture
+                    .as_ref()
+                    .is_some_and(|capability| capability.supported),
             ),
-            session_list: NegotiatedCapability::profile(true),
-            session_detail: NegotiatedCapability::profile(true),
+            session_list: NegotiatedCapability::declared(declared.session_list),
+            session_detail: NegotiatedCapability::declared(declared.session_detail),
             artifact_download: NegotiatedCapability::declared(declared.artifact_download),
-            capture_status: NegotiatedCapability::profile(true),
+            capture_status: NegotiatedCapability::declared(declared.capture_status),
             session_deletion: NegotiatedCapability::profile(false),
         }
     }
@@ -2910,6 +2922,20 @@ impl PiHttpClient {
     ) -> Result<HeartbeatOutcome, PiHttpError> {
         if self.is_lab_v4_http() {
             let _ = token.expose();
+            if self
+                .v4_capabilities
+                .lock()
+                .map_err(|_| PiHttpError::Network("v4 capability lock poisoned".to_string()))?
+                .as_ref()
+                .is_some_and(|capabilities| !capabilities.capture_status)
+            {
+                return Ok(HeartbeatOutcome {
+                    _daemon_instance_id: "lab-v4-http".to_string(),
+                    idle_timeout_ms: 60_000,
+                    absolute_expires_at: LAB_V4_LOCAL_PAIRING_EXPIRY.to_string(),
+                    capture_activity: None,
+                });
+            }
             let capture_status = self.v4_capture_status()?;
             return Ok(HeartbeatOutcome {
                 _daemon_instance_id: "lab-v4-http".to_string(),
@@ -2957,10 +2983,14 @@ impl PiHttpClient {
         if self.is_lab_v4_http() {
             let _ = token.expose();
             let descriptor = self.v4_device_descriptor()?;
-            let capture_status = self.v4_capture_status()?;
+            let capture_status = descriptor
+                .capabilities
+                .capture_status
+                .then(|| self.v4_capture_status())
+                .transpose()?;
             return Ok(Self::device_info_from_v4_descriptor(
                 descriptor,
-                Some(capture_status),
+                capture_status,
             ));
         }
         let auth = Self::bearer(token);
@@ -3509,19 +3539,9 @@ fn validate_v4_device_descriptor(descriptor: &V4DeviceDescriptor) -> Result<(), 
     }
 
     let capabilities = &descriptor.capabilities;
-    if !capabilities.range_download
-        || !capabilities.session_list
-        || !capabilities.session_detail
-        || !capabilities.artifact_download
-        || !capabilities.capture_status
-        || capabilities.session_deletion
-    {
-        return Err(PiHttpError::InvalidResponse(
-            "Device API v4 descriptor contradicts required session transfer capabilities"
-                .to_string(),
-        ));
+    if let Some(capability) = capabilities.calibration_capture.as_ref() {
+        validate_v4_calibration_capability(capability)?;
     }
-    validate_v4_calibration_capability(&capabilities.calibration_capture)?;
 
     validate_uuid_v4(
         "descriptor storage volume_id",
@@ -4909,14 +4929,11 @@ mod tests {
     }
 
     #[test]
-    fn lab_v4_device_rejects_a_missing_explicit_session_capability() {
+    fn lab_v4_device_defaults_missing_capabilities_to_unavailable() {
         let mut descriptor: serde_json::Value =
             serde_json::from_slice(&lab_v4_device_json()).expect("device fixture JSON");
-        descriptor["capabilities"]
-            .as_object_mut()
-            .expect("capabilities object")
-            .remove("session_list");
-        let (base_url, _rx, handle) = spawn_fake_server(vec![(
+        descriptor["capabilities"] = serde_json::json!({});
+        let (base_url, rx, handle) = spawn_fake_server(vec![(
             200,
             vec![],
             serde_json::to_vec(&descriptor).expect("descriptor bytes"),
@@ -4929,12 +4946,34 @@ mod tests {
         )
         .expect("lab v4 client");
 
-        let error = client
+        let device = client
             .get_device("lab-token-is-local")
-            .expect_err("missing capability must fail closed before capture status");
+            .expect("identity-valid device remains connectable");
+
+        assert_eq!(device.profile, DeviceApiProfile::LabHttpV4);
+        assert_eq!(device.capture_activity, CaptureActivityState::Unknown);
+        assert!(device.capture_status.is_none());
+        assert!(!device.capabilities.capture.supported);
+        assert!(!device.capabilities.preview.supported);
+        assert!(!device.capabilities.session_list.supported);
+        assert!(!device.capabilities.session_detail.supported);
+        assert!(!device.capabilities.artifact_download.supported);
+        assert!(!device.capabilities.capture_status.supported);
+        assert!(!device.capabilities.session_deletion.supported);
+
+        let heartbeat = client
+            .heartbeat("lab-token-is-local")
+            .expect("missing capture status stays a supported degraded connection");
+        assert!(heartbeat.capture_activity.is_none());
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("descriptor request")
+                .url,
+            "/api/v4/device"
+        );
         assert!(
-            matches!(error, PiHttpError::Decode(ref detail) if detail.contains("session_list")),
-            "unexpected error: {error}"
+            rx.try_recv().is_err(),
+            "disabled capabilities must not trigger unsupported endpoint requests"
         );
         handle.join().expect("fake server exits");
     }
