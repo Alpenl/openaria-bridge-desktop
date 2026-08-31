@@ -1033,6 +1033,7 @@ struct ManifestAudioSync {
     time_base: String,
     start_time_seconds: Number,
     end_time_seconds: Number,
+    video_time_reference: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1092,7 +1093,8 @@ impl DeviceSessionManifest {
         if self.video.segments.is_empty() {
             return Err("source video has no segments".to_string());
         }
-        reciprocal_decimal_rate(&self.camera.effective_fps, "camera.effective_fps")?;
+        let video_tick =
+            reciprocal_decimal_rate(&self.camera.effective_fps, "camera.effective_fps")?;
 
         let mut expected_start_frame = 0_u64;
         let mut expected_index = 0_u32;
@@ -1149,8 +1151,12 @@ impl DeviceSessionManifest {
                 if *sample_rate == 0 || *channels == 0 || *sample_count == 0 {
                     return Err("recorded audio has invalid scalar metadata".to_string());
                 }
-                if sync.time_base != "host_monotonic" {
-                    return Err("recorded audio must use host_monotonic sync".to_string());
+                if sync.time_base != "host_monotonic"
+                    || sync.video_time_reference != "session_time_seconds"
+                {
+                    return Err(
+                        "recorded audio must use the host_monotonic session clock".to_string()
+                    );
                 }
                 let sync_start_ns = exact_decimal_nanoseconds(&sync.start_time_seconds)?;
                 let sync_end_ns = exact_decimal_nanoseconds(&sync.end_time_seconds)?;
@@ -1172,30 +1178,28 @@ impl DeviceSessionManifest {
                     {
                         return Err("audio sample ranges are not contiguous".to_string());
                     }
-                    let declared_start_ns = exact_decimal_nanoseconds(&segment.start_time_seconds)?;
-                    let declared_end_ns = exact_decimal_nanoseconds(&segment.end_time_seconds)?;
+                    let declared_start_ns =
+                        rounded_decimal_nanoseconds(&segment.start_time_seconds)?;
+                    let declared_end_ns = rounded_decimal_nanoseconds(&segment.end_time_seconds)?;
                     if declared_end_ns <= declared_start_ns
                         || previous_end_ns
                             .is_some_and(|end: i64| end.abs_diff(declared_start_ns) > 1)
                         || !sample_clock_position_matches(
                             declared_start_ns,
-                            sync_start_ns,
+                            0,
                             segment.start_sample,
                             *sample_rate,
                             sample_tolerance_ns,
                         )?
                         || !sample_clock_position_matches(
                             declared_end_ns,
-                            sync_start_ns,
+                            0,
                             segment.end_sample,
                             *sample_rate,
                             sample_tolerance_ns,
                         )?
                     {
-                        return Err(
-                            "audio segment common-clock times contradict their sample ranges"
-                                .to_string(),
-                        );
+                        return Err("audio-clock times contradict their sample ranges".to_string());
                     }
                     validate_artifact(&segment.artifact, "audio.wav", "audio/wav", true)?;
                     expected_sample = segment.end_sample;
@@ -1207,19 +1211,17 @@ impl DeviceSessionManifest {
                 if expected_sample != *sample_count {
                     return Err("audio.sample_count does not equal its segment ranges".to_string());
                 }
-                let first_start_ns = exact_decimal_nanoseconds(&segments[0].start_time_seconds)?;
-                let last_end_ns = exact_decimal_nanoseconds(
-                    &segments
-                        .last()
-                        .expect("recorded audio segments are non-empty")
-                        .end_time_seconds,
-                )?;
-                if first_start_ns.abs_diff(sync_start_ns) > 1
-                    || last_end_ns.abs_diff(sync_end_ns) > 1
-                {
-                    return Err(
-                        "audio sync bounds do not bind the first and last segment".to_string()
-                    );
+                let sync_tolerance_ns = ceil_positive_timeline_nanoseconds(video_tick)?.max(
+                    ceil_ratio_u64(1_024_u128 * 1_000_000_000_u128, u128::from(*sample_rate))?,
+                );
+                if !sample_clock_position_matches(
+                    sync_end_ns,
+                    sync_start_ns,
+                    *sample_count,
+                    *sample_rate,
+                    sync_tolerance_ns,
+                )? {
+                    return Err("audio sync duration contradicts its sample range".to_string());
                 }
             }
         }
@@ -1295,28 +1297,40 @@ impl DeviceSessionManifest {
                 sample_count,
                 sync,
                 segments,
-            } => Some(ManifestAudioTimeline {
-                sample_rate_hz: *sample_rate,
-                channels: *channels,
-                sample_count: *sample_count,
-                session_start_offset: decimal_time(&sync.start_time_seconds)?,
-                session_stop_offset: decimal_time(&sync.end_time_seconds)?,
-                segments: segments
-                    .iter()
-                    .map(|segment| {
-                        Ok(TimedAudioSegment {
-                            index: segment.index,
-                            path: segment.artifact.path.clone(),
-                            bytes: segment.artifact.bytes,
-                            sha256: segment.artifact.sha256.clone(),
-                            start_sample: segment.start_sample,
-                            end_sample: segment.end_sample,
-                            start_time: decimal_time(&segment.start_time_seconds)?,
-                            end_time: decimal_time(&segment.end_time_seconds)?,
+            } => {
+                let session_start_ns = exact_decimal_nanoseconds(&sync.start_time_seconds)?;
+                Some(ManifestAudioTimeline {
+                    sample_rate_hz: *sample_rate,
+                    channels: *channels,
+                    sample_count: *sample_count,
+                    session_start_offset: TimelineTime::from_nanoseconds(session_start_ns)
+                        .map_err(|error| error.to_string())?,
+                    session_stop_offset: decimal_time(&sync.end_time_seconds)?,
+                    segments: segments
+                        .iter()
+                        .map(|segment| {
+                            Ok(TimedAudioSegment {
+                                index: segment.index,
+                                path: segment.artifact.path.clone(),
+                                bytes: segment.artifact.bytes,
+                                sha256: segment.artifact.sha256.clone(),
+                                start_sample: segment.start_sample,
+                                end_sample: segment.end_sample,
+                                start_time: session_time_from_audio_sample(
+                                    session_start_ns,
+                                    segment.start_sample,
+                                    *sample_rate,
+                                )?,
+                                end_time: session_time_from_audio_sample(
+                                    session_start_ns,
+                                    segment.end_sample,
+                                    *sample_rate,
+                                )?,
+                            })
                         })
-                    })
-                    .collect::<Result<Vec<_>, String>>()?,
-            }),
+                        .collect::<Result<Vec<_>, String>>()?,
+                })
+            }
         };
         Ok(ManifestSessionTimeline {
             source_manifest_sha256: source_sha256.to_string(),
@@ -2644,14 +2658,71 @@ fn exact_decimal_nanoseconds(number: &Number) -> Result<i64, String> {
         .map_err(|_| "decimal time exceeds the supported range".to_string())
 }
 
+fn rounded_decimal_nanoseconds(number: &Number) -> Result<i64, String> {
+    let (numerator, denominator) = decimal_ratio(number)?;
+    let nanoseconds = rounded_scaled_ratio(numerator, denominator, 1_000_000_000)
+        .ok_or_else(|| "decimal time exceeds the supported range".to_string())?;
+    i64::try_from(nanoseconds).map_err(|_| "decimal time exceeds the supported range".to_string())
+}
+
+fn session_time_from_audio_sample(
+    session_start_ns: i64,
+    sample: u64,
+    sample_rate: u32,
+) -> Result<TimelineTime, String> {
+    let offset_ns =
+        rounded_scaled_ratio(u128::from(sample), u128::from(sample_rate), 1_000_000_000)
+            .ok_or_else(|| "audio sample time exceeds the supported range".to_string())?;
+    let offset_ns = i64::try_from(offset_ns)
+        .map_err(|_| "audio sample time exceeds the supported range".to_string())?;
+    let session_time_ns = session_start_ns
+        .checked_add(offset_ns)
+        .ok_or_else(|| "audio session time exceeds the supported range".to_string())?;
+    TimelineTime::from_nanoseconds(session_time_ns).map_err(|error| error.to_string())
+}
+
+fn rounded_scaled_ratio(numerator: u128, denominator: u128, scale: u128) -> Option<u128> {
+    if denominator == 0 {
+        return None;
+    }
+    let scale_divisor = greatest_common_divisor(scale, denominator);
+    let scaled_numerator = numerator.checked_mul(scale / scale_divisor)?;
+    let scaled_denominator = denominator / scale_divisor;
+    let quotient = scaled_numerator / scaled_denominator;
+    let remainder = scaled_numerator % scaled_denominator;
+    quotient.checked_add(u128::from(
+        remainder >= scaled_denominator - scaled_denominator / 2,
+    ))
+}
+
 fn reciprocal_decimal_rate(number: &Number, label: &str) -> Result<TimelineTime, String> {
     let (numerator, denominator) = decimal_ratio(number)?;
     if numerator == 0 {
         return Err(format!("{label} must be positive"));
     }
-    TimelineTime::new(
-        i64::try_from(denominator).map_err(|_| format!("{label} exceeds the supported range"))?,
-        u64::try_from(numerator).map_err(|_| format!("{label} exceeds the supported range"))?,
+    let divisor = greatest_common_divisor(denominator, numerator);
+    let reduced_numerator = denominator / divisor;
+    let reduced_denominator = numerator / divisor;
+    if reduced_denominator <= 1_000_000_000 {
+        return TimelineTime::new(
+            i64::try_from(reduced_numerator)
+                .map_err(|_| format!("{label} exceeds the supported range"))?,
+            u64::try_from(reduced_denominator)
+                .map_err(|_| format!("{label} exceeds the supported range"))?,
+        )
+        .map_err(|error| error.to_string());
+    }
+
+    let tick_nanoseconds = rounded_scaled_ratio(denominator, numerator, 1_000_000_000)
+        .ok_or_else(|| format!("{label} exceeds the supported range"))?;
+    if tick_nanoseconds == 0 {
+        return Err(format!(
+            "{label} exceeds the supported nanosecond timeline precision"
+        ));
+    }
+    TimelineTime::from_nanoseconds(
+        i64::try_from(tick_nanoseconds)
+            .map_err(|_| format!("{label} exceeds the supported range"))?,
     )
     .map_err(|error| error.to_string())
 }
@@ -3283,6 +3354,102 @@ mod tests {
     fn source_manifest_fixture_passes_derived_download_admission() {
         let payload = compatibility_publication(&source_manifest());
         parse_source_publication(&payload).expect("valid vendored manifest is admitted");
+    }
+
+    #[test]
+    fn real_device_timeline_is_admitted_and_mapped_to_session_clock() {
+        let mut manifest = source_manifest();
+        manifest["time"]["duration_seconds"] =
+            serde_json::from_str("30.369608587").expect("real device duration");
+        manifest["camera"]["effective_fps"] =
+            serde_json::from_str("28.219000503248076").expect("real device effective_fps");
+        manifest["frames"]["count"] = serde_json::json!(857);
+        manifest["video"]["segments"][0]["end_frame"] = serde_json::json!(857);
+        manifest["video"]["segments"][0]["start_time_seconds"] =
+            serde_json::from_str("0.98904022").expect("real video start");
+        manifest["video"]["segments"][0]["end_time_seconds"] =
+            serde_json::from_str("30.369608587").expect("real video end");
+
+        manifest["audio"]["sample_count"] = serde_json::json!(1_398_784);
+        manifest["audio"]["sync"]["start_time_seconds"] =
+            serde_json::from_str("0.973346574").expect("real audio sync start");
+        manifest["audio"]["sync"]["end_time_seconds"] =
+            serde_json::from_str("30.108364855").expect("real audio sync end");
+        manifest["audio"]["segments"]
+            .as_array_mut()
+            .expect("audio segments")
+            .truncate(1);
+        let audio_segment = &mut manifest["audio"]["segments"][0];
+        audio_segment["end_sample"] = serde_json::json!(1_398_784);
+        audio_segment["end_time_seconds"] =
+            serde_json::from_str("29.141333333333332").expect("real audio segment end");
+        audio_segment["pcm_payload_bytes"] = serde_json::json!(5_595_136);
+        audio_segment["wav_header_bytes"] = serde_json::json!(44);
+        audio_segment["artifact"]["bytes"] = serde_json::json!(5_595_180);
+
+        let payload = compatibility_publication(&manifest);
+
+        validate_source_publication_for_download(&payload).unwrap_or_else(|error| {
+            panic!(
+                "real Device Session v2 must remain downloadable instead of exceeding the \
+                 1000000000 timeline denominator limit: {error}"
+            )
+        });
+        let source = parse_source_publication(&payload).expect("admitted real device manifest");
+        let timeline = source
+            .manifest
+            .export_timeline(&source.sha256)
+            .expect("real device export timeline");
+
+        assert_eq!(
+            timeline.video_tick,
+            TimelineTime::from_nanoseconds(35_437_116).expect("nanosecond video tick")
+        );
+        assert_eq!(
+            timeline.left_segments[0].start_time,
+            TimelineTime::from_nanoseconds(989_040_220).expect("video start")
+        );
+        assert_eq!(
+            timeline.left_segments[0].end_time,
+            TimelineTime::from_nanoseconds(30_369_608_587).expect("video end")
+        );
+        let audio = timeline.audio.expect("recorded audio timeline");
+        assert_eq!(
+            audio.session_start_offset,
+            TimelineTime::from_nanoseconds(973_346_574).expect("audio sync start")
+        );
+        assert_eq!(
+            audio.session_stop_offset,
+            TimelineTime::from_nanoseconds(30_108_364_855).expect("audio sync end")
+        );
+        assert_eq!(audio.segments[0].start_time, audio.session_start_offset);
+        assert_eq!(
+            audio.segments[0].end_time,
+            TimelineTime::from_nanoseconds(30_114_679_907).expect("sample-derived audio end")
+        );
+    }
+
+    #[test]
+    fn timeline_quantization_preserves_exact_rates_and_rounds_to_nearest_nanosecond() {
+        let exact_rate = serde_json::from_str("30.0").expect("exact frame rate");
+        assert_eq!(
+            reciprocal_decimal_rate(&exact_rate, "camera.effective_fps").expect("exact tick"),
+            TimelineTime::new(1, 30).expect("one thirtieth of a second")
+        );
+
+        let below_half = serde_json::from_str("0.0000000004").expect("sub-half nanosecond");
+        let at_half = serde_json::from_str("0.0000000005").expect("half nanosecond");
+        assert_eq!(rounded_decimal_nanoseconds(&below_half).unwrap(), 0);
+        assert_eq!(rounded_decimal_nanoseconds(&at_half).unwrap(), 1);
+
+        let unsupported_rate =
+            serde_json::from_str("2000000001").expect("sub-nanosecond frame period");
+        let error = reciprocal_decimal_rate(&unsupported_rate, "camera.effective_fps")
+            .expect_err("a frame period below half a nanosecond must fail closed");
+        assert!(
+            error.contains("nanosecond timeline precision"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
