@@ -55,7 +55,10 @@ Save the result outside the managed library directory.
 Positive values delay sound. This setting belongs to the selected export and
 must come from a matching sound/light calibration; a phone comparison from one
 take does not establish a universal device correction. AAC packet copies can
-expose up to one final packet of padding without moving the recorded events.
+expose an encoder preroll packet and up to one final packet of padding without
+moving the recorded events. The bundled FFmpeg uses microsecond MP4 edit-list
+ticks to avoid rounding the audio shift; older system FFmpeg versions retain
+millisecond compatibility.
 
 New downloads use rendering recipe 5: exact captured video timestamps, sample
 clock resampling without WSOLA transient shifts, H.264 CRF 20, and unspecified

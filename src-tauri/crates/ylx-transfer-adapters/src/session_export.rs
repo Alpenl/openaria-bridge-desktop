@@ -2527,6 +2527,29 @@ impl FfmpegSessionExporter {
                 ),
             ]);
         }
+        // MP4 edit lists otherwise use millisecond ticks and round AAC shifts.
+        // The bundled FFmpeg supports microsecond movie ticks; retain bounded
+        // millisecond compatibility for older system tools.
+        let mut help = Command::new(self.config.ffmpeg_path());
+        help.args(["-hide_banner", "-h", "muxer=mp4"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = std::time::Instant::now();
+        let capability = run_bounded_command(
+            &mut help,
+            "ffmpeg",
+            self.config.ffmpeg_path(),
+            PROCESS_STDERR_LIMIT_BYTES,
+            PROCESS_STDERR_LIMIT_BYTES,
+            &|| started.elapsed() > Duration::from_secs(5),
+        )?;
+        if String::from_utf8_lossy(&capability.stdout)
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("-movie_timescale"))
+        {
+            args.extend(["-movie_timescale".into(), "1000000".into()]);
+        }
         args.extend(["-video_track_timescale".into(), "1000000".into(), "-avoid_negative_ts".into(), "disabled".into(),
             "-metadata".into(), format!("comment={}", serde_json::json!({"schema":"openaria.playable-export.v1", "source_sha256":original_hash, "options":options})),
             "-movflags".into(), "+faststart".into(), staged.to_string_lossy().into_owned()]);
@@ -2584,10 +2607,20 @@ impl FfmpegSessionExporter {
             // padding formerly shortened by the source container duration.
             let tail_tolerance = 1_000_000
                 + 1_024_000_000_000_u64 / u64::from(audio.sample_rate_hz.unwrap_or(48_000));
+            // A positive shift can expose the encoder's formerly negative
+            // AAC preroll packet. It precedes the requested audible start by
+            // one packet; it does not shift the recorded waveform earlier.
+            let start_residual = timeline_residual_ns(actual.start, expected_start)?;
+            let leading_tolerance = if audio.codec_name == "aac" && options.audio_delay_ms > 0 {
+                tail_tolerance
+            } else {
+                1_000_000
+            };
             if actual.codec_name != audio.codec_name
                 || actual.sample_rate_hz != audio.sample_rate_hz
                 || actual.channels != audio.channels
-                || timeline_residual_ns(actual.start, expected_start)?.unsigned_abs() > 1_000_000
+                || start_residual > 1_000_000
+                || start_residual < -(leading_tolerance as i64)
                 || timeline_residual_ns(actual.end, audio.end.checked_add(delta)?)?.unsigned_abs()
                     > tail_tolerance
             {
