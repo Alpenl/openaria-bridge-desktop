@@ -321,6 +321,7 @@ impl TimelineTime {
         Self::from_wide_ratio(numerator, u128::from(self.denominator))
     }
 
+    #[cfg(test)]
     fn checked_div_u64(self, value: u64) -> Result<Self, SessionExportError> {
         if value == 0 {
             return Err(SessionExportError::InvalidTimeline(
@@ -1503,9 +1504,16 @@ fn read_video_frame_timeline_probe(
             "ffprobe reported a zero video frame count".to_string(),
         ));
     }
-    let inferred_tick = stream_end
-        .checked_sub(stream_start)?
-        .checked_div_u64(expected_frame_count)?;
+    let stream_duration = stream_end.checked_sub(stream_start)?;
+    let interpolation_denominator =
+        u128::from(stream_duration.denominator) * u128::from(expected_frame_count);
+    // A measured microsecond duration divided by an arbitrary frame count can
+    // exceed the bounded timeline denominator. Quantize diagnostic estimates
+    // once to nanoseconds; the actual per-frame timestamp digest stays exact.
+    let inferred_tick = TimelineTime::from_mixed_clock_ratio(
+        i128::from(stream_duration.numerator),
+        interpolation_denominator,
+    )?;
     let timestamp_tolerance_ns = time_base.ceil_nanoseconds()?.div_ceil(2);
     let mut reader = BufReader::new(reader);
     let mut report_hasher = Sha256::new();
@@ -1580,7 +1588,10 @@ fn read_video_frame_timeline_probe(
         let relative = actual.checked_sub(stream_start)?;
         let micros = ((i128::from(relative.rounded_nanoseconds()?) + 500) / 1000) as i64;
         timestamp_hasher.update(micros.to_le_bytes());
-        let expected = stream_start.checked_add(inferred_tick.checked_mul_u64(frame_count)?)?;
+        let expected = stream_start.checked_add(TimelineTime::from_mixed_clock_ratio(
+            i128::from(stream_duration.numerator) * i128::from(frame_count),
+            interpolation_denominator,
+        )?)?;
         let residual = timeline_residual_ns(actual, expected)?;
         if residual.unsigned_abs() > max_timestamp_residual_ns.unsigned_abs() {
             max_timestamp_residual_ns = residual;
@@ -2508,8 +2519,6 @@ impl FfmpegSessionExporter {
                 "1:1000000".into(),
                 "-bf".into(),
                 "0".into(),
-                "-r".into(),
-                fps.ffmpeg_seconds()?,
                 "-x265-params".into(),
                 format!(
                     "fps={}/{}:pools=4:frame-threads=2:log-level=error",
@@ -4154,7 +4163,7 @@ fn build_timeline_ffmpeg_args(
             "-r".to_string(),
             format!("{}/{}", video_tick.denominator(), video_tick.numerator()),
         ]);
-        args.extend(["-vsync".to_string(), "0".to_string()]);
+        args.extend(["-vsync".to_string(), "cfr".to_string()]);
     } else {
         args.extend([
             "-vsync".into(),
@@ -5170,7 +5179,7 @@ mod tests {
         assert!(filter.contains("atrim=duration=1.990000000"));
         assert!(filter.contains("asetpts=PTS-STARTPTS+0.500000000/TB"));
         assert!(!args.iter().any(|argument| argument == "-shortest"));
-        assert!(args.windows(2).any(|window| window == ["-vsync", "0"]));
+        assert!(args.windows(2).any(|window| window == ["-vsync", "cfr"]));
         assert!(fs::read_to_string(staging.path().join("left.ffconcat"))
             .expect("left concat list")
             .contains("duration 2.000000000"));
@@ -6724,6 +6733,30 @@ done
                 "output frame {index} has timestamp residual {residual} ns"
             );
         }
+    }
+
+    #[test]
+    fn frame_probe_accepts_measured_duration_with_large_average_period_denominator() {
+        let report = (0..1579_u64)
+            .map(|index| {
+                format!(
+                    "frames_frame_{index}_best_effort_timestamp={}\n",
+                    (index * 53_096_681 + 789) / 1579,
+                )
+            })
+            .collect::<String>();
+        let probe = read_video_frame_timeline_probe(
+            report.as_bytes(),
+            Path::new("measured-clock.mp4"),
+            timeline_time(1, 1_000_000),
+            TimelineTime::zero(),
+            timeline_time(53_096_681, 1_000_000),
+            1579,
+        )
+        .expect("1579-frame measured clock remains representable");
+        assert_eq!(probe.frame_count, 1579);
+        assert!(probe.max_timestamp_residual_ns.unsigned_abs() <= 501);
+        assert!(!probe.timestamp_sha256.is_empty());
     }
 
     #[test]
