@@ -460,7 +460,15 @@ fn compile_schema(raw: &str) -> jsonschema::Validator {
 
 fn source_validator() -> &'static jsonschema::Validator {
     static VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
-    VALIDATOR.get_or_init(|| compile_schema(SOURCE_SCHEMA_JSON))
+    VALIDATOR.get_or_init(|| {
+        let mut value: Value =
+            serde_json::from_str(SOURCE_SCHEMA_JSON).expect("source schema JSON");
+        value["$defs"]["recordedAudio"]["properties"]["capture_clock"] = serde_json::json!({
+            "type": "object", "required": ["schema"],
+            "properties": {"schema": {"const": "openaria.audio-clock.v1"}}
+        });
+        compile_schema(&value.to_string())
+    })
 }
 
 fn receipt_validator() -> &'static jsonschema::Validator {

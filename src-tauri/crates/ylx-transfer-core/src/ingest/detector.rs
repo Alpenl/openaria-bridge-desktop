@@ -1975,6 +1975,7 @@ enum DeviceSessionAudio {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeviceSessionRecordedAudio {
+    capture_clock: Option<Box<crate::audio_clock::CaptureClock>>,
     requested_mode: String,
     resolved_mode: String,
     codec: String,
@@ -2112,8 +2113,12 @@ fn device_session_v1_validator() -> &'static jsonschema::Validator {
 fn device_session_v2_validator() -> &'static jsonschema::Validator {
     static VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
     VALIDATOR.get_or_init(|| {
-        let schema: Value =
+        let mut schema: Value =
             serde_json::from_str(DEVICE_SESSION_V2_SCHEMA_JSON).expect("vendored schema is JSON");
+        schema["$defs"]["recordedAudio"]["properties"]["capture_clock"] = serde_json::json!({
+            "type": "object", "required": ["schema"],
+            "properties": {"schema": {"const": "openaria.audio-clock.v1"}}
+        });
         jsonschema::options()
             .with_draft(Draft::Draft202012)
             .should_validate_formats(true)
@@ -2603,25 +2608,22 @@ fn validate_recorded_audio(
             "Device Session v2 audio.sample_count does not equal segment sample sum",
         ));
     }
-    let first = audio.segments.first().expect("non-empty audio segments");
-    let last = audio.segments.last().expect("non-empty audio segments");
-    if (audio.sync.start_time_seconds - first.start_time_seconds).abs() > 1e-9
-        || (audio.sync.end_time_seconds - last.end_time_seconds).abs() > 1e-9
-    {
-        return Err(rejected(
-            CandidateReadiness::Corrupt,
-            ScanDiagnosticCode::ConflictingEvidence,
-            "Device Session v2 audio sync interval must equal segment coverage",
-        ));
-    }
-    let sync_duration = audio.sync.end_time_seconds - audio.sync.start_time_seconds;
-    let expected_sync_duration = audio.sample_count as f64 / audio.sample_rate as f64;
-    if (sync_duration - expected_sync_duration).abs() > duration_tolerance {
-        return Err(rejected(
-            CandidateReadiness::Corrupt,
-            ScanDiagnosticCode::ConflictingEvidence,
-            "Device Session v2 audio sync duration must match sample_count and sample_rate",
-        ));
+    if let Some(clock) = &audio.capture_clock {
+        clock
+            .validate(
+                audio.sample_rate,
+                audio.sample_count,
+                audio.sync.start_time_seconds,
+                audio.sync.end_time_seconds,
+                manifest.time.duration_seconds,
+            )
+            .map_err(|error| {
+                rejected(
+                    CandidateReadiness::Corrupt,
+                    ScanDiagnosticCode::ConflictingEvidence,
+                    &error,
+                )
+            })?;
     }
     if !(0.0 <= audio.sync.start_time_seconds
         && audio.sync.start_time_seconds < audio.sync.end_time_seconds

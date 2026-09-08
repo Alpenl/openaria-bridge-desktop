@@ -247,7 +247,7 @@ impl DerivedMediaCommitter {
         let output_path = processed.join(&output_filename);
         let timeline = source
             .manifest
-            .export_timeline(&source.sha256)
+            .export_timeline_with_frames(&source.sha256, &staging.revision_dir())
             .map_err(DownloadCommitFailure::permanent)?;
         let plan = SessionExportPlan::from_manifest_timeline(
             staging.revision_dir(),
@@ -405,7 +405,7 @@ impl DerivedMediaCommitter {
 
         let timeline = source
             .manifest
-            .export_timeline(&source.sha256)
+            .export_timeline_with_frames(&source.sha256, source_root)
             .map_err(DownloadCommitFailure::permanent)?;
         let plan = SessionExportPlan::from_manifest_timeline(
             source_root,
@@ -961,7 +961,13 @@ struct DeviceSessionManifest {
     imu: ManifestImu,
     frames: ManifestFrames,
     audio: ManifestAudio,
+    time: ManifestSessionTime,
     logs: Vec<ManifestArtifact>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ManifestSessionTime {
+    duration_seconds: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1022,6 +1028,7 @@ enum ManifestAudio {
         channels: u32,
         sample_count: u64,
         sync: ManifestAudioSync,
+        capture_clock: Option<Box<ylx_transfer_core::audio_clock::CaptureClock>>,
         segments: Vec<ManifestAudioSegment>,
     },
     #[serde(rename = "not_recorded")]
@@ -1093,8 +1100,7 @@ impl DeviceSessionManifest {
         if self.video.segments.is_empty() {
             return Err("source video has no segments".to_string());
         }
-        let video_tick =
-            reciprocal_decimal_rate(&self.camera.effective_fps, "camera.effective_fps")?;
+        reciprocal_decimal_rate(&self.camera.effective_fps, "camera.effective_fps")?;
 
         let mut expected_start_frame = 0_u64;
         let mut expected_index = 0_u32;
@@ -1146,6 +1152,7 @@ impl DeviceSessionManifest {
                 channels,
                 sample_count,
                 sync,
+                capture_clock,
                 segments,
             } => {
                 if *sample_rate == 0 || *channels == 0 || *sample_count == 0 {
@@ -1211,17 +1218,14 @@ impl DeviceSessionManifest {
                 if expected_sample != *sample_count {
                     return Err("audio.sample_count does not equal its segment ranges".to_string());
                 }
-                let sync_tolerance_ns = ceil_positive_timeline_nanoseconds(video_tick)?.max(
-                    ceil_ratio_u64(1_024_u128 * 1_000_000_000_u128, u128::from(*sample_rate))?,
-                );
-                if !sample_clock_position_matches(
-                    sync_end_ns,
-                    sync_start_ns,
-                    *sample_count,
-                    *sample_rate,
-                    sync_tolerance_ns,
-                )? {
-                    return Err("audio sync duration contradicts its sample range".to_string());
+                if let Some(clock) = capture_clock {
+                    clock.validate(
+                        u64::from(*sample_rate),
+                        *sample_count,
+                        sync_start_ns as f64 / 1e9,
+                        sync_end_ns as f64 / 1e9,
+                        self.time.duration_seconds,
+                    )?;
                 }
             }
         }
@@ -1296,11 +1300,37 @@ impl DeviceSessionManifest {
                 channels,
                 sample_count,
                 sync,
+                capture_clock,
                 segments,
             } => {
                 let session_start_ns = exact_decimal_nanoseconds(&sync.start_time_seconds)?;
+                let sample_tick = capture_clock
+                    .as_ref()
+                    .map(|clock| {
+                        let first = clock.anchors.first().expect("validated anchors");
+                        let last = clock.anchors.last().expect("validated anchors");
+                        TimelineTime::new(
+                            1_000,
+                            (((last[0] - first[0]) as f64 * 1e12 / (last[1] - first[1]) as f64)
+                                .round()) as u64,
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+                    .transpose()?;
+                let sample_time = |sample| match sample_tick {
+                    Some(tick) => TimelineTime::from_nanoseconds(session_start_ns)
+                        .and_then(|start| {
+                            tick.checked_mul_u64(sample)
+                                .and_then(|delta| delta.rounded_nanoseconds())
+                                .and_then(TimelineTime::from_nanoseconds)
+                                .and_then(|delta| start.checked_add(delta))
+                        })
+                        .map_err(|error| error.to_string()),
+                    None => session_time_from_audio_sample(session_start_ns, sample, *sample_rate),
+                };
                 Some(ManifestAudioTimeline {
                     sample_rate_hz: *sample_rate,
+                    sample_tick,
                     channels: *channels,
                     sample_count: *sample_count,
                     session_start_offset: TimelineTime::from_nanoseconds(session_start_ns)
@@ -1316,16 +1346,8 @@ impl DeviceSessionManifest {
                                 sha256: segment.artifact.sha256.clone(),
                                 start_sample: segment.start_sample,
                                 end_sample: segment.end_sample,
-                                start_time: session_time_from_audio_sample(
-                                    session_start_ns,
-                                    segment.start_sample,
-                                    *sample_rate,
-                                )?,
-                                end_time: session_time_from_audio_sample(
-                                    session_start_ns,
-                                    segment.end_sample,
-                                    *sample_rate,
-                                )?,
+                                start_time: sample_time(segment.start_sample)?,
+                                end_time: sample_time(segment.end_sample)?,
                             })
                         })
                         .collect::<Result<Vec<_>, String>>()?,
@@ -1342,6 +1364,74 @@ impl DeviceSessionManifest {
             right_segments,
             audio,
         })
+    }
+
+    fn export_timeline_with_frames(
+        &self,
+        source_sha256: &str,
+        source_root: &Path,
+    ) -> Result<ManifestSessionTimeline, String> {
+        let mut timeline = self.export_timeline(source_sha256)?;
+        let path = source_root.join(&self.frames.artifact.path);
+        let raw = read_bounded(&path, self.frames.artifact.bytes)?;
+        if sha256_bytes(&raw) != self.frames.artifact.sha256 {
+            return Err("frame clock artifact digest mismatch".to_string());
+        }
+        let mut timestamps = Vec::new();
+        for line in raw
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            let row =
+                parse_strict_json(line).map_err(|error| format!("invalid frame clock: {error}"))?;
+            let timestamp = row["host_monotonic_ns"]
+                .as_u64()
+                .filter(|value| *value > 0)
+                .ok_or("invalid frame timestamp")?;
+            if row["schema"] != "ylx.frame-index.v1"
+                || row["session_id"] != self.session_id
+                || row["frame"].as_u64() != Some(timestamps.len() as u64)
+                || timestamps
+                    .last()
+                    .is_some_and(|previous| timestamp <= *previous)
+            {
+                return Err("frame clock identity or monotonic sequence is invalid".to_string());
+            }
+            timestamps.push(timestamp);
+        }
+        if timestamps.len() as u64 != self.frames.count || timestamps.len() < 2 {
+            return Err("frame clock count is incomplete".to_string());
+        }
+        let span = timestamps.last().unwrap() - timestamps[0];
+        let interval = span as f64 / (self.frames.count - 1) as f64;
+        if timestamps.iter().enumerate().any(|(index, timestamp)| {
+            ((*timestamp - timestamps[0]) as f64 - index as f64 * interval).abs() > interval / 2.0
+        }) {
+            return Err(
+                "frame clock needs variable-rate rendering; retain source media".to_string(),
+            );
+        }
+        // Nanosecond ticks stay within TimelineTime's bounded denominator;
+        // rounding contributes at most half a nanosecond per video frame.
+        let tick = TimelineTime::from_nanoseconds(interval.round() as i64)
+            .map_err(|error| error.to_string())?;
+        let start = timeline.left_segments[0].start_time;
+        for segment in timeline
+            .left_segments
+            .iter_mut()
+            .chain(timeline.right_segments.iter_mut())
+        {
+            segment.start_time = tick
+                .checked_mul_u64(segment.start_frame)
+                .and_then(|delta| start.checked_add(delta))
+                .map_err(|error| error.to_string())?;
+            segment.end_time = tick
+                .checked_mul_u64(segment.end_frame)
+                .and_then(|delta| start.checked_add(delta))
+                .map_err(|error| error.to_string())?;
+        }
+        timeline.video_tick = tick;
+        Ok(timeline)
     }
 }
 
@@ -1691,7 +1781,7 @@ fn build_receipt(
             name: "openaria-bridge-desktop".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             recipe_id: RECIPE_ID.to_string(),
-            recipe_version: 1,
+            recipe_version: 2,
         },
         output: ReceiptOutput {
             artifact_id: output_sha256.clone(),
@@ -1780,7 +1870,7 @@ fn validate_receipt(
         || receipt.input_artifacts != source.inputs
         || receipt.transformer.name != "openaria-bridge-desktop"
         || receipt.transformer.recipe_id != RECIPE_ID
-        || receipt.transformer.recipe_version != 1
+        || ![1, 2].contains(&receipt.transformer.recipe_version)
         || !is_semver(&receipt.transformer.version)
     {
         return Err("derived media receipt source or transformer binding is invalid".to_string());
@@ -1810,7 +1900,12 @@ fn validate_receipt(
     validate_receipt_audio(&receipt.output.audio, &source.manifest.audio)?;
 
     let timeline = &receipt.timeline_verification;
-    validate_timeline_receipt(timeline, source, &receipt.output)?;
+    validate_timeline_receipt(
+        timeline,
+        source,
+        &receipt.output,
+        receipt.transformer.recipe_version,
+    )?;
     if receipt.canonicalization.state != "committed"
         || receipt.canonicalization.local_asset != "derived-output"
         || receipt.canonicalization.required_upload_assets
@@ -1840,11 +1935,22 @@ fn validate_timeline_receipt(
     timeline: &SessionExportTimelineVerification,
     source: &ParsedSource,
     output: &ReceiptOutput,
+    recipe_version: u32,
 ) -> Result<(), String> {
-    let source_video_tick_ns = ceil_positive_timeline_nanoseconds(reciprocal_decimal_rate(
-        &source.manifest.camera.effective_fps,
-        "camera.effective_fps",
-    )?)?;
+    let source_video_tick_ns = if recipe_version == 2 {
+        // Source inputs have been removed after commit; the receipt retains the
+        // measured tick bound to their hashes and the verified output digest.
+        let tick = timeline.source_video_tick_ns;
+        if tick == 0 || tick > 1_000_000_000 {
+            return Err("invalid measured frame tick in receipt".to_string());
+        }
+        tick
+    } else {
+        ceil_positive_timeline_nanoseconds(reciprocal_decimal_rate(
+            &source.manifest.camera.effective_fps,
+            "camera.effective_fps",
+        )?)?
+    };
     let encoding_audio_frame_ns = match &source.manifest.audio {
         ManifestAudio::Recorded { sample_rate, .. } => Some(ceil_ratio_u64(
             1_024_u128 * 1_000_000_000_u128,
@@ -1863,16 +1969,24 @@ fn validate_timeline_receipt(
         .into_iter()
         .min()
         .ok_or_else(|| "source video timeline is empty".to_string())?;
-    let source_video_end_ns = source
-        .manifest
-        .video
-        .segments
-        .iter()
-        .map(|segment| exact_decimal_nanoseconds(&segment.end_time_seconds))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .max()
-        .ok_or_else(|| "source video timeline is empty".to_string())?;
+    let source_video_end_ns = if recipe_version == 2 {
+        i64::try_from(
+            i128::from(source_video_start_ns)
+                + i128::from(source_video_tick_ns) * i128::from(source.manifest.frames.count),
+        )
+        .map_err(|_| "frame clock end overflow")?
+    } else {
+        source
+            .manifest
+            .video
+            .segments
+            .iter()
+            .map(|segment| exact_decimal_nanoseconds(&segment.end_time_seconds))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .max()
+            .ok_or_else(|| "source video timeline is empty".to_string())?
+    };
     let (expected_leading_gap_ns, source_audio_range) = match &source.manifest.audio {
         ManifestAudio::Recorded { sync, .. } => {
             let start = exact_decimal_nanoseconds(&sync.start_time_seconds)?;
@@ -1952,7 +2066,12 @@ fn validate_timeline_receipt(
         .ok()
         .filter(|duration| *duration > 0)
         .ok_or_else(|| "derived probe duration is invalid".to_string())?;
-    if timeline.probe_summary.duration_ns != duration_ns {
+    let rounding_allowance = if recipe_version == 2 {
+        source.manifest.frames.count
+    } else {
+        0
+    };
+    if timeline.probe_summary.duration_ns.abs_diff(duration_ns) > rounding_allowance {
         return Err("derived media receipt probe duration is not timeline-derived".to_string());
     }
     Ok(())
@@ -3104,6 +3223,19 @@ mod tests {
     }
 
     fn test_artifact_bytes(path: &str) -> Vec<u8> {
+        let manifest = source_manifest();
+        if manifest["frames"]["artifact"]["path"] == path {
+            let count = manifest["frames"]["count"].as_u64().unwrap();
+            let mut raw = Vec::new();
+            for frame in 0..count {
+                serde_json::to_writer(&mut raw, &serde_json::json!({
+                    "schema": "ylx.frame-index.v1", "session_id": manifest["session_id"],
+                    "frame": frame, "host_monotonic_ns": 1_000_000_000 + frame * 1_000_000_000 / 30,
+                })).unwrap();
+                raw.push(b'\n');
+            }
+            return raw;
+        }
         format!("verified test artifact: {path}").into_bytes()
     }
 
@@ -3226,6 +3358,7 @@ mod tests {
         let failure = blocked
             .commit(&request)
             .expect_err("backup cleanup failure must keep the commit incomplete");
+        assert!(failure.retryable, "{failure:?}");
         (source, staging, request, failure)
     }
 
@@ -3354,6 +3487,91 @@ mod tests {
     fn source_manifest_fixture_passes_derived_download_admission() {
         let payload = compatibility_publication(&source_manifest());
         parse_source_publication(&payload).expect("valid vendored manifest is admitted");
+    }
+
+    #[test]
+    fn measured_audio_clock_survives_admission_and_timeline_quantization() {
+        let mut manifest = source_manifest();
+        rewrite_artifacts_as_small_test_files(&mut manifest);
+        manifest["time"]["duration_seconds"] = serde_json::json!(31);
+        let count = manifest["audio"]["sample_count"].as_u64().unwrap();
+        let sample_start = 1_100_000_000_u64;
+        let tick_ns = 20_832_u64;
+        let sample_end = sample_start + count * tick_ns;
+        let mut anchors = (1024..count)
+            .step_by(48_000)
+            .map(|sample| [sample, sample_start + sample * tick_ns])
+            .collect::<Vec<_>>();
+        anchors.push([count, sample_end]);
+        manifest["audio"]["sync"]["start_time_seconds"] = serde_json::json!(0.1);
+        manifest["audio"]["sync"]["end_time_seconds"] =
+            serde_json::json!((sample_end - 1_000_000_000) as f64 / 1e9);
+        manifest["audio"]["capture_clock"] = serde_json::json!({
+            "schema":"openaria.audio-clock.v1", "clock":"host_monotonic",
+            "timestamp_source":"alsa_htimestamp_dma", "continuity":"verified",
+            "device":"hw:CARD=D2UQ2,DEV=0", "period_frames":1024, "buffer_frames":8192,
+            "thread_started_monotonic_ns":sample_start, "thread_stopped_monotonic_ns":sample_end + 1_000_000,
+            "sample_start_monotonic_ns":sample_start, "sample_end_monotonic_ns":sample_end,
+            "session_start_monotonic_ns":1_000_000_000, "max_residual_ns":0, "anchors":anchors,
+            "queue_capacity_frames":262144, "queue_peak_frames":1024, "max_write_ns":500000,
+            "xrun_count":0,"suspend_count":0,
+        });
+        let source = parse_source_publication(&compatibility_publication(&manifest)).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        for artifact in source.manifest.all_artifacts() {
+            let path = root.path().join(&artifact.path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, test_artifact_bytes(artifact.path.to_str().unwrap())).unwrap();
+        }
+        let timeline = source.manifest.export_timeline(&source.sha256).unwrap();
+        assert!(timeline.audio.as_ref().unwrap().sample_tick.is_some());
+        SessionExportPlan::from_manifest_timeline(
+            root.path(),
+            root.path().join("output.mp4"),
+            false,
+            timeline,
+        )
+        .unwrap();
+        manifest["audio"]["capture_clock"]["xrun_count"] = serde_json::json!(1);
+        assert!(parse_source_publication(&compatibility_publication(&manifest)).is_err());
+    }
+
+    #[test]
+    fn frame_clock_replaces_container_rate_and_rejects_internal_steps() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut source, staging, _) = prepared_commit_request(root.path());
+        source.manifest.camera.effective_fps = Number::from(29);
+        let timeline = source
+            .manifest
+            .export_timeline_with_frames(&source.sha256, &staging.revision_dir())
+            .unwrap();
+        assert_eq!(
+            timeline.video_tick,
+            TimelineTime::from_nanoseconds(33_333_333).unwrap()
+        );
+        let path = staging
+            .revision_dir()
+            .join(&source.manifest.frames.artifact.path);
+        let mut rows = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let middle = rows.len() / 2;
+        rows[middle]["host_monotonic_ns"] =
+            serde_json::json!(rows[middle]["host_monotonic_ns"].as_u64().unwrap() + 20_000_000);
+        let raw = rows
+            .iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>();
+        source.manifest.frames.artifact.bytes = raw.len() as u64;
+        source.manifest.frames.artifact.sha256 = sha256_bytes(raw.as_bytes());
+        fs::write(path, raw).unwrap();
+        assert!(source
+            .manifest
+            .export_timeline_with_frames(&source.sha256, &staging.revision_dir())
+            .unwrap_err()
+            .contains("variable-rate"));
     }
 
     #[test]

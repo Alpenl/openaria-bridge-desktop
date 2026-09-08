@@ -209,7 +209,7 @@ impl TimelineTime {
         self.denominator
     }
 
-    fn checked_add(self, other: Self) -> Result<Self, SessionExportError> {
+    pub fn checked_add(self, other: Self) -> Result<Self, SessionExportError> {
         let denominator = u128::from(self.denominator) * u128::from(other.denominator);
         let left = i128::from(self.numerator)
             .checked_mul(i128::from(other.denominator))
@@ -230,7 +230,7 @@ impl TimelineTime {
                 "timeline numerator overflowed while adding values".to_string(),
             )
         })?;
-        Self::from_wide_ratio(numerator, denominator)
+        Self::from_mixed_clock_ratio(numerator, denominator)
     }
 
     fn checked_sub(self, other: Self) -> Result<Self, SessionExportError> {
@@ -254,7 +254,38 @@ impl TimelineTime {
                 "timeline numerator overflowed while subtracting values".to_string(),
             )
         })?;
-        Self::from_wide_ratio(numerator, denominator)
+        Self::from_mixed_clock_ratio(numerator, denominator)
+    }
+
+    fn from_mixed_clock_ratio(
+        numerator: i128,
+        denominator: u128,
+    ) -> Result<Self, SessionExportError> {
+        let divisor = greatest_common_divisor(numerator.unsigned_abs(), denominator);
+        if denominator / divisor <= u128::from(MAX_TIMELINE_DENOMINATOR) {
+            return Self::from_wide_ratio(numerator, denominator);
+        }
+        // Independent audio/video clocks can have a very large common
+        // denominator. Round their sum/difference once to the nanosecond grid.
+        let denominator = i128::try_from(denominator).map_err(|_| {
+            SessionExportError::InvalidTimeline("mixed clock denominator overflow".into())
+        })?;
+        let scaled = numerator.checked_mul(1_000_000_000).ok_or_else(|| {
+            SessionExportError::InvalidTimeline("mixed clock numerator overflow".into())
+        })?;
+        let rounded = scaled
+            .checked_add(if scaled >= 0 {
+                denominator / 2
+            } else {
+                -denominator / 2
+            })
+            .ok_or_else(|| {
+                SessionExportError::InvalidTimeline("mixed clock rounding overflow".into())
+            })?
+            / denominator;
+        Self::from_nanoseconds(i64::try_from(rounded).map_err(|_| {
+            SessionExportError::InvalidTimeline("mixed clock nanoseconds overflow".into())
+        })?)
     }
 
     fn checked_mul_integer(self, value: i64) -> Result<Self, SessionExportError> {
@@ -262,7 +293,7 @@ impl TimelineTime {
         Self::from_wide_ratio(numerator, u128::from(self.denominator))
     }
 
-    fn checked_mul_u64(self, value: u64) -> Result<Self, SessionExportError> {
+    pub fn checked_mul_u64(self, value: u64) -> Result<Self, SessionExportError> {
         let numerator = i128::from(self.numerator)
             .checked_mul(i128::from(value))
             .ok_or_else(|| {
@@ -289,7 +320,7 @@ impl TimelineTime {
         Self::from_wide_ratio(i128::from(self.numerator), denominator)
     }
 
-    fn rounded_nanoseconds(self) -> Result<i64, SessionExportError> {
+    pub fn rounded_nanoseconds(self) -> Result<i64, SessionExportError> {
         let scaled = i128::from(self.numerator) * 1_000_000_000_i128;
         let denominator = i128::from(self.denominator);
         let rounded = if scaled >= 0 {
@@ -377,6 +408,8 @@ pub struct TimedAudioSegment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestAudioTimeline {
     pub sample_rate_hz: u32,
+    /// Measured host-clock seconds per PCM frame, when backed by capture evidence.
+    pub sample_tick: Option<TimelineTime>,
     pub channels: u32,
     pub sample_count: u64,
     /// Audio start on the common session clock.
@@ -957,8 +990,28 @@ fn validate_audio_timeline(
     }
 
     let one_nanosecond = TimelineTime::from_nanoseconds(1)?;
+    let sample_tick = audio
+        .sample_tick
+        .unwrap_or(TimelineTime::from_samples(1, audio.sample_rate_hz)?);
+    let measured_rate = sample_tick.denominator() as f64 / sample_tick.numerator() as f64;
+    if sample_tick <= TimelineTime::zero()
+        || (measured_rate / f64::from(audio.sample_rate_hz) - 1.0).abs() > 0.01
+    {
+        return Err(SessionExportError::InvalidTimeline(
+            "invalid measured audio sample clock".to_string(),
+        ));
+    }
     let mut previous_end_sample = 0_u64;
     let mut previous_end_time = None;
+    let sample_position = |sample| -> Result<TimelineTime, SessionExportError> {
+        let delta = sample_tick.checked_mul_u64(sample)?;
+        let delta = if audio.sample_tick.is_some() {
+            TimelineTime::from_nanoseconds(delta.rounded_nanoseconds()?)?
+        } else {
+            delta
+        };
+        audio.session_start_offset.checked_add(delta)
+    };
     for (position, segment) in audio.segments.iter().enumerate() {
         if usize::try_from(segment.index).ok() != Some(position) {
             return Err(SessionExportError::InvalidTimeline(format!(
@@ -979,18 +1032,8 @@ fn validate_audio_timeline(
                 "audio time coverage is not contiguous at segment {position}"
             )));
         }
-        let expected_start = audio
-            .session_start_offset
-            .checked_add(TimelineTime::from_samples(
-                segment.start_sample,
-                audio.sample_rate_hz,
-            )?)?;
-        let expected_end = audio
-            .session_start_offset
-            .checked_add(TimelineTime::from_samples(
-                segment.end_sample,
-                audio.sample_rate_hz,
-            )?)?;
+        let expected_start = sample_position(segment.start_sample)?;
+        let expected_end = sample_position(segment.end_sample)?;
         if timeline_abs_difference(segment.start_time, expected_start)? > one_nanosecond
             || timeline_abs_difference(segment.end_time, expected_end)? > one_nanosecond
         {
@@ -3723,17 +3766,25 @@ fn build_timeline_ffmpeg_args(
         video_tick.denominator()
     );
     let mut filter = format!(
-        "[0:v:0]setpts={video_clock}[l];\
-         [1:v:0]setpts={video_clock}[r];\
+        "[0:v:0]settb=AVTB,setpts={video_clock}[l];\
+         [1:v:0]settb=AVTB,setpts={video_clock}[r];\
          [l][r]hstack=inputs=2:shortest=1[v]"
     );
     if let Some(audio_start) = timing.audio_start_offset() {
+        let audio = timing
+            .manifest
+            .audio
+            .as_ref()
+            .expect("audio timing has a source");
+        let tempo = audio.sample_tick.map_or(1.0, |tick| {
+            tick.denominator() as f64 / tick.numerator() as f64 / f64::from(audio.sample_rate_hz)
+        });
         let audio_duration = timing
             .audio_end()
             .expect("audio timing has a manifest stop")
             .checked_sub(audio_start)?;
         filter.push_str(&format!(
-            ";[2:a:0]aresample=async=0:first_pts=0,\
+            ";[2:a:0]aresample=async=0:first_pts=0,atempo={tempo:.12},\
              atrim=duration={},\
              asetpts=PTS-STARTPTS+{}/TB[a]",
             audio_duration.ffmpeg_seconds()?,
@@ -3752,6 +3803,10 @@ fn build_timeline_ffmpeg_args(
         args.push("-an".to_string());
     }
     append_h264_video_output_args(&mut args);
+    args.extend([
+        "-r".to_string(),
+        format!("{}/{}", video_tick.denominator(), video_tick.numerator()),
+    ]);
     args.extend(["-vsync".to_string(), "0".to_string()]);
     if audio_list.is_some() {
         args.extend([
@@ -4466,6 +4521,7 @@ mod tests {
             fs::write(&path, b"audio").expect("audio segment");
             Some(ManifestAudioTimeline {
                 sample_rate_hz: 48_000,
+                sample_tick: None,
                 channels: 2,
                 sample_count: 96_000,
                 session_start_offset: timeline_time(1, 2),
@@ -4518,6 +4574,7 @@ mod tests {
             right_segments: vec![timed_video_segment(0, right, 0, 60, 0, 2)],
             audio: Some(ManifestAudioTimeline {
                 sample_rate_hz: 48_000,
+                sample_tick: None,
                 channels: 2,
                 sample_count: 96_000,
                 session_start_offset: timeline_time(1, 2),
@@ -4571,6 +4628,7 @@ mod tests {
             right_segments: vec![timed_video_segment(0, right, 0, 60, 0, 2)],
             audio: Some(ManifestAudioTimeline {
                 sample_rate_hz: 48_000,
+                sample_tick: None,
                 channels: 2,
                 sample_count: 96_000,
                 session_start_offset: timeline_time(1, 2),
@@ -4642,6 +4700,7 @@ mod tests {
             right_segments: vec![timed_video_segment(0, right, 0, 60, 0, 2)],
             audio: Some(ManifestAudioTimeline {
                 sample_rate_hz: 48_000,
+                sample_tick: None,
                 channels: 2,
                 sample_count: 96_000,
                 session_start_offset: timeline_time(1, 2),
@@ -5769,6 +5828,83 @@ done
     }
 
     #[test]
+    fn real_export_preserves_measured_video_and_audio_rates() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            eprintln!("skipping measured clock export because ffmpeg/ffprobe is unavailable");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let left = source.join("video/left_00000.mp4");
+        let right = source.join("video/right_00000.mp4");
+        let wav = source.join("audio/audio_00000.wav");
+        generate_h264_clip(&left, "red");
+        generate_h264_clip(&right, "blue");
+        generate_wav(&wav);
+        let tick = TimelineTime::from_nanoseconds(125_123_456).unwrap();
+        let video_segment = |path: PathBuf| TimedVideoSegment {
+            index: 0,
+            bytes: fs::metadata(&path).unwrap().len(),
+            sha256: sha256_file(&path).unwrap(),
+            path,
+            start_frame: 0,
+            end_frame: 6,
+            start_time: TimelineTime::zero(),
+            end_time: tick.checked_mul_u64(6).unwrap(),
+        };
+        let sample_tick = timeline_time(1, 44_110);
+        let audio_start = timeline_time(1, 10);
+        let delta_ns = sample_tick
+            .checked_mul_u64(26_460)
+            .unwrap()
+            .rounded_nanoseconds()
+            .unwrap();
+        let audio_end = audio_start
+            .checked_add(TimelineTime::from_nanoseconds(delta_ns).unwrap())
+            .unwrap();
+        let timeline = ManifestSessionTimeline {
+            source_manifest_sha256: "e".repeat(64),
+            clock: SessionTimelineClock::HostMonotonic,
+            video_tick: tick,
+            eye_width: 32,
+            eye_height: 32,
+            left_segments: vec![video_segment(left)],
+            right_segments: vec![video_segment(right)],
+            audio: Some(ManifestAudioTimeline {
+                sample_rate_hz: 44_100,
+                sample_tick: Some(sample_tick),
+                channels: 2,
+                sample_count: 26_460,
+                session_start_offset: audio_start,
+                session_stop_offset: audio_end,
+                segments: vec![TimedAudioSegment {
+                    index: 0,
+                    bytes: fs::metadata(&wav).unwrap().len(),
+                    sha256: sha256_file(&wav).unwrap(),
+                    path: wav,
+                    start_sample: 0,
+                    end_sample: 26_460,
+                    start_time: audio_start,
+                    end_time: audio_end,
+                }],
+            }),
+        };
+        let plan = SessionExportPlan::from_manifest_timeline(
+            &source,
+            directory.path().join("derived.mp4"),
+            false,
+            timeline,
+        )
+        .unwrap();
+        let receipt = FfmpegSessionExporter::new(SessionExportConfig::system_ffmpeg())
+            .export_plan(&plan)
+            .unwrap();
+        let verification = receipt.timeline_verification.unwrap();
+        assert_eq!(verification.paired_frames, 6);
+        assert!(verification.video_end_residual_ns.unsigned_abs() < 10_000);
+    }
+
+    #[test]
     fn exports_and_verifies_real_manifest_timeline_with_late_audio() {
         if !ffmpeg_available() || !ffprobe_available() {
             eprintln!("skipping manifest timeline export because ffmpeg/ffprobe is unavailable");
@@ -5803,6 +5939,7 @@ done
             right_segments: vec![video_segment(right)],
             audio: Some(ManifestAudioTimeline {
                 sample_rate_hz: 44_100,
+                sample_tick: None,
                 channels: 2,
                 sample_count: 26_460,
                 session_start_offset: timeline_time(1, 5),
@@ -5905,6 +6042,7 @@ done
             ],
             audio: Some(ManifestAudioTimeline {
                 sample_rate_hz: 48_000,
+                sample_tick: None,
                 channels: 2,
                 sample_count: 96_000,
                 session_start_offset: TimelineTime::zero(),
@@ -6341,6 +6479,7 @@ done
             right_segments: vec![video_segment(right)],
             audio: Some(ManifestAudioTimeline {
                 sample_rate_hz: 48_000,
+                sample_tick: None,
                 channels: 2,
                 sample_count: 96_000,
                 session_start_offset: TimelineTime::zero(),
@@ -6406,6 +6545,7 @@ done
             right_segments: vec![video_segment(right)],
             audio: Some(ManifestAudioTimeline {
                 sample_rate_hz: 48_000,
+                sample_tick: None,
                 channels: 2,
                 sample_count: 96_000,
                 session_start_offset: TimelineTime::zero(),
