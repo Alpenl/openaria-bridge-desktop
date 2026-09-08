@@ -195,6 +195,11 @@ export interface MediaLibraryEntryProjection {
   readonly cardPresence: MediaLibraryCardPresence;
 }
 
+export interface MediaExportOptions {
+  readonly videoCodec: "h264" | "hevc";
+  readonly audioDelayMs: number;
+}
+
 export type MediaLibraryEntryExportResult =
   | { readonly status: "cancelled" }
   | {

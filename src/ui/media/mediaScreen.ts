@@ -65,7 +65,19 @@ export function createMediaScreen(dispatch: MediaWorkspaceDispatch, suppliedRoot
       }
       if (action === "export-library-entry") {
         const entryKey = matched.dataset.entryKey;
-        if (nonEmpty(entryKey)) dispatch({ kind: "media/exportLibraryEntry", entryKey });
+        const row = matched.closest("[data-library-entry]");
+        const codec = row?.querySelector<HTMLSelectElement>("[data-export-codec]")?.value;
+        const delay = row?.querySelector<HTMLInputElement>("[data-export-delay]");
+        if (delay && !delay.reportValidity()) return;
+        if (nonEmpty(entryKey))
+          dispatch({
+            kind: "media/exportLibraryEntry",
+            entryKey,
+            options: {
+              videoCodec: codec === "hevc" ? "hevc" : "h264",
+              audioDelayMs: Number(delay?.value || 0),
+            },
+          });
         return;
       }
       if (action === "toggle-candidate") {
@@ -170,8 +182,24 @@ export function createMediaScreen(dispatch: MediaWorkspaceDispatch, suppliedRoot
   }
 
   function renderContent(snapshot: MediaWorkspaceSnapshot): void {
+    const settings = new Map(
+      Array.from(roots.content.querySelectorAll<HTMLElement>("[data-library-entry]")).map((row) => [
+        row.dataset.libraryEntry,
+        {
+          codec: row.querySelector<HTMLSelectElement>("[data-export-codec]")?.value,
+          delay: row.querySelector<HTMLInputElement>("[data-export-delay]")?.value,
+        },
+      ]),
+    );
     currentSnapshot = snapshot;
     roots.content.innerHTML = mediaContentHtml(snapshot);
+    for (const row of roots.content.querySelectorAll<HTMLElement>("[data-library-entry]")) {
+      const saved = settings.get(row.dataset.libraryEntry);
+      const codec = row.querySelector<HTMLSelectElement>("[data-export-codec]");
+      const delay = row.querySelector<HTMLInputElement>("[data-export-delay]");
+      if (codec && saved?.codec !== undefined) codec.value = saved.codec;
+      if (delay && saved?.delay !== undefined) delay.value = saved.delay;
+    }
     syncSelectAll(snapshot);
   }
 

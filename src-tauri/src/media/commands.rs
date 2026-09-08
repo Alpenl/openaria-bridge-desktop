@@ -11,7 +11,7 @@ use serde_json::Value;
 use tauri::AppHandle;
 use tauri_plugin_dialog::DialogExt;
 use ylx_transfer_adapters::session_export::{
-    FfmpegSessionExporter, SessionExportConfig, SessionExportReceipt, SessionExportRequest,
+    FfmpegSessionExporter, SessionExportReceipt, SessionExportRequest,
 };
 use ylx_transfer_core::ingest::SafeRelativePath;
 
@@ -71,7 +71,7 @@ fn decode_pipeline_command(command: &str) -> Result<PipelineCommand, RpcError> {
     }
 }
 
-async fn select_export_path(
+pub(crate) async fn select_export_path(
     app: &AppHandle,
     directory: PathBuf,
     default_file_name: String,
@@ -289,6 +289,7 @@ pub async fn media_start_pipeline_batch(
 pub async fn media_export_library_entry(
     app: AppHandle,
     entry_key: String,
+    options: Option<ylx_transfer_adapters::session_export::MediaExportOptions>,
 ) -> Result<MediaExportResult, RpcError> {
     validate_string("entryKey", &entry_key)?;
     let library = application(&app)?.read_library_projections().value;
@@ -320,8 +321,21 @@ pub async fn media_export_library_entry(
     let source_root = source_relative.join_to(&library_root);
     let request = SessionExportRequest::new(source_root, output_path).with_overwrite(true);
     let receipt = tauri::async_runtime::spawn_blocking(move || {
-        FfmpegSessionExporter::new(SessionExportConfig::system_ffmpeg())
-            .export_source_tree(&request)
+        let exporter =
+            FfmpegSessionExporter::new(crate::composition::ffmpeg_export_config().map_err(
+                ylx_transfer_adapters::session_export::SessionExportError::InvalidRequest,
+            )?);
+        let plan = crate::composition::device_session_export_plan(
+            request.source_root(),
+            request.output_path(),
+        )
+        .map_err(ylx_transfer_adapters::session_export::SessionExportError::InvalidRequest)?;
+        let plan = match plan {
+            Some(plan) => plan,
+            None => exporter.build_plan(&request)?,
+        }
+        .with_options(options.unwrap_or_default())?;
+        exporter.export_plan(&plan)
     })
     .await
     .map_err(|error| {

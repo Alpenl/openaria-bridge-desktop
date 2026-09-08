@@ -42,6 +42,28 @@ adapter compatibility, but it is not the current Windows/manual-connect route.
 
 ## Compatibility
 
+### Synchronized video export
+
+Expand a complete recording in the local library and use **另存成片** beside its
+MP4 file. The default **H.264 原码流**, with zero audio delay, makes a verified
+byte-for-byte copy. **H.265 归档** encodes video with HEVC Main (`hvc1`, CRF 22,
+medium preset), while retaining the original audio packets and every video
+frame timestamp. HEVC takes longer to encode; size savings depend on the scene.
+Save the result outside the managed library directory.
+
+**音频延后 (ms)** applies an explicit correction between -1000 and +1000 ms.
+Positive values delay sound. This setting belongs to the selected export and
+must come from a matching sound/light calibration; a phone comparison from one
+take does not establish a universal device correction. AAC packet copies can
+expose up to one final packet of padding without moving the recorded events.
+
+New downloads use rendering recipe 5: exact captured video timestamps, sample
+clock resampling without WSOLA transient shifts, H.264 CRF 20, and unspecified
+color primaries when the source does not identify them reliably. Historical
+library movies remain readable; downloading their verified source again
+rebuilds an earlier recipe. Existing compressed or clipped audio cannot be
+recovered by changing export settings.
+
 The public product name is **Open Aria Bridge**. The 0.5 codebase intentionally
 retains several `ylx-transfer` package, crate, executable, state-directory, and
 wire identifiers so existing installations and recorded data continue to

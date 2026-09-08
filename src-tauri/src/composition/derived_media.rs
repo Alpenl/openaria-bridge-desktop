@@ -193,7 +193,7 @@ impl DownloadCommitPort for DerivedMediaCommitter {
         // A process may have published the canonical bundle and stopped before
         // the coordinator's durable CommitComplete. Reuse the exact validated
         // bundle, but do not report success until source cleanup also finishes.
-        match canonical_assets_in_session_dir(&staging.published_dir(), &source) {
+        match canonical_assets_for_current_recipe(&staging.published_dir(), &source) {
             Ok(_) => {
                 control.begin_irreversible()?;
                 cleanup_previous_canonical_backup(
@@ -520,6 +520,21 @@ fn canonical_assets_in_session_dir(
 ) -> Result<CanonicalDerivedAssets, String> {
     canonical_publication_bundle_in_session_dir(session_dir, source)
         .map(|bundle| bundle.canonical_assets)
+}
+
+fn canonical_assets_for_current_recipe(
+    session_dir: &Path,
+    source: &ParsedSource,
+) -> Result<CanonicalDerivedAssets, String> {
+    let bundle = canonical_publication_bundle_in_session_dir(session_dir, source)?;
+    let receipt: DerivedMediaReceipt =
+        serde_json::from_slice(&bundle.receipt_bytes).map_err(|error| error.to_string())?;
+    if receipt.transformer.recipe_version != 5 {
+        return Err(
+            "existing media uses an earlier rendering recipe; rebuild from verified source".into(),
+        );
+    }
+    Ok(bundle.canonical_assets)
 }
 
 fn canonical_publication_bundle_in_session_dir(
@@ -908,6 +923,34 @@ fn parse_source_publication(payload: &[u8]) -> Result<ParsedSource, String> {
 
 pub(super) fn validate_source_publication_for_download(payload: &[u8]) -> Result<(), String> {
     parse_source_publication(payload).map(|_| ())
+}
+
+pub(crate) fn device_session_export_plan(
+    source_root: &Path,
+    output_path: &Path,
+) -> Result<Option<SessionExportPlan>, String> {
+    let path = source_root.join("manifest.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let metadata = plain_regular_file_metadata(&path)?;
+    if metadata.len() > 16 * 1024 * 1024 {
+        return Err("source manifest exceeds size limit".into());
+    }
+    let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+    let value = parse_strict_json(&bytes).map_err(|error| error.to_string())?;
+    if value["schema"] != SOURCE_SCHEMA {
+        return Ok(None);
+    }
+    validate_source_manifest_schema(&value)?;
+    let manifest: DeviceSessionManifest =
+        serde_json::from_value(value).map_err(|error| error.to_string())?;
+    manifest.validate()?;
+    verify_manifest_files_in_root(&manifest, source_root)?;
+    let timeline = manifest.export_timeline_with_frames(&sha256_bytes(&bytes), source_root)?;
+    SessionExportPlan::from_manifest_timeline(source_root, output_path, true, timeline)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 fn validate_gateway_verification(
@@ -1805,7 +1848,7 @@ fn build_receipt(
             name: "openaria-bridge-desktop".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             recipe_id: RECIPE_ID.to_string(),
-            recipe_version: 3,
+            recipe_version: 5,
         },
         output: ReceiptOutput {
             artifact_id: output_sha256.clone(),
@@ -1894,7 +1937,7 @@ fn validate_receipt(
         || receipt.input_artifacts != source.inputs
         || receipt.transformer.name != "openaria-bridge-desktop"
         || receipt.transformer.recipe_id != RECIPE_ID
-        || ![1, 2, 3].contains(&receipt.transformer.recipe_version)
+        || ![1, 2, 3, 4, 5].contains(&receipt.transformer.recipe_version)
         || !is_semver(&receipt.transformer.version)
     {
         return Err("derived media receipt source or transformer binding is invalid".to_string());
@@ -3448,6 +3491,34 @@ mod tests {
             .expect("write canonical receipt");
         canonical_assets_in_session_dir(&staging.published_dir(), source)
             .expect("installed canonical bundle is valid");
+    }
+
+    #[test]
+    fn earlier_canonical_recipe_remains_readable_but_requires_rebuild_on_download() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = compatibility_publication(&source_manifest());
+        let source = parse_source_publication(&payload).expect("source");
+        let staging = SessionStaging::for_publication(
+            dir.path(),
+            &source.manifest.device.device_id,
+            &source.manifest.session_id,
+            &payload,
+        )
+        .expect("staging");
+        install_test_canonical_bundle(&staging, &source);
+        canonical_assets_for_current_recipe(&staging.published_dir(), &source)
+            .expect("current recipe can be reused");
+        let path = staging
+            .published_dir()
+            .join("processed")
+            .join(RECEIPT_FILENAME);
+        let mut receipt: DerivedMediaReceipt =
+            serde_json::from_slice(&fs::read(&path).expect("receipt bytes")).expect("receipt");
+        receipt.transformer.recipe_version = 3;
+        write_receipt_atomically(&path, &receipt).expect("earlier recipe");
+        canonical_assets_in_session_dir(&staging.published_dir(), &source)
+            .expect("historical library media remains readable");
+        assert!(canonical_assets_for_current_recipe(&staging.published_dir(), &source).is_err());
     }
 
     fn cleanup_retry_request(

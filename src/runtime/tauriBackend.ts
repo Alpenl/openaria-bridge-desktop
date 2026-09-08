@@ -221,6 +221,8 @@ export function createTauriBackend(): TransferBackend {
           .then((raw) => mapWireValue(raw, (value) => libraryMutation(value, keys))),
       ),
     revealLibraryFile: (key, fileId) => call("reveal_library_file", () => api.revealLibraryFile(key, fileId)),
+    exportLibraryVideo: (key, fileId, options) =>
+      call("export_library_video", () => api.exportLibraryVideo(key, fileId, options)),
 
     downloadSession: (deviceId, sessionId) =>
       call("download_session", () => api.downloadSession(deviceId, sessionId)).then(asDownloadJobId),

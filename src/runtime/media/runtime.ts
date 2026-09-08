@@ -15,6 +15,7 @@ import type {
   ImportJob,
   MediaJobCommand,
   MediaLibraryEntryExportResult,
+  MediaExportOptions,
   MediaTrustedProducerRevocation,
   MediaScanSnapshot,
   PipelineCommand,
@@ -68,7 +69,10 @@ export interface MediaRuntime {
   releaseMediaHandles(mediaId: MediaId): Promise<MediaOperationResult<Revisioned<MediaScanSnapshot>>>;
   ejectMedia(mediaId: MediaId): Promise<MediaOperationResult<Revisioned<MediaScanSnapshot>>>;
   revokeTrustedProducer(keyFingerprint: string): Promise<MediaOperationResult<MediaTrustedProducerRevocation>>;
-  exportLibraryEntry(entryKey: string): Promise<MediaOperationResult<MediaLibraryEntryExportResult>>;
+  exportLibraryEntry(
+    entryKey: string,
+    options?: MediaExportOptions,
+  ): Promise<MediaOperationResult<MediaLibraryEntryExportResult>>;
 }
 
 export function createMediaRuntime(options: MediaRuntimeOptions): MediaRuntime {
@@ -266,11 +270,11 @@ export function createMediaRuntime(options: MediaRuntimeOptions): MediaRuntime {
         failed: operationFailure,
       });
     },
-    exportLibraryEntry(entryKey) {
+    exportLibraryEntry(entryKey, exportOptions) {
       return operations.run({
         key: `media:library:export:${entryKey}`,
         scope: `media:library:export:${entryKey}`,
-        run: () => options.backend.exportLibraryEntry(entryKey),
+        run: () => options.backend.exportLibraryEntry(entryKey, exportOptions),
         failed: operationFailure,
       });
     },

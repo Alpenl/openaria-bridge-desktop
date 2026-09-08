@@ -1170,6 +1170,37 @@ button {
 .file-row .btn {
   flex: none;
 }
+.export-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.export-controls label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.export-controls select,
+.export-controls input {
+  font: inherit;
+  color: var(--text-primary);
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  padding: 5px;
+}
+@media (max-width: 1050px) {
+  .file-row:has(.export-controls) {
+    flex-wrap: wrap;
+  }
+  .file-row:has(.export-controls) .file-path {
+    flex-basis: 75%;
+  }
+}
 
 /* ---------- transfer tray ---------- */
 .tray {

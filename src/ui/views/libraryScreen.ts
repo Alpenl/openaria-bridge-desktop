@@ -27,6 +27,40 @@ export function createLibraryScreen(dispatch: Dispatch): LibraryScreen {
   const bound = bindings();
   const content = el("content");
   const topbar = el("topbar");
+  const exportSettings = new Map<string, { codec: string; delay: string }>();
+
+  bound.add(
+    delegate(content, "input", "[data-export-codec], [data-export-delay]", (matched) => {
+      const controls = matched.closest(".export-controls");
+      const button = controls?.querySelector<HTMLElement>('[data-action="export-video"]');
+      if (!button) return;
+      exportSettings.set(`${button.dataset.key}|${button.dataset.fileId}`, {
+        codec: controls?.querySelector<HTMLSelectElement>("[data-export-codec]")?.value ?? "h264",
+        delay: controls?.querySelector<HTMLInputElement>("[data-export-delay]")?.value ?? "0",
+      });
+    }),
+  );
+
+  bound.add(
+    delegate(content, "click", '[data-action="export-video"]', (matched, event) => {
+      event.stopPropagation();
+      const key = matched.dataset.key;
+      const fileId = matched.dataset.fileId;
+      const controls = matched.closest(".export-controls");
+      const codec = controls?.querySelector<HTMLSelectElement>("[data-export-codec]")?.value;
+      const delay = controls?.querySelector<HTMLInputElement>("[data-export-delay]");
+      if (key === undefined || fileId === undefined || (delay && !delay.reportValidity())) return;
+      dispatch({
+        kind: "entry/exportVideo",
+        key: asLibraryKey(key),
+        fileId: asFileId(fileId),
+        options: {
+          videoCodec: codec === "hevc" ? "hevc" : "h264",
+          audioDelayMs: Number(delay?.value || 0),
+        },
+      });
+    }),
+  );
 
   bound.add(delegate(el("libraryNavItem"), "click", "#libraryNavItem", () => dispatch({ kind: "library/open" })));
 
@@ -170,6 +204,16 @@ export function createLibraryScreen(dispatch: Dispatch): LibraryScreen {
           });
         })
         .join("");
+      for (const button of container.querySelectorAll<HTMLElement>('[data-action="export-video"]')) {
+        const settings = exportSettings.get(`${button.dataset.key}|${button.dataset.fileId}`);
+        const controls = button.closest(".export-controls");
+        const codec = controls?.querySelector<HTMLSelectElement>("[data-export-codec]");
+        const delay = controls?.querySelector<HTMLInputElement>("[data-export-delay]");
+        if (settings && codec && delay) {
+          codec.value = settings.codec;
+          delay.value = settings.delay;
+        }
+      }
     }
 
     const selectAllBox = document.getElementById("selectAllBox") as HTMLInputElement | null;

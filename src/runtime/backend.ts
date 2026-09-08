@@ -30,6 +30,7 @@ import type {
   Transfer,
   TransferJobEvent,
 } from "../types";
+import type { MediaExportOptions } from "./media/types";
 import type {
   DeviceId,
   DownloadJobId,
@@ -154,6 +155,7 @@ export interface TransferBackend {
 
   removeLibraryEntries(keys: readonly LibraryKey[]): Promise<Revisioned<LibraryMutation>>;
   revealLibraryFile(key: LibraryKey, fileId: FileId): Promise<void>;
+  exportLibraryVideo(key: LibraryKey, fileId: FileId, options: MediaExportOptions): Promise<string | null>;
 
   downloadSession(deviceId: DeviceId, sessionId: SessionId): Promise<DownloadJobId>;
   downloadSessions(

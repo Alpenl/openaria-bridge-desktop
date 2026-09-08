@@ -5,6 +5,7 @@
 // imports from `@tauri-apps/api`.
 
 import { invoke } from "@tauri-apps/api/core";
+import type { MediaExportOptions } from "./media/types";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Device,
@@ -268,6 +269,8 @@ export const api = {
   dismissUpload: (jobId: string) => invokeValueDecoded("dismiss_upload_transfer", decodeVoid, { jobId }),
   revealLibraryFile: (key: string, fileId: string) =>
     invokeValueDecoded("reveal_library_file", decodeVoid, { key, fileId }),
+  exportLibraryVideo: (key: string, fileId: string, options: MediaExportOptions) =>
+    invokeValueDecoded("export_library_video", decodeNullableString, { key, fileId, options }),
 
   getStorageConfig: () => invokeRevisionedDecoded("get_storage_config", decodeStorage).then((raw) => raw.value),
   selectDownloadRoot: () => invokeValueDecoded("select_download_root", decodeNullableString),

@@ -34,6 +34,23 @@ const FFPROBE_STDOUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_TIMELINE_DENOMINATOR: u64 = 1_000_000_000;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportVideoCodec {
+    #[default]
+    H264,
+    Hevc,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MediaExportOptions {
+    #[serde(default)]
+    pub video_codec: ExportVideoCodec,
+    #[serde(default)]
+    pub audio_delay_ms: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionExportConfig {
     ffmpeg_path: PathBuf,
@@ -463,6 +480,7 @@ pub struct SessionExportPlan {
     video: SessionExportVideoInput,
     audio_segments: Vec<PathBuf>,
     timing: Option<SessionExportTimingPlan>,
+    options: MediaExportOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -567,6 +585,7 @@ impl SessionExportPlan {
             video,
             audio_segments,
             timing: None,
+            options: MediaExportOptions::default(),
         })
     }
 
@@ -611,7 +630,45 @@ impl SessionExportPlan {
             video,
             audio_segments,
             timing: Some(timing),
+            options: MediaExportOptions::default(),
         })
+    }
+
+    pub fn with_options(mut self, options: MediaExportOptions) -> Result<Self, SessionExportError> {
+        if !(-1000..=1000).contains(&options.audio_delay_ms) {
+            return Err(SessionExportError::InvalidRequest(
+                "audio delay must be within +/-1000 ms".into(),
+            ));
+        }
+        if options.audio_delay_ms != self.options.audio_delay_ms {
+            let timing = self.timing.as_mut().ok_or_else(|| {
+                SessionExportError::InvalidRequest(
+                    "audio calibration requires a verified manifest timeline".into(),
+                )
+            })?;
+            let start = timing.audio_start.ok_or_else(|| {
+                SessionExportError::InvalidRequest(
+                    "audio calibration requires recorded audio".into(),
+                )
+            })?;
+            let delta = TimelineTime::new(
+                i64::from(options.audio_delay_ms) - i64::from(self.options.audio_delay_ms),
+                1000,
+            )?;
+            let shifted = start.checked_add(delta)?;
+            if shifted < TimelineTime::zero() {
+                return Err(SessionExportError::InvalidRequest(
+                    "audio calibration precedes the session origin".into(),
+                ));
+            }
+            timing.audio_start = Some(shifted);
+            timing.audio_end = timing
+                .audio_end
+                .map(|end| end.checked_add(delta))
+                .transpose()?;
+        }
+        self.options = options;
+        Ok(self)
     }
 
     #[must_use]
@@ -1703,10 +1760,15 @@ pub fn verify_session_export_output(
     }
 
     let video = &probe.video_streams[0];
-    if video.codec_name != "h264" {
-        return Err(SessionExportError::OutputVerificationFailed(
-            "derived output video stream is not a non-empty H.264 stream".to_string(),
-        ));
+    let expected_codec = if plan.options.video_codec == ExportVideoCodec::Hevc {
+        "hevc"
+    } else {
+        "h264"
+    };
+    if video.codec_name != expected_codec {
+        return Err(SessionExportError::OutputVerificationFailed(format!(
+            "derived output video stream is not the requested {expected_codec} stream"
+        )));
     }
     let video_width = video.width.filter(|width| *width > 0).ok_or_else(|| {
         SessionExportError::OutputVerificationFailed(
@@ -2343,6 +2405,7 @@ impl FfmpegSessionExporter {
             video,
             audio_segments,
             timing: None,
+            options: MediaExportOptions::default(),
         })
     }
 
@@ -2352,6 +2415,185 @@ impl FfmpegSessionExporter {
     ) -> Result<SessionExportReceipt, SessionExportError> {
         let plan = self.build_plan(request)?;
         self.export_plan(&plan)
+    }
+
+    /// Export an already synchronized library movie. Default H.264 is copied;
+    /// calibrated H.264 is remuxed. AAC
+    /// packets retain their content and only receive the explicit time shift.
+    pub fn export_playable_copy(
+        &self,
+        source: &Path,
+        output: &Path,
+        options: &MediaExportOptions,
+    ) -> Result<(), SessionExportError> {
+        if !(-1000..=1000).contains(&options.audio_delay_ms) {
+            return Err(SessionExportError::InvalidRequest(
+                "audio delay must be within +/-1000 ms".into(),
+            ));
+        }
+        let output = validate_output_path(output, true)?;
+        if fs::canonicalize(source).ok() == fs::canonicalize(&output).ok() && output.exists() {
+            return Err(SessionExportError::InvalidRequest(
+                "export cannot replace its source".into(),
+            ));
+        }
+        let original_hash = sha256_file(source)?;
+        let original = self.probe_output(source)?;
+        if original.video_streams.len() != 1 || original.audio_streams.len() > 1 {
+            return Err(SessionExportError::InvalidRequest(
+                "export requires one video and at most one audio stream".into(),
+            ));
+        }
+        if options.audio_delay_ms != 0 && original.audio_streams.is_empty() {
+            return Err(SessionExportError::InvalidRequest(
+                "audio calibration requires recorded audio".into(),
+            ));
+        }
+        let staging = TempExportDir::create_for(&output)?;
+        let staged = staging.path().join("output.mp4");
+        let video = &original.video_streams[0];
+        if *options == MediaExportOptions::default() && video.codec_name == "h264" {
+            fs::copy(source, &staged).map_err(|error| SessionExportError::Io {
+                context: "copy verified library movie",
+                path: staged.clone(),
+                source: error,
+            })?;
+            if sha256_file(&staged)? != original_hash || sha256_file(source)? != original_hash {
+                return Err(SessionExportError::OutputVerificationFailed(
+                    "source changed during copy".into(),
+                ));
+            }
+            return replace_with_staged_output(&staged, &output);
+        }
+        let mut args = vec![
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-nostats".into(),
+            "-nostdin".into(),
+            "-y".into(),
+            "-copyts".into(),
+            "-i".into(),
+            source.to_string_lossy().into_owned(),
+        ];
+        if !original.audio_streams.is_empty() {
+            args.extend([
+                "-itsoffset".into(),
+                format!("{:.3}", f64::from(options.audio_delay_ms) / 1000.0),
+                "-i".into(),
+                source.to_string_lossy().into_owned(),
+            ]);
+        }
+        args.extend(["-map".into(), "0:v:0".into()]);
+        if !original.audio_streams.is_empty() {
+            args.extend(["-map".into(), "1:a:0".into(), "-c:a".into(), "copy".into()]);
+        }
+        if options.video_codec == ExportVideoCodec::H264 {
+            if video.codec_name != "h264" {
+                return Err(SessionExportError::InvalidRequest(
+                    "H.264 copy requires an H.264 library movie".into(),
+                ));
+            }
+            args.extend(["-c:v".into(), "copy".into()]);
+        } else {
+            append_video_output_args(&mut args, ExportVideoCodec::Hevc);
+            let duration = video.end.checked_sub(video.start)?;
+            let rate = video.frame_count.unwrap_or(0) as f64 * duration.denominator() as f64
+                / duration.numerator() as f64;
+            let fps = TimelineTime::new((rate * 1_000_000.0).round() as i64, 1_000_000)?;
+            args.extend([
+                "-vsync".into(),
+                "0".into(),
+                "-enc_time_base:v".into(),
+                "1:1000000".into(),
+                "-bf".into(),
+                "0".into(),
+                "-r".into(),
+                fps.ffmpeg_seconds()?,
+                "-x265-params".into(),
+                format!(
+                    "fps={}/{}:pools=4:frame-threads=2:log-level=error",
+                    fps.numerator(),
+                    fps.denominator()
+                ),
+            ]);
+        }
+        args.extend(["-video_track_timescale".into(), "1000000".into(), "-avoid_negative_ts".into(), "disabled".into(),
+            "-metadata".into(), format!("comment={}", serde_json::json!({"schema":"openaria.playable-export.v1", "source_sha256":original_hash, "options":options})),
+            "-movflags".into(), "+faststart".into(), staged.to_string_lossy().into_owned()]);
+        let mut command = Command::new(self.config.ffmpeg_path());
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let result = run_bounded_command(
+            &mut command,
+            "ffmpeg",
+            self.config.ffmpeg_path(),
+            0,
+            PROCESS_STDERR_LIMIT_BYTES,
+            &|| false,
+        )?;
+        if !result.status.success() {
+            return Err(SessionExportError::FfmpegFailed {
+                status: result.status.to_string(),
+                stderr: stderr_preview(&result.stderr),
+            });
+        }
+        let exported = self.probe_output(&staged)?;
+        let expected_codec = if options.video_codec == ExportVideoCodec::Hevc {
+            "hevc"
+        } else {
+            "h264"
+        };
+        if exported.video_streams.len() != 1
+            || exported.audio_streams.len() != original.audio_streams.len()
+            || exported.video_streams[0].codec_name != expected_codec
+            || exported.video_streams[0].width != video.width
+            || exported.video_streams[0].height != video.height
+            || original
+                .video_frame_timeline
+                .as_ref()
+                .map(|v| (&v.timestamp_sha256, v.frame_count))
+                != exported
+                    .video_frame_timeline
+                    .as_ref()
+                    .map(|v| (&v.timestamp_sha256, v.frame_count))
+            || timeline_residual_ns(exported.video_streams[0].start, video.start)?.unsigned_abs()
+                > 1_000_000
+        {
+            return Err(SessionExportError::OutputVerificationFailed(
+                "export changed the video frame clock or stream layout".into(),
+            ));
+        }
+        if let Some(audio) = original.audio_streams.first() {
+            let delta = TimelineTime::new(i64::from(options.audio_delay_ms), 1000)?;
+            let expected_start = audio.start.checked_add(delta)?.max(TimelineTime::zero());
+            let actual = &exported.audio_streams[0];
+            // Remuxing retains complete AAC packets. The last packet may expose
+            // padding formerly shortened by the source container duration.
+            let tail_tolerance = 1_000_000
+                + 1_024_000_000_000_u64 / u64::from(audio.sample_rate_hz.unwrap_or(48_000));
+            if actual.codec_name != audio.codec_name
+                || actual.sample_rate_hz != audio.sample_rate_hz
+                || actual.channels != audio.channels
+                || timeline_residual_ns(actual.start, expected_start)?.unsigned_abs() > 1_000_000
+                || timeline_residual_ns(actual.end, audio.end.checked_add(delta)?)?.unsigned_abs()
+                    > tail_tolerance
+            {
+                return Err(SessionExportError::OutputVerificationFailed(
+                    format!("export changed audio beyond the requested calibration: actual {}..{}, expected {}..{}",
+                        actual.start.ffmpeg_seconds()?, actual.end.ffmpeg_seconds()?, expected_start.ffmpeg_seconds()?, audio.end.checked_add(delta)?.ffmpeg_seconds()?),
+                ));
+            }
+        }
+        if sha256_file(source)? != original_hash {
+            return Err(SessionExportError::OutputVerificationFailed(
+                "source changed during export".into(),
+            ));
+        }
+        replace_with_staged_output(&staged, &output)
     }
 
     pub fn probe_output(&self, path: &Path) -> Result<OutputMediaProbe, SessionExportError> {
@@ -3766,7 +4008,7 @@ fn build_ffmpeg_args(
             } else {
                 args.push("-an".to_string());
             }
-            append_h264_video_output_args(&mut args);
+            append_video_output_args(&mut args, plan.options.video_codec);
         }
         SessionExportVideoInput::SideBySide {
             segments,
@@ -3783,10 +4025,10 @@ fn build_ffmpeg_args(
             } else {
                 args.push("-an".to_string());
             }
-            if *copy_video {
+            if *copy_video && plan.options.video_codec == ExportVideoCodec::H264 {
                 args.extend(["-c:v".to_string(), "copy".to_string()]);
             } else {
-                append_h264_video_output_args(&mut args);
+                append_video_output_args(&mut args, plan.options.video_codec);
             }
         }
     }
@@ -3868,15 +4110,18 @@ fn build_timeline_ffmpeg_args(
             .audio
             .as_ref()
             .expect("audio timing has a source");
-        let tempo = audio.sample_tick.map_or(1.0, |tick| {
-            tick.denominator() as f64 / tick.numerator() as f64 / f64::from(audio.sample_rate_hz)
-        });
+        let actual_rate = audio
+            .sample_tick
+            .map_or(f64::from(audio.sample_rate_hz), |tick| {
+                tick.denominator() as f64 / tick.numerator() as f64
+            });
+        let resampling = sample_clock_filter(audio.sample_rate_hz, actual_rate)?;
         let audio_duration = timing
             .audio_end()
             .expect("audio timing has a manifest stop")
             .checked_sub(audio_start)?;
         filter.push_str(&format!(
-            ";[2:a:0]aresample=async=0:first_pts=0,atempo={tempo:.12},\
+            ";[2:a:0]{resampling},\
              atrim=duration={},\
              asetpts=PTS-STARTPTS+{}/TB[a]",
             audio_duration.ffmpeg_seconds()?,
@@ -3903,7 +4148,7 @@ fn build_timeline_ffmpeg_args(
     } else {
         args.push("-an".to_string());
     }
-    append_h264_video_output_args(&mut args);
+    append_video_output_args(&mut args, plan.options.video_codec);
     if frame_pts.is_empty() {
         args.extend([
             "-r".to_string(),
@@ -3922,11 +4167,21 @@ fn build_timeline_ffmpeg_args(
             "1000000".into(),
             "-bf".into(),
             "0".into(),
-            "-x264-params".into(),
+            if plan.options.video_codec == ExportVideoCodec::Hevc {
+                "-x265-params"
+            } else {
+                "-x264-params"
+            }
+            .into(),
             format!(
-                "fps={}/{}",
+                "fps={}/{}{}",
                 video_tick.denominator(),
-                video_tick.numerator()
+                video_tick.numerator(),
+                if plan.options.video_codec == ExportVideoCodec::Hevc {
+                    ":pools=4:frame-threads=2:log-level=error"
+                } else {
+                    ""
+                }
             ),
             "-bsf:v".into(),
             format!(
@@ -3954,6 +4209,33 @@ fn build_timeline_ffmpeg_args(
     Ok(args)
 }
 
+fn sample_clock_filter(rate: u32, actual_rate: f64) -> Result<String, SessionExportError> {
+    if rate == 0 || !actual_rate.is_finite() || actual_rate <= 0.0 {
+        return Err(SessionExportError::InvalidRequest(
+            "invalid audio sample clock rate".into(),
+        ));
+    }
+    let mut filter = "aresample=async=0:first_pts=0".to_string();
+    if (actual_rate / f64::from(rate) - 1.0).abs() <= 1e-9 {
+        return Ok(filter);
+    }
+    let scale = (f64::from(i32::MAX) / actual_rate.max(f64::from(rate)))
+        .floor()
+        .min(1000.0);
+    if scale < 1.0 {
+        return Err(SessionExportError::InvalidRequest(
+            "audio sample clock rate exceeds FFmpeg limits".into(),
+        ));
+    }
+    // Virtual rates retain millihertz precision without WSOLA moving transients.
+    filter.push_str(&format!(
+        ",asetrate={},aresample={},asetrate={rate}",
+        (actual_rate * scale).round() as u64,
+        u64::from(rate) * scale as u64,
+    ));
+    Ok(filter)
+}
+
 fn append_concat_input(args: &mut Vec<String>, list_path: &Path) {
     args.extend([
         "-f".to_string(),
@@ -3978,17 +4260,34 @@ fn frame_pts_expression(pts: &[u64], start: usize) -> String {
     )
 }
 
-fn append_h264_video_output_args(args: &mut Vec<String>) {
+fn append_video_output_args(args: &mut Vec<String>, codec: ExportVideoCodec) {
+    let hevc = codec == ExportVideoCodec::Hevc;
     args.extend([
         "-c:v".to_string(),
-        "libx264".to_string(),
+        if hevc { "libx265" } else { "libx264" }.to_string(),
         "-preset".to_string(),
-        "veryfast".to_string(),
+        if hevc { "medium" } else { "veryfast" }.to_string(),
         "-crf".to_string(),
-        "18".to_string(),
+        if hevc { "22" } else { "20" }.to_string(),
         "-pix_fmt".to_string(),
         "yuv420p".to_string(),
+        "-color_primaries".into(),
+        "2".into(),
+        "-color_trc".into(),
+        "2".into(),
+        "-colorspace".into(),
+        "2".into(),
+        "-color_range".into(),
+        "tv".into(),
     ]);
+    if hevc {
+        args.extend([
+            "-tag:v".into(),
+            "hvc1".into(),
+            "-x265-params".into(),
+            "pools=4:frame-threads=2:log-level=error".into(),
+        ]);
+    }
 }
 
 fn write_concat_list(
@@ -4189,6 +4488,62 @@ impl Drop for TempExportDir {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sample_clock_resampling_preserves_transient_positions() {
+        if !ffmpeg_available() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let rate = 48_000_u32;
+        let indices = [24_624, 150_096, 506_064, 930_624, 1_513_392];
+        let mut bytes = vec![0_u8; 34 * rate as usize * 4];
+        for index in indices {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&0.9_f32.to_le_bytes());
+        }
+        let path = directory.path().join("impulses.f32");
+        std::fs::write(&path, bytes).unwrap();
+        for actual_rate in [48_004.615_414, 47_995.384_586] {
+            let output = std::process::Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "f32le", "-ar", "48000", "-ac", "1", "-i",
+                ])
+                .arg(&path)
+                .args([
+                    "-af",
+                    &sample_clock_filter(rate, actual_rate).unwrap(),
+                    "-f",
+                    "f32le",
+                    "-",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let samples: Vec<f32> = output
+                .stdout
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            for index in indices {
+                let expected = (index as f64 * f64::from(rate) / actual_rate).round() as usize;
+                let lo = expected - 2400;
+                let peak = samples[lo..expected + 2400]
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+                    .unwrap();
+                assert!((lo + peak.0).abs_diff(expected) <= 1);
+                assert!(peak.1.abs() > 0.3);
+            }
+        }
+        assert!(sample_clock_filter(48_000, f64::NAN).is_err());
+        assert!(sample_clock_filter(48_000, f64::INFINITY).is_err());
+        assert!(sample_clock_filter(48_000, -1.0).is_err());
+    }
+
     use std::path::Path;
     use std::process::{Command, Stdio};
 
@@ -5674,15 +6029,18 @@ done
             Ok(_) => panic!("default periodic stats must exceed the bounded stderr budget"),
             Err(error) => error,
         };
-        assert!(matches!(
-            default_error,
-            SessionExportError::ProcessOutputLimit {
-                process: "ffmpeg",
-                stream: "stderr",
-                limit_bytes: PROCESS_STDERR_LIMIT_BYTES,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                &default_error,
+                SessionExportError::ProcessOutputLimit {
+                    process: "ffmpeg",
+                    stream: "stderr",
+                    limit_bytes: PROCESS_STDERR_LIMIT_BYTES,
+                    ..
+                }
+            ),
+            "unexpected output-limit result: {default_error:?}"
+        );
 
         write_publication(directory.path(), "h264", &separate_eyes_h264());
         let legacy_plan = FfmpegSessionExporter::new(SessionExportConfig::system_ffmpeg())
@@ -6056,7 +6414,12 @@ done
         if !ffmpeg_available() || !ffprobe_available() {
             return;
         }
-        for start in [0_u64, 200_123] {
+        for (start, codec) in [
+            (0_u64, ExportVideoCodec::H264),
+            (200_123, ExportVideoCodec::H264),
+            (0, ExportVideoCodec::Hevc),
+            (200_123, ExportVideoCodec::Hevc),
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let source = directory.path().join("source");
             let left = source.join("video/left.mp4");
@@ -6096,6 +6459,11 @@ done
             };
             let output = directory.path().join("vfr.mp4");
             let plan = SessionExportPlan::from_manifest_timeline(&source, &output, false, timeline)
+                .unwrap()
+                .with_options(MediaExportOptions {
+                    video_codec: codec,
+                    audio_delay_ms: 0,
+                })
                 .unwrap();
             let exporter = FfmpegSessionExporter::new(SessionExportConfig::system_ffmpeg());
             let receipt = exporter.export_plan(&plan).unwrap();
@@ -6201,6 +6569,22 @@ done
         let audio = media.audio.expect("output audio properties");
         assert_eq!(audio.codec, "aac");
         assert_eq!(audio.sample_rate_hz, 44_100);
+        let exporter = FfmpegSessionExporter::new(SessionExportConfig::system_ffmpeg());
+        for codec in [ExportVideoCodec::H264, ExportVideoCodec::Hevc] {
+            for delay in [-30, 0, 30] {
+                let copy = directory.path().join(format!("copy-{codec:?}-{delay}.mp4"));
+                exporter
+                    .export_playable_copy(
+                        &output,
+                        &copy,
+                        &MediaExportOptions {
+                            video_codec: codec,
+                            audio_delay_ms: delay,
+                        },
+                    )
+                    .expect("verified copy preserves the video clock and shifts only audio");
+            }
+        }
         assert!(output.is_file());
         assert_eq!(staging_dirs(directory.path()), Vec::<String>::new());
     }

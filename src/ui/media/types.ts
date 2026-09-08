@@ -3,6 +3,7 @@ import type {
   DerivationProgress,
   ImportProgress,
   MediaError,
+  MediaExportOptions,
   MediaLibraryEntryProjection,
   MediaJobCommand as RuntimeMediaJobCommand,
   RequiredAction,
@@ -328,7 +329,7 @@ export type MediaWorkspaceAction =
   | { readonly kind: "media/scanAll" }
   | { readonly kind: "media/retryResource"; readonly resource: MediaResourceName }
   | { readonly kind: "media/revokeTrustedProducer"; readonly keyFingerprint: string }
-  | { readonly kind: "media/exportLibraryEntry"; readonly entryKey: string }
+  | { readonly kind: "media/exportLibraryEntry"; readonly entryKey: string; readonly options?: MediaExportOptions }
   | { readonly kind: "media/rescanSource"; readonly sourceId: string }
   | { readonly kind: "media/releaseSource"; readonly sourceId: string }
   | { readonly kind: "media/ejectSource"; readonly sourceId: string }

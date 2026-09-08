@@ -270,9 +270,12 @@ export function createTauriMediaBackend(): MediaBackend {
           (reason: unknown) => rejectInvocation(MEDIA_TAURI_COMMANDS.revokeTrustedProducer, reason),
         ),
       ),
-    exportLibraryEntry: (entryKey) =>
+    exportLibraryEntry: (entryKey, options) =>
       call(MEDIA_TAURI_COMMANDS.exportLibraryEntry, () =>
-        invoke<unknown>(MEDIA_TAURI_COMMANDS.exportLibraryEntry, { entryKey }).then(
+        invoke<unknown>(
+          MEDIA_TAURI_COMMANDS.exportLibraryEntry,
+          options === undefined ? { entryKey } : { entryKey, options },
+        ).then(
           (raw) => decodeMediaLibraryEntryExportResult(raw, `${MEDIA_TAURI_COMMANDS.exportLibraryEntry}.response`),
           (reason: unknown) => rejectInvocation(MEDIA_TAURI_COMMANDS.exportLibraryEntry, reason),
         ),
