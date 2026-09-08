@@ -63,11 +63,15 @@ function select<T extends ListEntity>(
     return filter.status === "done" ? done : !done;
   });
 
+  const sortKeys = new Map(
+    visible.map((item) => {
+      const parsed = Date.parse(item.dateLabel);
+      return [item, Number.isNaN(parsed) ? accessors.key(item) : String(parsed).padStart(16, "0")] as const;
+    }),
+  );
   visible.sort((a, b) => {
-    const parsedA = Date.parse(a.dateLabel);
-    const parsedB = Date.parse(b.dateLabel);
-    const ka = Number.isNaN(parsedA) ? accessors.key(a) : String(parsedA).padStart(16, "0");
-    const kb = Number.isNaN(parsedB) ? accessors.key(b) : String(parsedB).padStart(16, "0");
+    const ka = sortKeys.get(a)!;
+    const kb = sortKeys.get(b)!;
     return filter.sortDesc ? kb.localeCompare(ka) : ka.localeCompare(kb);
   });
 

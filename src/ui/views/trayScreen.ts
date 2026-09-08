@@ -15,6 +15,34 @@ export interface TrayScreen {
   dispose(): void;
 }
 
+function updateRow(current: Element, incoming: Element): void {
+  for (const attribute of Array.from(current.attributes)) {
+    if (!incoming.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
+  }
+  for (const attribute of Array.from(incoming.attributes)) {
+    if (current.getAttribute(attribute.name) !== attribute.value) {
+      current.setAttribute(attribute.name, attribute.value);
+    }
+  }
+  // Stats and meters change on every tick; unchanged control groups stay
+  // attached, including the currently focused pause/cancel button.
+  let cursor = current.firstElementChild;
+  for (const child of Array.from(incoming.children)) {
+    if (cursor === null) {
+      current.append(child);
+    } else {
+      const next = cursor.nextElementSibling;
+      if (cursor.outerHTML !== child.outerHTML) cursor.replaceWith(child);
+      cursor = next;
+    }
+  }
+  while (cursor !== null) {
+    const next = cursor.nextElementSibling;
+    cursor.remove();
+    cursor = next;
+  }
+}
+
 export function createTrayScreen(dispatch: Dispatch): TrayScreen {
   const bound = bindings();
   const tray = el("tray");
@@ -24,6 +52,7 @@ export function createTrayScreen(dispatch: Dispatch): TrayScreen {
 
   /** The selection currently on screen — the authority on what a click means. */
   let painted: TraySelection = selectTray([], [], false);
+  const rows = new Map<string, { node: Element; html: string }>();
 
   bound.add(delegate(toggle, "click", "#trayToggleBtn", () => dispatch({ kind: "tray/toggle" })));
 
@@ -57,45 +86,57 @@ export function createTrayScreen(dispatch: Dispatch): TrayScreen {
       tray.dataset.open = "false";
       count.textContent = "";
       body.replaceChildren();
+      rows.clear();
       return;
     }
     tray.dataset.open = "true";
     count.textContent = selection.countText;
 
-    // Keep the delegated listener stable and reconcile rows by their opaque
-    // backend identity. Progress updates replace only changed rows; a fast
-    // stream never tears down every button/listener on each tick.
-    const existing = new Map<string, Element>();
-    body.querySelectorAll<HTMLElement>("[data-tray-key]").forEach((node) => {
-      const key = node.dataset.trayKey;
-      if (key !== undefined) existing.set(key, node);
-    });
-    const fragment = document.createDocumentFragment();
+    // Cache row HTML so unchanged rows need no DOM inspection. Remove retired
+    // jobs first so their remaining siblings do not have to move.
+    const expectedKeys = new Set(
+      selection.items.map((item) => (item.kind === "job" ? `job:${item.jobId}` : `transfer:${item.transfer.key}`)),
+    );
+    if (selection.resourceError !== null) expectedKeys.add("resource-error");
+    for (const [key, row] of rows) {
+      if (!expectedKeys.has(key)) {
+        row.node.remove();
+        rows.delete(key);
+      }
+    }
+    let cursor = body.firstElementChild;
+    function placeRow(key: string, html: string): void {
+      let row = rows.get(key);
+      if (row === undefined || row.html !== html) {
+        const template = document.createElement("template");
+        template.innerHTML = html;
+        const node = template.content.firstElementChild;
+        if (node === null) return;
+        if (row !== undefined) {
+          updateRow(row.node, node);
+          row.html = html;
+        } else {
+          row = { node, html };
+          rows.set(key, row);
+        }
+      }
+      if (row.node !== cursor) body.insertBefore(row.node, cursor);
+      cursor = row.node.nextElementSibling;
+    }
+
     if (selection.resourceError !== null) {
-      const degraded = document.createElement("div");
-      degraded.className = "resource-degraded";
-      degraded.innerHTML =
-        `<span>传输队列读取失败：${escapeHtml(selection.resourceError)}</span>` +
-        `<button class="btn btn-sm btn-primary" data-action="retry-resource" data-resource="transfers" ${selection.resourceLoading ? "disabled" : ""}>` +
-        `${selection.resourceLoading ? "重试中…" : "重试读取"}</button>`;
-      fragment.append(degraded);
+      placeRow(
+        "resource-error",
+        '<div class="resource-degraded">' +
+          `<span>传输队列读取失败：${escapeHtml(selection.resourceError)}</span>` +
+          `<button class="btn btn-sm btn-primary" data-action="retry-resource" data-resource="transfers" ${selection.resourceLoading ? "disabled" : ""}>` +
+          `${selection.resourceLoading ? "重试中…" : "重试读取"}</button></div>`,
+      );
     }
     for (const item of selection.items) {
-      const html = trayItemHtml(item);
       const key = item.kind === "job" ? `job:${item.jobId}` : `transfer:${item.transfer.key}`;
-      const previous = existing.get(key);
-      if (previous !== undefined && previous.outerHTML === html) {
-        fragment.append(previous);
-        existing.delete(key);
-        continue;
-      }
-      const template = document.createElement("template");
-      template.innerHTML = html;
-      const next = template.content.firstElementChild;
-      if (next !== null) fragment.append(next);
-      existing.delete(key);
+      placeRow(key, trayItemHtml(item));
     }
-    body.replaceChildren(fragment);
   }
 
   return { render, dispose: bound.dispose };
