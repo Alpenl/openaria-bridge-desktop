@@ -1358,6 +1358,7 @@ impl DeviceSessionManifest {
             source_manifest_sha256: source_sha256.to_string(),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick,
+            video_frame_pts_us: Vec::new(),
             eye_width: self.camera.eye_width,
             eye_height: self.camera.height,
             left_segments,
@@ -1404,33 +1405,56 @@ impl DeviceSessionManifest {
         }
         let span = timestamps.last().unwrap() - timestamps[0];
         let interval = span as f64 / (self.frames.count - 1) as f64;
-        if timestamps.iter().enumerate().any(|(index, timestamp)| {
-            ((*timestamp - timestamps[0]) as f64 - index as f64 * interval).abs() > interval / 2.0
-        }) {
-            return Err(
-                "frame clock needs variable-rate rendering; retain source media".to_string(),
-            );
-        }
         // Nanosecond ticks stay within TimelineTime's bounded denominator;
         // rounding contributes at most half a nanosecond per video frame.
         let tick = TimelineTime::from_nanoseconds(interval.round() as i64)
             .map_err(|error| error.to_string())?;
         let start = timeline.left_segments[0].start_time;
+        let start_ns = u64::try_from(
+            start
+                .rounded_nanoseconds()
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|_| "video start precedes the session clock")?;
+        let pts: Vec<u64> = timestamps
+            .iter()
+            .map(|timestamp| {
+                (timestamp - timestamps[0])
+                    .checked_add(start_ns)
+                    .and_then(|value| value.checked_add(500))
+                    .map(|value| value / 1000)
+                    .ok_or("frame clock time overflow")
+            })
+            .collect::<Result<_, _>>()?;
+        if pts.windows(2).any(|pair| pair[1] <= pair[0]) {
+            return Err("frame clock cannot be represented at microsecond precision".to_string());
+        }
+        let frame_time = |index: u64| -> Result<TimelineTime, String> {
+            let micros = if index == self.frames.count {
+                pts.last()
+                    .unwrap()
+                    .checked_add((interval / 1000.0).round() as u64)
+                    .ok_or("frame clock end overflow")?
+            } else {
+                *pts.get(index as usize)
+                    .ok_or("video segment exceeds frame clock")?
+            };
+            let nanos = micros
+                .checked_mul(1000)
+                .and_then(|value| i64::try_from(value).ok())
+                .ok_or("frame clock time overflow")?;
+            TimelineTime::from_nanoseconds(nanos).map_err(|error| error.to_string())
+        };
         for segment in timeline
             .left_segments
             .iter_mut()
             .chain(timeline.right_segments.iter_mut())
         {
-            segment.start_time = tick
-                .checked_mul_u64(segment.start_frame)
-                .and_then(|delta| start.checked_add(delta))
-                .map_err(|error| error.to_string())?;
-            segment.end_time = tick
-                .checked_mul_u64(segment.end_frame)
-                .and_then(|delta| start.checked_add(delta))
-                .map_err(|error| error.to_string())?;
+            segment.start_time = frame_time(segment.start_frame)?;
+            segment.end_time = frame_time(segment.end_frame)?;
         }
         timeline.video_tick = tick;
+        timeline.video_frame_pts_us = pts;
         Ok(timeline)
     }
 }
@@ -1781,7 +1805,7 @@ fn build_receipt(
             name: "openaria-bridge-desktop".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             recipe_id: RECIPE_ID.to_string(),
-            recipe_version: 2,
+            recipe_version: 3,
         },
         output: ReceiptOutput {
             artifact_id: output_sha256.clone(),
@@ -1870,7 +1894,7 @@ fn validate_receipt(
         || receipt.input_artifacts != source.inputs
         || receipt.transformer.name != "openaria-bridge-desktop"
         || receipt.transformer.recipe_id != RECIPE_ID
-        || ![1, 2].contains(&receipt.transformer.recipe_version)
+        || ![1, 2, 3].contains(&receipt.transformer.recipe_version)
         || !is_semver(&receipt.transformer.version)
     {
         return Err("derived media receipt source or transformer binding is invalid".to_string());
@@ -1937,7 +1961,7 @@ fn validate_timeline_receipt(
     output: &ReceiptOutput,
     recipe_version: u32,
 ) -> Result<(), String> {
-    let source_video_tick_ns = if recipe_version == 2 {
+    let source_video_tick_ns = if recipe_version >= 2 {
         // Source inputs have been removed after commit; the receipt retains the
         // measured tick bound to their hashes and the verified output digest.
         let tick = timeline.source_video_tick_ns;
@@ -1969,7 +1993,7 @@ fn validate_timeline_receipt(
         .into_iter()
         .min()
         .ok_or_else(|| "source video timeline is empty".to_string())?;
-    let source_video_end_ns = if recipe_version == 2 {
+    let source_video_end_ns = if recipe_version >= 2 {
         i64::try_from(
             i128::from(source_video_start_ns)
                 + i128::from(source_video_tick_ns) * i128::from(source.manifest.frames.count),
@@ -2066,7 +2090,7 @@ fn validate_timeline_receipt(
         .ok()
         .filter(|duration| *duration > 0)
         .ok_or_else(|| "derived probe duration is invalid".to_string())?;
-    let rounding_allowance = if recipe_version == 2 {
+    let rounding_allowance = if recipe_version >= 2 {
         source.manifest.frames.count
     } else {
         0
@@ -3537,7 +3561,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_clock_replaces_container_rate_and_rejects_internal_steps() {
+    fn frame_clock_replaces_container_rate_and_preserves_internal_steps() {
         let root = tempfile::tempdir().unwrap();
         let (mut source, staging, _) = prepared_commit_request(root.path());
         source.manifest.camera.effective_fps = Number::from(29);
@@ -3567,11 +3591,18 @@ mod tests {
         source.manifest.frames.artifact.bytes = raw.len() as u64;
         source.manifest.frames.artifact.sha256 = sha256_bytes(raw.as_bytes());
         fs::write(path, raw).unwrap();
-        assert!(source
+        let changed = source
             .manifest
             .export_timeline_with_frames(&source.sha256, &staging.revision_dir())
-            .unwrap_err()
-            .contains("variable-rate"));
+            .unwrap();
+        assert_eq!(
+            changed.video_frame_pts_us[middle],
+            timeline.video_frame_pts_us[middle] + 20_000
+        );
+        assert_eq!(
+            changed.video_frame_pts_us[middle + 1],
+            timeline.video_frame_pts_us[middle + 1]
+        );
     }
 
     #[test]

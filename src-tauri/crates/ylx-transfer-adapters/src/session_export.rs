@@ -424,6 +424,8 @@ pub struct ManifestSessionTimeline {
     pub source_manifest_sha256: String,
     pub clock: SessionTimelineClock,
     pub video_tick: TimelineTime,
+    /// Absolute session-clock presentation timestamps, rounded to microseconds.
+    pub video_frame_pts_us: Vec<u64>,
     pub eye_width: u32,
     pub eye_height: u32,
     pub left_segments: Vec<TimedVideoSegment>,
@@ -706,6 +708,20 @@ fn validate_manifest_timeline(
     if left != right {
         return Err(SessionExportError::InvalidTimeline(
             "left/right aggregate frame and time coverage differs".to_string(),
+        ));
+    }
+
+    if !manifest.video_frame_pts_us.is_empty()
+        && (manifest.video_frame_pts_us.len() as u64 != left.frames
+            || i128::from(manifest.video_frame_pts_us[0])
+                != (i128::from(left.start.rounded_nanoseconds()?) + 500) / 1000
+            || manifest
+                .video_frame_pts_us
+                .windows(2)
+                .any(|pair| pair[1] <= pair[0]))
+    {
+        return Err(SessionExportError::InvalidTimeline(
+            "video frame presentation clock is incomplete or not increasing".to_string(),
         ));
     }
 
@@ -1186,6 +1202,7 @@ struct OutputStreamProbe {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OutputVideoFrameTimelineProbe {
     frame_count: u64,
+    timestamp_sha256: String,
     inferred_tick: TimelineTime,
     timestamp_tolerance_ns: u64,
     max_timestamp_residual_ns: i64,
@@ -1329,6 +1346,7 @@ impl OutputMediaProbe {
         let frame_report_sha256 = sha256_bytes(b"uniform-test-video-frame-evidence");
         self.video_frame_timeline = Some(OutputVideoFrameTimelineProbe {
             frame_count,
+            timestamp_sha256: String::new(),
             inferred_tick,
             timestamp_tolerance_ns: video.time_base.ceil_nanoseconds()?.div_ceil(2),
             max_timestamp_residual_ns: 0,
@@ -1434,6 +1452,7 @@ fn read_video_frame_timeline_probe(
     let timestamp_tolerance_ns = time_base.ceil_nanoseconds()?.div_ceil(2);
     let mut reader = BufReader::new(reader);
     let mut report_hasher = Sha256::new();
+    let mut timestamp_hasher = Sha256::new();
     let mut line = Vec::with_capacity(32);
     let mut frame_count = 0_u64;
     let mut max_timestamp_residual_ns = 0_i64;
@@ -1501,6 +1520,9 @@ fn read_video_frame_timeline_probe(
             ))
         })?;
         let actual = time_base.checked_mul_integer(ticks)?;
+        let relative = actual.checked_sub(stream_start)?;
+        let micros = ((i128::from(relative.rounded_nanoseconds()?) + 500) / 1000) as i64;
+        timestamp_hasher.update(micros.to_le_bytes());
         let expected = stream_start.checked_add(inferred_tick.checked_mul_u64(frame_count)?)?;
         let residual = timeline_residual_ns(actual, expected)?;
         if residual.unsigned_abs() > max_timestamp_residual_ns.unsigned_abs() {
@@ -1515,6 +1537,7 @@ fn read_video_frame_timeline_probe(
     }
     Ok(OutputVideoFrameTimelineProbe {
         frame_count,
+        timestamp_sha256: format!("{:x}", timestamp_hasher.finalize()),
         inferred_tick,
         timestamp_tolerance_ns,
         max_timestamp_residual_ns,
@@ -1724,11 +1747,18 @@ pub fn verify_session_export_output(
     let source_video_tick_ns = timing.video_tick().ceil_nanoseconds()?;
     let video_start_residual_ns = timeline_residual_ns(video.start, timing.video_start)?;
     let video_end_residual_ns = timeline_residual_ns(video.end, timing.video_end)?;
-    if video_start_residual_ns.unsigned_abs() > source_video_tick_ns
-        || video_end_residual_ns.unsigned_abs() > source_video_tick_ns
+    let video_boundary_ns = if timing.manifest.video_frame_pts_us.is_empty() {
+        source_video_tick_ns
+    } else {
+        // Legacy MP4 muxers quantize the edit-list origin to milliseconds.
+        // Relative frame PTS are still checked individually at microsecond precision.
+        1_000_000
+    };
+    if video_start_residual_ns.unsigned_abs() > video_boundary_ns
+        || video_end_residual_ns.unsigned_abs() > video_boundary_ns
     {
         return Err(SessionExportError::OutputVerificationFailed(format!(
-            "derived video timing residual exceeds one source video tick ({source_video_tick_ns} ns)"
+            "derived video timing residual exceeds the allowed boundary ({video_boundary_ns} ns)"
         )));
     }
     let frame_timeline = probe.video_frame_timeline.as_ref().ok_or_else(|| {
@@ -1742,42 +1772,56 @@ pub fn verify_session_export_output(
             frame_timeline.frame_count
         )));
     }
-    if frame_timeline.max_timestamp_residual_ns.unsigned_abs()
-        > frame_timeline.timestamp_tolerance_ns
-    {
-        return Err(SessionExportError::OutputVerificationFailed(format!(
+    if !timing.manifest.video_frame_pts_us.is_empty() {
+        let mut hasher = Sha256::new();
+        let first = timing.manifest.video_frame_pts_us[0];
+        for pts in &timing.manifest.video_frame_pts_us {
+            hasher.update((pts - first).to_le_bytes());
+        }
+        if frame_timeline.timestamp_sha256 != format!("{:x}", hasher.finalize()) {
+            return Err(SessionExportError::OutputVerificationFailed(
+                "derived output frame timestamps differ from the capture clock".to_string(),
+            ));
+        }
+    } else {
+        if frame_timeline.max_timestamp_residual_ns.unsigned_abs()
+            > frame_timeline.timestamp_tolerance_ns
+        {
+            return Err(SessionExportError::OutputVerificationFailed(format!(
             "derived output frame timestamp {} has residual {} ns from its stream clock; allowed {} ns",
             frame_timeline.max_timestamp_residual_frame,
             frame_timeline.max_timestamp_residual_ns,
             frame_timeline.timestamp_tolerance_ns
         )));
-    }
-    let observed_timestamp_uncertainty = frame_timeline.max_timestamp_residual_ns.unsigned_abs();
-    // The streaming reader compared every raw PTS with the stream's arithmetic
-    // clock and retained its worst error. Combining that bound with each
-    // stream-clock/manifest-clock residual proves every frame without storing
-    // an attacker-controlled number of timestamps in memory.
-    for frame_index in 0..timing.paired_frames {
-        let output_clock_timestamp = video
-            .start
-            .checked_add(frame_timeline.inferred_tick.checked_mul_u64(frame_index)?)?;
-        let manifest_timestamp = timing
-            .video_start
-            .checked_add(timing.video_tick().checked_mul_u64(frame_index)?)?;
-        let clock_residual =
-            timeline_residual_ns(output_clock_timestamp, manifest_timestamp)?.unsigned_abs();
-        let proven_residual = clock_residual
-            .checked_add(observed_timestamp_uncertainty)
-            .ok_or_else(|| {
-                SessionExportError::OutputVerificationFailed(
-                    "derived output frame timestamp residual overflowed".to_string(),
-                )
-            })?;
-        if proven_residual > frame_timeline.timestamp_tolerance_ns {
-            return Err(SessionExportError::OutputVerificationFailed(format!(
+        }
+        let observed_timestamp_uncertainty =
+            frame_timeline.max_timestamp_residual_ns.unsigned_abs();
+        // The streaming reader compared every raw PTS with the stream's arithmetic
+        // clock and retained its worst error. Combining that bound with each
+        // stream-clock/manifest-clock residual proves every frame without storing
+        // an attacker-controlled number of timestamps in memory.
+        for frame_index in 0..timing.paired_frames {
+            let output_clock_timestamp = video
+                .start
+                .checked_add(frame_timeline.inferred_tick.checked_mul_u64(frame_index)?)?;
+            let manifest_timestamp = timing
+                .video_start
+                .checked_add(timing.video_tick().checked_mul_u64(frame_index)?)?;
+            let clock_residual =
+                timeline_residual_ns(output_clock_timestamp, manifest_timestamp)?.unsigned_abs();
+            let proven_residual = clock_residual
+                .checked_add(observed_timestamp_uncertainty)
+                .ok_or_else(|| {
+                    SessionExportError::OutputVerificationFailed(
+                        "derived output frame timestamp residual overflowed".to_string(),
+                    )
+                })?;
+            if proven_residual > frame_timeline.timestamp_tolerance_ns {
+                return Err(SessionExportError::OutputVerificationFailed(format!(
                 "derived output frame timestamp {frame_index} differs from the manifest clock by at least {proven_residual} ns; allowed {} ns",
                 frame_timeline.timestamp_tolerance_ns
             )));
+            }
         }
     }
 
@@ -2695,7 +2739,46 @@ impl FfmpegSessionExporter {
         let staged_output_path = staging.path().join("output.mp4");
         let mut run_plan = plan.clone();
         run_plan.output_path = staged_output_path.clone();
-        let args = build_ffmpeg_args(&run_plan, staging.path())?;
+        let mut args = build_ffmpeg_args(&run_plan, staging.path())?;
+        if let Some(timing) = run_plan
+            .timing()
+            .filter(|timing| !timing.manifest.video_frame_pts_us.is_empty())
+        {
+            let mut help = Command::new(self.config.ffmpeg_path());
+            help.args(["-hide_banner", "-h", "bsf=setts"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let started = std::time::Instant::now();
+            let capability = run_bounded_command(
+                &mut help,
+                "ffmpeg",
+                self.config.ffmpeg_path(),
+                PROCESS_STDERR_LIMIT_BYTES,
+                PROCESS_STDERR_LIMIT_BYTES,
+                &|| is_cancelled() || started.elapsed() > Duration::from_secs(5),
+            )?;
+            let help_text = String::from_utf8_lossy(&capability.stdout);
+            let has_duration = help_text
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some("-duration"));
+            if !has_duration {
+                // Older FFmpeg accepts an output rate hint with passthrough PTS;
+                // newer versions require the explicit packet-duration filter.
+                let index = args
+                    .iter()
+                    .position(|arg| arg == "-bsf:v")
+                    .expect("VFR duration filter");
+                let tick = timing.video_tick();
+                args[index] = "-r".to_string();
+                args[index + 1] = format!("{}/{}", tick.denominator(), tick.numerator());
+                let index = args
+                    .iter()
+                    .position(|arg| arg == "-movie_timescale")
+                    .expect("VFR movie timescale");
+                args.drain(index..index + 2);
+            }
+        }
 
         let mut command = Command::new(self.config.ffmpeg_path());
         command
@@ -3768,8 +3851,17 @@ fn build_timeline_ffmpeg_args(
     let mut filter = format!(
         "[0:v:0]settb=AVTB,setpts={video_clock}[l];\
          [1:v:0]settb=AVTB,setpts={video_clock}[r];\
-         [l][r]hstack=inputs=2:shortest=1[v]"
+         [l][r]hstack=inputs=2:shortest=1"
     );
+    let frame_pts = &manifest.video_frame_pts_us;
+    if frame_pts.is_empty() {
+        filter.push_str("[v]");
+    } else {
+        filter.push_str(&format!(
+            "[stacked];[stacked]settb=AVTB,setpts='{}'[v]",
+            frame_pts_expression(frame_pts, 0),
+        ));
+    }
     if let Some(audio_start) = timing.audio_start_offset() {
         let audio = timing
             .manifest
@@ -3791,23 +3883,59 @@ fn build_timeline_ffmpeg_args(
             audio_start.ffmpeg_seconds()?
         ));
     }
-    args.extend([
-        "-filter_complex".to_string(),
-        filter,
-        "-map".to_string(),
-        "[v]".to_string(),
-    ]);
+    if frame_pts.is_empty() {
+        args.extend(["-filter_complex".to_string(), filter]);
+    } else {
+        let path = staging_dir.join("timeline.fffilter");
+        fs::write(&path, filter).map_err(|source| SessionExportError::Io {
+            context: "write frame presentation clock",
+            path: path.clone(),
+            source,
+        })?;
+        args.extend([
+            "-filter_complex_script".to_string(),
+            path.to_string_lossy().into_owned(),
+        ]);
+    }
+    args.extend(["-map".to_string(), "[v]".to_string()]);
     if audio_list.is_some() {
         args.extend(["-map".to_string(), "[a]".to_string()]);
     } else {
         args.push("-an".to_string());
     }
     append_h264_video_output_args(&mut args);
-    args.extend([
-        "-r".to_string(),
-        format!("{}/{}", video_tick.denominator(), video_tick.numerator()),
-    ]);
-    args.extend(["-vsync".to_string(), "0".to_string()]);
+    if frame_pts.is_empty() {
+        args.extend([
+            "-r".to_string(),
+            format!("{}/{}", video_tick.denominator(), video_tick.numerator()),
+        ]);
+        args.extend(["-vsync".to_string(), "0".to_string()]);
+    } else {
+        args.extend([
+            "-vsync".into(),
+            "0".into(),
+            "-enc_time_base:v".into(),
+            "1:1000000".into(),
+            "-video_track_timescale".into(),
+            "1000000".into(),
+            "-movie_timescale".into(),
+            "1000000".into(),
+            "-bf".into(),
+            "0".into(),
+            "-x264-params".into(),
+            format!(
+                "fps={}/{}",
+                video_tick.denominator(),
+                video_tick.numerator()
+            ),
+            "-bsf:v".into(),
+            format!(
+                "setts=pts=PTS:dts=DTS:duration='if(eq(N,{}),{},DURATION)'",
+                frame_pts.len() - 1,
+                (video_tick.ceil_nanoseconds()? + 500) / 1000
+            ),
+        ]);
+    }
     if audio_list.is_some() {
         args.extend([
             "-c:a".to_string(),
@@ -3835,6 +3963,19 @@ fn append_concat_input(args: &mut Vec<String>, list_path: &Path) {
         "-i".to_string(),
         list_path.to_string_lossy().into_owned(),
     ]);
+}
+
+fn frame_pts_expression(pts: &[u64], start: usize) -> String {
+    if pts.len() == 1 {
+        return pts[0].to_string();
+    }
+    let middle = pts.len() / 2;
+    format!(
+        "if(lt(N,{}),{},{})",
+        start + middle,
+        frame_pts_expression(&pts[..middle], start),
+        frame_pts_expression(&pts[middle..], start + middle)
+    )
 }
 
 fn append_h264_video_output_args(args: &mut Vec<String>) {
@@ -4501,6 +4642,7 @@ mod tests {
             source_manifest_sha256: "6".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
             left_segments: vec![timed_video_segment(0, left, 0, 30, 0, 1)],
@@ -4544,6 +4686,7 @@ mod tests {
             source_manifest_sha256: "d".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
             left_segments: vec![timed_video_segment(0, left, 0, 60, 0, 2)],
@@ -4568,6 +4711,7 @@ mod tests {
             source_manifest_sha256: "a".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
             left_segments: vec![timed_video_segment(0, left, 0, 60, 0, 2)],
@@ -4622,6 +4766,7 @@ mod tests {
             source_manifest_sha256: "b".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
             left_segments: vec![timed_video_segment(0, left, 0, 60, 0, 2)],
@@ -4694,6 +4839,7 @@ mod tests {
             source_manifest_sha256: "c".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
             left_segments: vec![timed_video_segment(0, left, 0, 60, 0, 2)],
@@ -5866,6 +6012,7 @@ done
             source_manifest_sha256: "e".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: tick,
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
             left_segments: vec![video_segment(left)],
@@ -5905,6 +6052,68 @@ done
     }
 
     #[test]
+    fn real_vfr_export_preserves_every_capture_timestamp_and_rejects_clock_changes() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            return;
+        }
+        for start in [0_u64, 200_123] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source");
+            let left = source.join("video/left.mp4");
+            let right = source.join("video/right.mp4");
+            generate_h264_clip(&left, "red");
+            generate_h264_clip(&right, "blue");
+            let pts = vec![
+                start,
+                start + 125123,
+                start + 246247,
+                start + 384370,
+                start + 700494,
+                start + 825617,
+            ];
+            let tick_us = (pts[5] - pts[0] + 2) / 5;
+            let tick = timeline_time(tick_us as i64, 1_000_000);
+            let segment = |path: PathBuf| TimedVideoSegment {
+                index: 0,
+                bytes: fs::metadata(&path).unwrap().len(),
+                sha256: sha256_file(&path).unwrap(),
+                path,
+                start_frame: 0,
+                end_frame: 6,
+                start_time: timeline_time(start as i64, 1_000_000),
+                end_time: timeline_time((pts[5] + tick_us) as i64, 1_000_000),
+            };
+            let timeline = ManifestSessionTimeline {
+                source_manifest_sha256: "e".repeat(64),
+                clock: SessionTimelineClock::HostMonotonic,
+                video_tick: tick,
+                video_frame_pts_us: pts.clone(),
+                eye_width: 32,
+                eye_height: 32,
+                left_segments: vec![segment(left)],
+                right_segments: vec![segment(right)],
+                audio: None,
+            };
+            let output = directory.path().join("vfr.mp4");
+            let plan = SessionExportPlan::from_manifest_timeline(&source, &output, false, timeline)
+                .unwrap();
+            let exporter = FfmpegSessionExporter::new(SessionExportConfig::system_ffmpeg());
+            let receipt = exporter.export_plan(&plan).unwrap();
+            let evidence = receipt.timeline_verification.unwrap();
+            assert_eq!(evidence.paired_frames, 6);
+            assert!(evidence.video_start_residual_ns.unsigned_abs() < 1_000_000);
+            assert!(evidence.video_end_residual_ns.unsigned_abs() < 1_000_000);
+            let mut changed = plan.clone();
+            changed.timing.as_mut().unwrap().manifest.video_frame_pts_us[2] += 1_000;
+            let probe = exporter.probe_output(&output).unwrap();
+            assert!(verify_session_export_output(&changed, &output, &probe)
+                .unwrap_err()
+                .to_string()
+                .contains("frame timestamps differ"));
+        }
+    }
+
+    #[test]
     fn exports_and_verifies_real_manifest_timeline_with_late_audio() {
         if !ffmpeg_available() || !ffprobe_available() {
             eprintln!("skipping manifest timeline export because ffmpeg/ffprobe is unavailable");
@@ -5933,6 +6142,7 @@ done
             source_manifest_sha256: "e".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 10),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
             left_segments: vec![video_segment(left)],
@@ -6030,6 +6240,7 @@ done
             source_manifest_sha256: "f".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
             left_segments: vec![
@@ -6399,6 +6610,7 @@ done
             source_manifest_sha256: "9".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
             left_segments: vec![
@@ -6473,6 +6685,7 @@ done
             source_manifest_sha256: "8".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
             left_segments: vec![video_segment(left)],
@@ -6539,6 +6752,7 @@ done
             source_manifest_sha256: "7".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
             left_segments: vec![video_segment(left)],
