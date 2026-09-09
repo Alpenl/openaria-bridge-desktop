@@ -529,7 +529,7 @@ fn canonical_assets_for_current_recipe(
     let bundle = canonical_publication_bundle_in_session_dir(session_dir, source)?;
     let receipt: DerivedMediaReceipt =
         serde_json::from_slice(&bundle.receipt_bytes).map_err(|error| error.to_string())?;
-    if receipt.transformer.recipe_version != 5 {
+    if receipt.transformer.recipe_version != 6 {
         return Err(
             "existing media uses an earlier rendering recipe; rebuild from verified source".into(),
         );
@@ -867,7 +867,10 @@ fn parse_source_publication(payload: &[u8]) -> Result<ParsedSource, String> {
         || publication.receipt_origin != "client-derived-lab-compatibility"
         || publication.device_authenticity != "not_asserted"
         || !publication.integrity_ok
-        || publication.source_schema != SOURCE_SCHEMA
+        || !matches!(
+            publication.source_schema.as_str(),
+            SOURCE_SCHEMA | "ylx.device-session.v3"
+        )
     {
         return Err(format!(
             "usable derived media requires an eligible {SOURCE_SCHEMA} v4 compatibility publication, found {}",
@@ -939,7 +942,10 @@ pub(crate) fn device_session_export_plan(
     }
     let bytes = fs::read(&path).map_err(|error| error.to_string())?;
     let value = parse_strict_json(&bytes).map_err(|error| error.to_string())?;
-    if value["schema"] != SOURCE_SCHEMA {
+    if !matches!(
+        value["schema"].as_str(),
+        Some(SOURCE_SCHEMA | "ylx.device-session.v3")
+    ) {
         return Ok(None);
     }
     validate_source_manifest_schema(&value)?;
@@ -1108,7 +1114,11 @@ struct ManifestArtifact {
 
 impl DeviceSessionManifest {
     fn validate(&self) -> Result<(), String> {
-        if self.schema != SOURCE_SCHEMA || !self.sealed {
+        if !matches!(
+            self.schema.as_str(),
+            SOURCE_SCHEMA | "ylx.device-session.v3"
+        ) || !self.sealed
+        {
             return Err("source must be a sealed Device Session v2 manifest".to_string());
         }
         validate_uuid_v7(&self.manifest_id, "manifest_id")?;
@@ -1132,7 +1142,8 @@ impl DeviceSessionManifest {
             return Err("source camera dimensions must be positive".to_string());
         }
         if self.video.layout != "split-eyes"
-            || self.video.codec != "h264"
+            || !(self.video.codec == "h264"
+                || (self.schema == "ylx.device-session.v3" && self.video.codec == "hevc"))
             || self.video.container != "mp4"
         {
             return Err(
@@ -1404,6 +1415,11 @@ impl DeviceSessionManifest {
             video_frame_pts_us: Vec::new(),
             eye_width: self.camera.eye_width,
             eye_height: self.camera.height,
+            source_video_codec: if self.video.codec == "hevc" {
+                ylx_transfer_core::ingest::SourceVideoCodec::Hevc
+            } else {
+                ylx_transfer_core::ingest::SourceVideoCodec::H264
+            },
             left_segments,
             right_segments,
             audio,
@@ -1836,7 +1852,7 @@ fn build_receipt(
         created_at: now.clone(),
         origin: origin.to_string(),
         source_manifest: ReceiptSourceManifest {
-            schema: SOURCE_SCHEMA.to_string(),
+            schema: source.manifest.schema.clone(),
             manifest_id: source.manifest.manifest_id.clone(),
             session_id: source.manifest.session_id.clone(),
             volume_id: source.manifest.volume_id.clone(),
@@ -1848,7 +1864,7 @@ fn build_receipt(
             name: "openaria-bridge-desktop".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             recipe_id: RECIPE_ID.to_string(),
-            recipe_version: 5,
+            recipe_version: 6,
         },
         output: ReceiptOutput {
             artifact_id: output_sha256.clone(),
@@ -1928,7 +1944,7 @@ fn validate_receipt(
     validate_uuid_v7(&receipt.receipt_id, "receipt_id")?;
     if receipt.schema != RECEIPT_SCHEMA
         || (receipt.origin != "new-download" && receipt.origin != "existing-library-migration")
-        || receipt.source_manifest.schema != SOURCE_SCHEMA
+        || receipt.source_manifest.schema != source.manifest.schema
         || receipt.source_manifest.manifest_id != source.manifest.manifest_id
         || receipt.source_manifest.session_id != source.manifest.session_id
         || receipt.source_manifest.volume_id != source.manifest.volume_id
@@ -1937,7 +1953,7 @@ fn validate_receipt(
         || receipt.input_artifacts != source.inputs
         || receipt.transformer.name != "openaria-bridge-desktop"
         || receipt.transformer.recipe_id != RECIPE_ID
-        || ![1, 2, 3, 4, 5].contains(&receipt.transformer.recipe_version)
+        || ![1, 2, 3, 4, 5, 6].contains(&receipt.transformer.recipe_version)
         || !is_semver(&receipt.transformer.version)
     {
         return Err("derived media receipt source or transformer binding is invalid".to_string());

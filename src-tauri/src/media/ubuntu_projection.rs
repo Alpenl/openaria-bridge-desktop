@@ -686,6 +686,7 @@ fn map_source_schema(schema: CoreSourceSchema) -> SourceSchema {
     match schema {
         CoreSourceSchema::DeviceSessionV1 => SourceSchema::DeviceSessionV1,
         CoreSourceSchema::DeviceSessionV2 => SourceSchema::DeviceSessionV2,
+        CoreSourceSchema::DeviceSessionV3 => SourceSchema::DeviceSessionV3,
         CoreSourceSchema::SignedPublicationV1 => SourceSchema::SignedPublicationV1,
         CoreSourceSchema::RawCaptureV2 => SourceSchema::RawCaptureV2,
         CoreSourceSchema::LegacyMjpegSessionV5 => SourceSchema::LegacyMjpegSessionV5,
@@ -701,6 +702,7 @@ fn map_unsigned_source_schema(
     match schema {
         CoreSourceSchema::DeviceSessionV1 => Ok(UnsignedSourceSchema::DeviceSessionV1),
         CoreSourceSchema::DeviceSessionV2 => Ok(UnsignedSourceSchema::DeviceSessionV2),
+        CoreSourceSchema::DeviceSessionV3 => Ok(UnsignedSourceSchema::DeviceSessionV3),
         CoreSourceSchema::RawCaptureV2 => Ok(UnsignedSourceSchema::RawCaptureV2),
         CoreSourceSchema::LegacyMjpegSessionV5 => Ok(UnsignedSourceSchema::LegacyMjpegSessionV5),
         CoreSourceSchema::CompleteUnpublishedV6 => Ok(UnsignedSourceSchema::CompleteUnpublishedV6),

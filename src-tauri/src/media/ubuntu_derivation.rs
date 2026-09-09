@@ -116,7 +116,9 @@ pub fn approved_profile_for(
 ) -> Result<NormalizationProfile, MediaPortError> {
     let candidate = match source.media_plan().codec() {
         SourceVideoCodec::Mjpeg => NormalizationProfile::candidate_mjpeg_x265_slow_v1(),
-        SourceVideoCodec::H264 => NormalizationProfile::candidate_h264_x265_slow_v1(),
+        SourceVideoCodec::H264 | SourceVideoCodec::Hevc => {
+            NormalizationProfile::candidate_h264_x265_slow_v1()
+        }
     }
     .map_err(|error| {
         MediaPortError::new(
@@ -186,10 +188,12 @@ pub fn normalization_input_for(
     }
 
     match schema {
-        SourceSchema::DeviceSessionV1 | SourceSchema::DeviceSessionV2 => {
+        SourceSchema::DeviceSessionV1
+        | SourceSchema::DeviceSessionV2
+        | SourceSchema::DeviceSessionV3 => {
             ensure_unsigned_provenance(source, schema)?;
             match (layout, codec) {
-                (StereoLayout::SeparateEyes, SourceVideoCodec::H264) => {
+                (StereoLayout::SeparateEyes, SourceVideoCodec::H264 | SourceVideoCodec::Hevc) => {
                     let segments =
                         paired_segments(left, right, source.media_plan().segment_count(), schema)?;
                     NormalizationInput::complete_unpublished_v6(segments, manifest_digest)
@@ -342,7 +346,7 @@ pub fn normalization_input_for(
         SourceSchema::UnsignedPublicationV1 => {
             ensure_unsigned_provenance(source, schema)?;
             match (layout, codec) {
-                (StereoLayout::SeparateEyes, SourceVideoCodec::H264) => {
+                (StereoLayout::SeparateEyes, SourceVideoCodec::H264 | SourceVideoCodec::Hevc) => {
                     let segments =
                         paired_segments(left, right, source.media_plan().segment_count(), schema)?;
                     NormalizationInput::unsigned_paired_h264_publication_v1(

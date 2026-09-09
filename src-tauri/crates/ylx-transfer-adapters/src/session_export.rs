@@ -446,6 +446,7 @@ pub struct ManifestSessionTimeline {
     pub video_frame_pts_us: Vec<u64>,
     pub eye_width: u32,
     pub eye_height: u32,
+    pub source_video_codec: SourceVideoCodec,
     pub left_segments: Vec<TimedVideoSegment>,
     pub right_segments: Vec<TimedVideoSegment>,
     pub audio: Option<ManifestAudioTimeline>,
@@ -2428,8 +2429,8 @@ impl FfmpegSessionExporter {
         self.export_plan(&plan)
     }
 
-    /// Export an already synchronized library movie. Default H.264 is copied;
-    /// calibrated H.264 is remuxed. AAC
+    /// Export an already synchronized movie. Matching H.264/HEVC is copied;
+    /// an audio adjustment only remuxes matching video. AAC
     /// packets retain their content and only receive the explicit time shift.
     pub fn export_playable_copy(
         &self,
@@ -2463,7 +2464,12 @@ impl FfmpegSessionExporter {
         let staging = TempExportDir::create_for(&output)?;
         let staged = staging.path().join("output.mp4");
         let video = &original.video_streams[0];
-        if *options == MediaExportOptions::default() && video.codec_name == "h264" {
+        let expected_codec = if options.video_codec == ExportVideoCodec::Hevc {
+            "hevc"
+        } else {
+            "h264"
+        };
+        if options.audio_delay_ms == 0 && video.codec_name == expected_codec {
             fs::copy(source, &staged).map_err(|error| SessionExportError::Io {
                 context: "copy verified library movie",
                 path: staged.clone(),
@@ -2499,15 +2505,10 @@ impl FfmpegSessionExporter {
         if !original.audio_streams.is_empty() {
             args.extend(["-map".into(), "1:a:0".into(), "-c:a".into(), "copy".into()]);
         }
-        if options.video_codec == ExportVideoCodec::H264 {
-            if video.codec_name != "h264" {
-                return Err(SessionExportError::InvalidRequest(
-                    "H.264 copy requires an H.264 library movie".into(),
-                ));
-            }
+        if video.codec_name == expected_codec {
             args.extend(["-c:v".into(), "copy".into()]);
         } else {
-            append_video_output_args(&mut args, ExportVideoCodec::Hevc);
+            append_video_output_args(&mut args, options.video_codec);
             let duration = video.end.checked_sub(video.start)?;
             let rate = video.frame_count.unwrap_or(0) as f64 * duration.denominator() as f64
                 / duration.numerator() as f64;
@@ -2519,13 +2520,17 @@ impl FfmpegSessionExporter {
                 "1:1000000".into(),
                 "-bf".into(),
                 "0".into(),
-                "-x265-params".into(),
-                format!(
-                    "fps={}/{}:pools=4:frame-threads=2:log-level=error",
-                    fps.numerator(),
-                    fps.denominator()
-                ),
             ]);
+            if options.video_codec == ExportVideoCodec::Hevc {
+                args.extend([
+                    "-x265-params".into(),
+                    format!(
+                        "fps={}/{}:pools=4:frame-threads=2:log-level=error",
+                        fps.numerator(),
+                        fps.denominator()
+                    ),
+                ]);
+            }
         }
         // MP4 edit lists otherwise use millisecond ticks and round AAC shifts.
         // The bundled FFmpeg supports microsecond movie ticks; retain bounded
@@ -2824,6 +2829,7 @@ impl FfmpegSessionExporter {
                     position,
                     timing.manifest().eye_width,
                     timing.manifest().eye_height,
+                    timing.manifest().source_video_codec,
                     is_cancelled,
                 )?;
                 if actual != expected {
@@ -2952,6 +2958,7 @@ impl FfmpegSessionExporter {
         position: usize,
         expected_width: u32,
         expected_height: u32,
+        expected_codec: SourceVideoCodec,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<u64, SessionExportError> {
         let mut command = Command::new(self.config.ffprobe_path());
@@ -2992,6 +2999,7 @@ impl FfmpegSessionExporter {
             position,
             expected_width,
             expected_height,
+            expected_codec,
         )
     }
 
@@ -3153,6 +3161,7 @@ fn parse_source_video_segment_probe(
     position: usize,
     expected_width: u32,
     expected_height: u32,
+    expected_codec: SourceVideoCodec,
 ) -> Result<u64, SessionExportError> {
     let report: Value = serde_json::from_slice(bytes).map_err(|error| {
         SessionExportError::OutputVerificationFailed(format!(
@@ -3185,16 +3194,21 @@ fn parse_source_video_segment_probe(
         })?;
     if streams.len() != 1 {
         return Err(SessionExportError::OutputVerificationFailed(format!(
-            "{eye}-eye segment {position} must contain exactly one H.264 video stream and no other streams; found {} streams",
+            "{eye}-eye segment {position} must contain exactly one video stream matching the declared codec and no other streams; found {} streams",
             streams.len()
         )));
     }
     let stream = &streams[0];
     if required_probe_string(stream, "codec_type")? != "video"
-        || required_probe_string(stream, "codec_name")? != "h264"
+        || required_probe_string(stream, "codec_name")?
+            != match expected_codec {
+                SourceVideoCodec::H264 => "h264",
+                SourceVideoCodec::Hevc => "hevc",
+                SourceVideoCodec::Mjpeg => "mjpeg",
+            }
     {
         return Err(SessionExportError::OutputVerificationFailed(format!(
-            "{eye}-eye segment {position} must contain exactly one H.264 video stream"
+            "{eye}-eye segment {position} must contain exactly one video stream matching the declared codec"
         )));
     }
     let width = optional_probe_u64(stream, "width")?
@@ -4308,9 +4322,9 @@ fn append_video_output_args(args: &mut Vec<String>, codec: ExportVideoCodec) {
         "-c:v".to_string(),
         if hevc { "libx265" } else { "libx264" }.to_string(),
         "-preset".to_string(),
-        if hevc { "medium" } else { "veryfast" }.to_string(),
+        "medium".to_string(),
         "-crf".to_string(),
-        if hevc { "22" } else { "20" }.to_string(),
+        "18".to_string(),
         "-pix_fmt".to_string(),
         "yuv420p".to_string(),
         "-color_primaries".into(),
@@ -5042,6 +5056,7 @@ mod tests {
             video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![timed_video_segment(0, left, 0, 30, 0, 1)],
             right_segments: vec![timed_video_segment(0, right, 0, 30, 0, 1)],
             audio: None,
@@ -5086,6 +5101,7 @@ mod tests {
             video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![timed_video_segment(0, left, 0, 60, 0, 2)],
             right_segments: vec![timed_video_segment(0, right, 0, 60, 0, 2)],
             audio,
@@ -5111,6 +5127,7 @@ mod tests {
             video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![timed_video_segment(0, left, 0, 60, 0, 2)],
             right_segments: vec![timed_video_segment(0, right, 0, 60, 0, 2)],
             audio: Some(ManifestAudioTimeline {
@@ -5166,6 +5183,7 @@ mod tests {
             video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![timed_video_segment(0, left, 0, 60, 0, 2)],
             right_segments: vec![timed_video_segment(0, right, 0, 60, 0, 2)],
             audio: Some(ManifestAudioTimeline {
@@ -5239,6 +5257,7 @@ mod tests {
             video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![timed_video_segment(0, left, 0, 60, 0, 2)],
             right_segments: vec![timed_video_segment(0, right, 0, 60, 0, 2)],
             audio: Some(ManifestAudioTimeline {
@@ -6415,6 +6434,7 @@ done
             video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![video_segment(left)],
             right_segments: vec![video_segment(right)],
             audio: Some(ManifestAudioTimeline {
@@ -6495,6 +6515,7 @@ done
                 video_frame_pts_us: pts.clone(),
                 eye_width: 32,
                 eye_height: 32,
+                source_video_codec: SourceVideoCodec::H264,
                 left_segments: vec![segment(left)],
                 right_segments: vec![segment(right)],
                 audio: None,
@@ -6555,6 +6576,7 @@ done
             video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![video_segment(left)],
             right_segments: vec![video_segment(right)],
             audio: Some(ManifestAudioTimeline {
@@ -6669,6 +6691,7 @@ done
             video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![
                 video_segment(0, left_first, 0, 30),
                 video_segment(1, left_second, 30, 60),
@@ -6902,6 +6925,92 @@ done
     }
 
     #[test]
+    fn source_video_probe_requires_the_declared_hevc_codec() {
+        let bytes = br#"{"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2"},"streams":[{"codec_type":"video","codec_name":"hevc","width":32,"height":32,"nb_read_frames":"30"}]}"#;
+        assert_eq!(
+            parse_source_video_segment_probe(
+                bytes,
+                Path::new("left.mp4"),
+                "left",
+                0,
+                32,
+                32,
+                SourceVideoCodec::Hevc
+            )
+            .unwrap(),
+            30
+        );
+        assert!(parse_source_video_segment_probe(
+            bytes,
+            Path::new("left.mp4"),
+            "left",
+            0,
+            32,
+            32,
+            SourceVideoCodec::H264
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn hevc_eyes_export_at_full_size_and_matching_playable_copy_preserves_bytes() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            eprintln!("skipping HEVC media regression: ffmpeg/ffprobe unavailable");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir_all(source.join("video")).unwrap();
+        let left = source.join("video/left_00000.mp4");
+        let right = source.join("video/right_00000.mp4");
+        for (path, color) in [(&left, "red"), (&right, "blue")] {
+            run_ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("color={color}:size=32x32:rate=30"),
+                "-frames:v",
+                "30",
+                "-c:v",
+                "libx265",
+                "-preset",
+                "ultrafast",
+                "-x265-params",
+                "pools=1:frame-threads=1:log-level=error",
+                "-bf",
+                "0",
+                "-pix_fmt",
+                "yuv420p",
+                "-tag:v",
+                "hvc1",
+                path.to_str().unwrap(),
+            ]);
+        }
+        let mut timeline = single_segment_video_timeline(left, right);
+        timeline.source_video_codec = SourceVideoCodec::Hevc;
+        let output = directory.path().join("joined.mp4");
+        let plan =
+            SessionExportPlan::from_manifest_timeline(&source, &output, false, timeline).unwrap();
+        let exporter = FfmpegSessionExporter::new(SessionExportConfig::system_ffmpeg());
+        let receipt = exporter.export_plan(&plan).unwrap();
+        let media = receipt.output_media.unwrap();
+        assert_eq!((media.width, media.height), (64, 32));
+        let hevc = directory.path().join("hevc.mp4");
+        let copy = directory.path().join("copy.mp4");
+        let options = MediaExportOptions {
+            video_codec: ExportVideoCodec::Hevc,
+            audio_delay_ms: 0,
+        };
+        exporter
+            .export_playable_copy(&output, &hevc, &options)
+            .unwrap();
+        exporter
+            .export_playable_copy(&hevc, &copy, &options)
+            .unwrap();
+        assert_eq!(fs::read(&hevc).unwrap(), fs::read(&copy).unwrap());
+    }
+
+    #[test]
     fn source_video_contract_rejects_non_h264_mp4_segment() {
         if !ffmpeg_available() || !ffprobe_available() {
             eprintln!("skipping source video codec verification because ffmpeg is unavailable");
@@ -6928,7 +7037,7 @@ done
             .expect_err("MPEG-4 Part 2 must not satisfy the declared H.264 source contract");
 
         assert!(error.to_string().contains("left-eye segment 0"));
-        assert!(error.to_string().contains("H.264"));
+        assert!(error.to_string().contains("declared codec"));
         assert!(!output.exists());
     }
 
@@ -7063,6 +7172,7 @@ done
             video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![
                 video_segment(0, left_first, 0, 30),
                 video_segment(1, left_second, 30, 60),
@@ -7138,6 +7248,7 @@ done
             video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![video_segment(left)],
             right_segments: vec![video_segment(right)],
             audio: Some(ManifestAudioTimeline {
@@ -7205,6 +7316,7 @@ done
             video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![video_segment(left)],
             right_segments: vec![video_segment(right)],
             audio: Some(ManifestAudioTimeline {

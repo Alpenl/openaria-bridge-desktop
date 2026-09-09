@@ -340,6 +340,7 @@ fn source_schema_str(schema: SourceSchema) -> &'static str {
     match schema {
         SourceSchema::DeviceSessionV1 => "device_session_v1",
         SourceSchema::DeviceSessionV2 => "device_session_v2",
+        SourceSchema::DeviceSessionV3 => "device_session_v3",
         SourceSchema::SignedPublicationV1 => "signed_publication_v1",
         SourceSchema::UnsignedPublicationV1 => "unsigned_publication_v1",
         SourceSchema::RawCaptureV2 => "raw_capture_v2",

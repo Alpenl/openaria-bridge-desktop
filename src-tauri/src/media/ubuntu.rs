@@ -2229,6 +2229,7 @@ fn map_source_schema(value: CoreSourceSchema) -> AppSourceSchema {
     match value {
         CoreSourceSchema::DeviceSessionV1 => AppSourceSchema::DeviceSessionV1,
         CoreSourceSchema::DeviceSessionV2 => AppSourceSchema::DeviceSessionV2,
+        CoreSourceSchema::DeviceSessionV3 => AppSourceSchema::DeviceSessionV3,
         CoreSourceSchema::RawCaptureV2 => AppSourceSchema::RawCaptureV2,
         CoreSourceSchema::LegacyMjpegSessionV5 => AppSourceSchema::LegacyMjpegSessionV5,
         CoreSourceSchema::CompleteUnpublishedV6 => AppSourceSchema::CompleteUnpublishedV6,
@@ -2242,6 +2243,7 @@ fn map_unsigned_schema(value: CoreSourceSchema) -> UnsignedSourceSchema {
     match value {
         CoreSourceSchema::DeviceSessionV1 => UnsignedSourceSchema::DeviceSessionV1,
         CoreSourceSchema::DeviceSessionV2 => UnsignedSourceSchema::DeviceSessionV2,
+        CoreSourceSchema::DeviceSessionV3 => UnsignedSourceSchema::DeviceSessionV3,
         CoreSourceSchema::RawCaptureV2 => UnsignedSourceSchema::RawCaptureV2,
         CoreSourceSchema::LegacyMjpegSessionV5 => UnsignedSourceSchema::LegacyMjpegSessionV5,
         CoreSourceSchema::CompleteUnpublishedV6 => UnsignedSourceSchema::CompleteUnpublishedV6,
