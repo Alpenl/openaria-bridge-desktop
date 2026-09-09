@@ -63,6 +63,7 @@ pub(crate) enum DetectionResult {
 enum DeviceSessionVersion {
     V1,
     V2,
+    V3,
 }
 
 impl DeviceSessionVersion {
@@ -70,6 +71,7 @@ impl DeviceSessionVersion {
         match self {
             Self::V1 => "ylx.device-session.v1",
             Self::V2 => "ylx.device-session.v2",
+            Self::V3 => "ylx.device-session.v3",
         }
     }
 
@@ -77,6 +79,7 @@ impl DeviceSessionVersion {
         match self {
             Self::V1 => SourceSchema::DeviceSessionV1,
             Self::V2 => SourceSchema::DeviceSessionV2,
+            Self::V3 => SourceSchema::DeviceSessionV3,
         }
     }
 
@@ -84,13 +87,14 @@ impl DeviceSessionVersion {
         match self {
             Self::V1 => "device_session_v1",
             Self::V2 => "device_session_v2",
+            Self::V3 => "device_session_v3",
         }
     }
 
     fn expected_imu_frame(self) -> &'static str {
         match self {
             Self::V1 => "opencv_optical",
-            Self::V2 => "raw_device_axes",
+            Self::V2 | Self::V3 => "raw_device_axes",
         }
     }
 }
@@ -180,6 +184,7 @@ impl DeviceSessionV1Detector {
         let version = match string_at(&strict_value, &["/schema"]) {
             Some("ylx.device-session.v1") => DeviceSessionVersion::V1,
             Some("ylx.device-session.v2") => DeviceSessionVersion::V2,
+            Some("ylx.device-session.v3") => DeviceSessionVersion::V3,
             Some(other) => {
                 return rejected(
                     CandidateReadiness::UnsupportedSchema,
@@ -320,7 +325,11 @@ impl DeviceSessionV1Detector {
                 split_frame_span = split_frame_start.zip(split_frame_end);
                 (
                     StereoLayout::SeparateEyes,
-                    SourceVideoCodec::H264,
+                    if video.codec == "hevc" {
+                        SourceVideoCodec::Hevc
+                    } else {
+                        SourceVideoCodec::H264
+                    },
                     Some(manifest.camera.eye_width),
                     Some(manifest.camera.height),
                     video.segments.len() as u32,
@@ -1975,6 +1984,7 @@ enum DeviceSessionAudio {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeviceSessionRecordedAudio {
+    capture_clock: Option<Box<crate::audio_clock::CaptureClock>>,
     requested_mode: String,
     resolved_mode: String,
     codec: String,
@@ -2024,6 +2034,8 @@ struct DeviceSessionAudioSegment {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SplitEyesVideo {
+    #[serde(default)]
+    encoding: Option<Value>,
     layout: String,
     codec: String,
     container: String,
@@ -2070,8 +2082,8 @@ fn parse_device_session_video(value: &Value) -> Result<DeviceVideoShape, String>
         Some("split-eyes") => {
             let video: SplitEyesVideo = serde_json::from_value(value.clone())
                 .map_err(|error| format!("split-eyes video shape is invalid: {error}"))?;
-            if video.codec != "h264" || video.container != "mp4" {
-                return Err("split-eyes video must declare h264/mp4".to_string());
+            if !matches!(video.codec.as_str(), "h264" | "hevc") || video.container != "mp4" {
+                return Err("split-eyes video must declare h264 or hevc in mp4".to_string());
             }
             Ok(DeviceVideoShape::SplitEyes(video))
         }
@@ -2093,7 +2105,23 @@ fn device_session_validator(version: DeviceSessionVersion) -> &'static jsonschem
     match version {
         DeviceSessionVersion::V1 => device_session_v1_validator(),
         DeviceSessionVersion::V2 => device_session_v2_validator(),
+        DeviceSessionVersion::V3 => device_session_v3_validator(),
     }
+}
+
+fn device_session_v3_validator() -> &'static jsonschema::Validator {
+    static VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
+    VALIDATOR.get_or_init(|| {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../../../contracts/schemas/ylx-device-session-v3.schema.json"
+        ))
+        .expect("v3 schema is JSON");
+        jsonschema::options()
+            .with_draft(Draft::Draft202012)
+            .should_validate_formats(true)
+            .build(&schema)
+            .expect("Device Session v3 schema compiles")
+    })
 }
 
 fn device_session_v1_validator() -> &'static jsonschema::Validator {
@@ -2112,8 +2140,12 @@ fn device_session_v1_validator() -> &'static jsonschema::Validator {
 fn device_session_v2_validator() -> &'static jsonschema::Validator {
     static VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
     VALIDATOR.get_or_init(|| {
-        let schema: Value =
+        let mut schema: Value =
             serde_json::from_str(DEVICE_SESSION_V2_SCHEMA_JSON).expect("vendored schema is JSON");
+        schema["$defs"]["recordedAudio"]["properties"]["capture_clock"] = serde_json::json!({
+            "type": "object", "required": ["schema"],
+            "properties": {"schema": {"const": "openaria.audio-clock.v1"}}
+        });
         jsonschema::options()
             .with_draft(Draft::Draft202012)
             .should_validate_formats(true)
@@ -2161,13 +2193,14 @@ fn validate_device_session_header(
         ));
     }
     match (version, manifest.audio.as_ref()) {
-        (DeviceSessionVersion::V1, None) | (DeviceSessionVersion::V2, Some(_)) => {}
+        (DeviceSessionVersion::V1, None)
+        | (DeviceSessionVersion::V2 | DeviceSessionVersion::V3, Some(_)) => {}
         (DeviceSessionVersion::V1, Some(_)) => {
             return Err(model_rejected(
                 "Device Session v1 must not carry v2 audio fields".to_string(),
             ))
         }
-        (DeviceSessionVersion::V2, None) => {
+        (DeviceSessionVersion::V2 | DeviceSessionVersion::V3, None) => {
             return Err(model_rejected(
                 "Device Session v2 must carry explicit audio state".to_string(),
             ))
@@ -2478,7 +2511,7 @@ fn append_device_session_audio_inventory(
 ) -> Result<(), DetectionResult> {
     match version {
         DeviceSessionVersion::V1 => Ok(()),
-        DeviceSessionVersion::V2 => {
+        DeviceSessionVersion::V2 | DeviceSessionVersion::V3 => {
             let Some(audio) = manifest.audio.as_ref() else {
                 return Err(model_rejected(
                     "Device Session v2 must carry explicit audio state".to_string(),
@@ -2603,25 +2636,22 @@ fn validate_recorded_audio(
             "Device Session v2 audio.sample_count does not equal segment sample sum",
         ));
     }
-    let first = audio.segments.first().expect("non-empty audio segments");
-    let last = audio.segments.last().expect("non-empty audio segments");
-    if (audio.sync.start_time_seconds - first.start_time_seconds).abs() > 1e-9
-        || (audio.sync.end_time_seconds - last.end_time_seconds).abs() > 1e-9
-    {
-        return Err(rejected(
-            CandidateReadiness::Corrupt,
-            ScanDiagnosticCode::ConflictingEvidence,
-            "Device Session v2 audio sync interval must equal segment coverage",
-        ));
-    }
-    let sync_duration = audio.sync.end_time_seconds - audio.sync.start_time_seconds;
-    let expected_sync_duration = audio.sample_count as f64 / audio.sample_rate as f64;
-    if (sync_duration - expected_sync_duration).abs() > duration_tolerance {
-        return Err(rejected(
-            CandidateReadiness::Corrupt,
-            ScanDiagnosticCode::ConflictingEvidence,
-            "Device Session v2 audio sync duration must match sample_count and sample_rate",
-        ));
+    if let Some(clock) = &audio.capture_clock {
+        clock
+            .validate(
+                audio.sample_rate,
+                audio.sample_count,
+                audio.sync.start_time_seconds,
+                audio.sync.end_time_seconds,
+                manifest.time.duration_seconds,
+            )
+            .map_err(|error| {
+                rejected(
+                    CandidateReadiness::Corrupt,
+                    ScanDiagnosticCode::ConflictingEvidence,
+                    &error,
+                )
+            })?;
     }
     if !(0.0 <= audio.sync.start_time_seconds
         && audio.sync.start_time_seconds < audio.sync.end_time_seconds
@@ -3036,7 +3066,7 @@ fn device_session_report(version: DeviceSessionVersion, manifest_sha256: &str) -
         DeviceSessionVersion::V1 => {
             "legacy raw_int16 opencv_optical IMU is physical-unverified source metadata, not calibrated SI"
         }
-        DeviceSessionVersion::V2 => {
+        DeviceSessionVersion::V2 | DeviceSessionVersion::V3 => {
             "raw_int16 raw_device_axes IMU is preserved as source metadata, not calibrated SI"
         }
     };

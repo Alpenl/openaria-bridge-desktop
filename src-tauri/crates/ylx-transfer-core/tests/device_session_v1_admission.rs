@@ -1064,7 +1064,7 @@ fn unknown_root_manifest_schema_fails_closed_even_when_legacy_marker_exists() {
     let directory = tempfile::tempdir().expect("tempdir");
     write_manifest(directory.path(), VideoFixture::SplitEyes, false);
     mutate_manifest(directory.path(), |manifest| {
-        manifest["schema"] = json!("ylx.device-session.v3");
+        manifest["schema"] = json!("ylx.device-session.v99");
     });
     fs::write(
         directory.path().join("capture.json"),
@@ -1429,4 +1429,55 @@ fn manifest_symlink_and_hardlink_fail_closed_before_parsing() {
     )
     .expect("manifest hardlink");
     expect_rejected(hardlink_case.path(), CandidateReadiness::UnsafePath);
+}
+
+#[test]
+fn device_session_v3_preserves_codec_and_exact_manifest_identity() {
+    for codec in ["h264", "hevc"] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(vendored_contract_path(
+                "fixtures/valid/ylx-device-session-v2.audio-not-recorded.json",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        manifest["schema"] = serde_json::json!("ylx.device-session.v3");
+        manifest["video"]["codec"] = serde_json::json!(codec);
+        manifest["video"]["encoding"] = serde_json::json!({
+            "schema":"openaria.recording-encoding.v1", "codec":codec,
+            "rate_control":"cbr", "bitrate_kbps":16384, "min_qp":18, "max_qp":32,
+            "intra_qp":20, "initial_qp":22, "gop_frames":30, "vbv_ms":3000,
+            "profile":if codec == "h264" { "high" } else { "main" },
+            "pixel_format":"yuv420p", "bit_depth":8, "b_frames":0
+        });
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        fs::write(directory.path().join("manifest.json"), &bytes).unwrap();
+        let ScanItemOutcome::Candidate { candidate } = detect(directory.path()) else {
+            panic!("v3 rejected");
+        };
+        assert_eq!(candidate.schema(), SourceSchema::DeviceSessionV3);
+        assert_eq!(
+            candidate.revision_claim(),
+            &revision_for_manifest_bytes(&bytes)
+        );
+        assert_eq!(
+            candidate.media_plan().codec(),
+            if codec == "hevc" {
+                ylx_transfer_core::ingest::SourceVideoCodec::Hevc
+            } else {
+                ylx_transfer_core::ingest::SourceVideoCodec::H264
+            }
+        );
+        manifest["video"]["encoding"]["codec"] = serde_json::json!("wrong");
+        fs::write(
+            directory.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(!matches!(
+            detect(directory.path()),
+            ScanItemOutcome::Candidate { .. }
+        ));
+    }
 }

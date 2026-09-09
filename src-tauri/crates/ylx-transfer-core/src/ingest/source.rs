@@ -27,6 +27,7 @@ pub enum SourceKind {
 pub enum SourceSchema {
     DeviceSessionV1,
     DeviceSessionV2,
+    DeviceSessionV3,
     SignedPublicationV1,
     /// A complete publication manifest that carries no detached signature.
     ///
@@ -162,6 +163,7 @@ pub enum StereoLayout {
 pub enum SourceVideoCodec {
     Mjpeg,
     H264,
+    Hevc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

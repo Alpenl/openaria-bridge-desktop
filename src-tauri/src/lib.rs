@@ -620,6 +620,7 @@ pub fn run() {
             commands::dismiss_upload_transfer,
             commands::cancel_upload,
             commands::reveal_library_file,
+            commands::export_library_video,
             commands::get_storage_config,
             commands::select_download_root,
             commands::save_download_root,

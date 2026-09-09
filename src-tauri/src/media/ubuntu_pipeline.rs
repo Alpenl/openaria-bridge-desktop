@@ -1464,7 +1464,9 @@ fn core_policy_for(
 fn profile_revision_for(source: &SourceRecording) -> Result<ProfileRevision, MediaPortError> {
     let profile = match source.media_plan().codec() {
         SourceVideoCodec::Mjpeg => NormalizationProfile::candidate_mjpeg_x265_slow_v1(),
-        SourceVideoCodec::H264 => NormalizationProfile::candidate_h264_x265_slow_v1(),
+        SourceVideoCodec::H264 | SourceVideoCodec::Hevc => {
+            NormalizationProfile::candidate_h264_x265_slow_v1()
+        }
     }
     .map_err(|error| {
         MediaPortError::new(

@@ -6,6 +6,7 @@
 //! `TransferStore` and the related journal/upload stores own durable transfer
 //! state, while the credential vault keeps raw secrets out of SQLite.
 
+pub mod audio_clock;
 pub mod credential_vault;
 pub mod device;
 pub mod domain;

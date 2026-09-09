@@ -1082,6 +1082,56 @@ impl TransferApplication {
         .await
     }
 
+    pub fn library_export_source(&self, key: &str, file_id: &str) -> Result<PathBuf, String> {
+        let (library_root, entry) = {
+            let data = self
+                .0
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let entry = data
+                .library
+                .iter()
+                .find(|entry| entry.key() == key)
+                .cloned()
+                .ok_or_else(|| "未找到该本地记录".to_string())?;
+            (data.composition.library_root(), entry)
+        };
+        let path = checked_library_file_path(&library_root, &entry, file_id)?;
+        if path.extension().is_none_or(|extension| extension != "mp4") {
+            return Err("请选择 MP4 成片导出".into());
+        }
+        Ok(path)
+    }
+
+    pub async fn export_library_video(
+        &self,
+        key: String,
+        file_id: String,
+        output: PathBuf,
+        options: ylx_transfer_adapters::session_export::MediaExportOptions,
+    ) -> Result<String, String> {
+        let application = self.clone();
+        run_blocking("另存成片", move || {
+            let source = application.library_export_source(&key, &file_id)?;
+            let parent = output
+                .parent()
+                .and_then(|path| std::fs::canonicalize(path).ok())
+                .ok_or_else(|| "导出目录不存在".to_string())?;
+            let root = std::fs::canonicalize(application.active_library_root())
+                .map_err(|error| error.to_string())?;
+            if parent.starts_with(root) {
+                return Err("请将另存成片放在本地库以外的目录".into());
+            }
+            let config = composition::ffmpeg_export_config()?;
+            ylx_transfer_adapters::session_export::FfmpegSessionExporter::new(config)
+                .export_playable_copy(&source, &output, &options)
+                .map_err(|error| error.to_string())?;
+            Ok(output.to_string_lossy().into_owned())
+        })
+        .await
+    }
+
     pub async fn download_session(
         &self,
         app: AppHandle,

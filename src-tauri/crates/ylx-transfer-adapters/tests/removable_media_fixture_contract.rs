@@ -277,6 +277,7 @@ fn schema_classification(schema: SourceSchema) -> &'static str {
     match schema {
         SourceSchema::DeviceSessionV1 => "DeviceSessionV1",
         SourceSchema::DeviceSessionV2 => "DeviceSessionV2",
+        SourceSchema::DeviceSessionV3 => "DeviceSessionV3",
         SourceSchema::SignedPublicationV1 => "TrustedPublished",
         SourceSchema::UnsignedPublicationV1 => "UnsignedPublicationV1",
         SourceSchema::RawCaptureV2 => "SdkRawCapture",

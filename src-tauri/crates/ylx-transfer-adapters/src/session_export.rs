@@ -34,6 +34,23 @@ const FFPROBE_STDOUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_TIMELINE_DENOMINATOR: u64 = 1_000_000_000;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportVideoCodec {
+    #[default]
+    H264,
+    Hevc,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MediaExportOptions {
+    #[serde(default)]
+    pub video_codec: ExportVideoCodec,
+    #[serde(default)]
+    pub audio_delay_ms: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionExportConfig {
     ffmpeg_path: PathBuf,
@@ -209,7 +226,7 @@ impl TimelineTime {
         self.denominator
     }
 
-    fn checked_add(self, other: Self) -> Result<Self, SessionExportError> {
+    pub fn checked_add(self, other: Self) -> Result<Self, SessionExportError> {
         let denominator = u128::from(self.denominator) * u128::from(other.denominator);
         let left = i128::from(self.numerator)
             .checked_mul(i128::from(other.denominator))
@@ -230,7 +247,7 @@ impl TimelineTime {
                 "timeline numerator overflowed while adding values".to_string(),
             )
         })?;
-        Self::from_wide_ratio(numerator, denominator)
+        Self::from_mixed_clock_ratio(numerator, denominator)
     }
 
     fn checked_sub(self, other: Self) -> Result<Self, SessionExportError> {
@@ -254,7 +271,38 @@ impl TimelineTime {
                 "timeline numerator overflowed while subtracting values".to_string(),
             )
         })?;
-        Self::from_wide_ratio(numerator, denominator)
+        Self::from_mixed_clock_ratio(numerator, denominator)
+    }
+
+    fn from_mixed_clock_ratio(
+        numerator: i128,
+        denominator: u128,
+    ) -> Result<Self, SessionExportError> {
+        let divisor = greatest_common_divisor(numerator.unsigned_abs(), denominator);
+        if denominator / divisor <= u128::from(MAX_TIMELINE_DENOMINATOR) {
+            return Self::from_wide_ratio(numerator, denominator);
+        }
+        // Independent audio/video clocks can have a very large common
+        // denominator. Round their sum/difference once to the nanosecond grid.
+        let denominator = i128::try_from(denominator).map_err(|_| {
+            SessionExportError::InvalidTimeline("mixed clock denominator overflow".into())
+        })?;
+        let scaled = numerator.checked_mul(1_000_000_000).ok_or_else(|| {
+            SessionExportError::InvalidTimeline("mixed clock numerator overflow".into())
+        })?;
+        let rounded = scaled
+            .checked_add(if scaled >= 0 {
+                denominator / 2
+            } else {
+                -denominator / 2
+            })
+            .ok_or_else(|| {
+                SessionExportError::InvalidTimeline("mixed clock rounding overflow".into())
+            })?
+            / denominator;
+        Self::from_nanoseconds(i64::try_from(rounded).map_err(|_| {
+            SessionExportError::InvalidTimeline("mixed clock nanoseconds overflow".into())
+        })?)
     }
 
     fn checked_mul_integer(self, value: i64) -> Result<Self, SessionExportError> {
@@ -262,7 +310,7 @@ impl TimelineTime {
         Self::from_wide_ratio(numerator, u128::from(self.denominator))
     }
 
-    fn checked_mul_u64(self, value: u64) -> Result<Self, SessionExportError> {
+    pub fn checked_mul_u64(self, value: u64) -> Result<Self, SessionExportError> {
         let numerator = i128::from(self.numerator)
             .checked_mul(i128::from(value))
             .ok_or_else(|| {
@@ -273,6 +321,7 @@ impl TimelineTime {
         Self::from_wide_ratio(numerator, u128::from(self.denominator))
     }
 
+    #[cfg(test)]
     fn checked_div_u64(self, value: u64) -> Result<Self, SessionExportError> {
         if value == 0 {
             return Err(SessionExportError::InvalidTimeline(
@@ -289,7 +338,7 @@ impl TimelineTime {
         Self::from_wide_ratio(i128::from(self.numerator), denominator)
     }
 
-    fn rounded_nanoseconds(self) -> Result<i64, SessionExportError> {
+    pub fn rounded_nanoseconds(self) -> Result<i64, SessionExportError> {
         let scaled = i128::from(self.numerator) * 1_000_000_000_i128;
         let denominator = i128::from(self.denominator);
         let rounded = if scaled >= 0 {
@@ -377,6 +426,8 @@ pub struct TimedAudioSegment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestAudioTimeline {
     pub sample_rate_hz: u32,
+    /// Measured host-clock seconds per PCM frame, when backed by capture evidence.
+    pub sample_tick: Option<TimelineTime>,
     pub channels: u32,
     pub sample_count: u64,
     /// Audio start on the common session clock.
@@ -391,8 +442,11 @@ pub struct ManifestSessionTimeline {
     pub source_manifest_sha256: String,
     pub clock: SessionTimelineClock,
     pub video_tick: TimelineTime,
+    /// Absolute session-clock presentation timestamps, rounded to microseconds.
+    pub video_frame_pts_us: Vec<u64>,
     pub eye_width: u32,
     pub eye_height: u32,
+    pub source_video_codec: SourceVideoCodec,
     pub left_segments: Vec<TimedVideoSegment>,
     pub right_segments: Vec<TimedVideoSegment>,
     pub audio: Option<ManifestAudioTimeline>,
@@ -428,6 +482,7 @@ pub struct SessionExportPlan {
     video: SessionExportVideoInput,
     audio_segments: Vec<PathBuf>,
     timing: Option<SessionExportTimingPlan>,
+    options: MediaExportOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -532,6 +587,7 @@ impl SessionExportPlan {
             video,
             audio_segments,
             timing: None,
+            options: MediaExportOptions::default(),
         })
     }
 
@@ -576,7 +632,45 @@ impl SessionExportPlan {
             video,
             audio_segments,
             timing: Some(timing),
+            options: MediaExportOptions::default(),
         })
+    }
+
+    pub fn with_options(mut self, options: MediaExportOptions) -> Result<Self, SessionExportError> {
+        if !(-1000..=1000).contains(&options.audio_delay_ms) {
+            return Err(SessionExportError::InvalidRequest(
+                "audio delay must be within +/-1000 ms".into(),
+            ));
+        }
+        if options.audio_delay_ms != self.options.audio_delay_ms {
+            let timing = self.timing.as_mut().ok_or_else(|| {
+                SessionExportError::InvalidRequest(
+                    "audio calibration requires a verified manifest timeline".into(),
+                )
+            })?;
+            let start = timing.audio_start.ok_or_else(|| {
+                SessionExportError::InvalidRequest(
+                    "audio calibration requires recorded audio".into(),
+                )
+            })?;
+            let delta = TimelineTime::new(
+                i64::from(options.audio_delay_ms) - i64::from(self.options.audio_delay_ms),
+                1000,
+            )?;
+            let shifted = start.checked_add(delta)?;
+            if shifted < TimelineTime::zero() {
+                return Err(SessionExportError::InvalidRequest(
+                    "audio calibration precedes the session origin".into(),
+                ));
+            }
+            timing.audio_start = Some(shifted);
+            timing.audio_end = timing
+                .audio_end
+                .map(|end| end.checked_add(delta))
+                .transpose()?;
+        }
+        self.options = options;
+        Ok(self)
     }
 
     #[must_use]
@@ -673,6 +767,20 @@ fn validate_manifest_timeline(
     if left != right {
         return Err(SessionExportError::InvalidTimeline(
             "left/right aggregate frame and time coverage differs".to_string(),
+        ));
+    }
+
+    if !manifest.video_frame_pts_us.is_empty()
+        && (manifest.video_frame_pts_us.len() as u64 != left.frames
+            || i128::from(manifest.video_frame_pts_us[0])
+                != (i128::from(left.start.rounded_nanoseconds()?) + 500) / 1000
+            || manifest
+                .video_frame_pts_us
+                .windows(2)
+                .any(|pair| pair[1] <= pair[0]))
+    {
+        return Err(SessionExportError::InvalidTimeline(
+            "video frame presentation clock is incomplete or not increasing".to_string(),
         ));
     }
 
@@ -957,8 +1065,28 @@ fn validate_audio_timeline(
     }
 
     let one_nanosecond = TimelineTime::from_nanoseconds(1)?;
+    let sample_tick = audio
+        .sample_tick
+        .unwrap_or(TimelineTime::from_samples(1, audio.sample_rate_hz)?);
+    let measured_rate = sample_tick.denominator() as f64 / sample_tick.numerator() as f64;
+    if sample_tick <= TimelineTime::zero()
+        || (measured_rate / f64::from(audio.sample_rate_hz) - 1.0).abs() > 0.01
+    {
+        return Err(SessionExportError::InvalidTimeline(
+            "invalid measured audio sample clock".to_string(),
+        ));
+    }
     let mut previous_end_sample = 0_u64;
     let mut previous_end_time = None;
+    let sample_position = |sample| -> Result<TimelineTime, SessionExportError> {
+        let delta = sample_tick.checked_mul_u64(sample)?;
+        let delta = if audio.sample_tick.is_some() {
+            TimelineTime::from_nanoseconds(delta.rounded_nanoseconds()?)?
+        } else {
+            delta
+        };
+        audio.session_start_offset.checked_add(delta)
+    };
     for (position, segment) in audio.segments.iter().enumerate() {
         if usize::try_from(segment.index).ok() != Some(position) {
             return Err(SessionExportError::InvalidTimeline(format!(
@@ -979,18 +1107,8 @@ fn validate_audio_timeline(
                 "audio time coverage is not contiguous at segment {position}"
             )));
         }
-        let expected_start = audio
-            .session_start_offset
-            .checked_add(TimelineTime::from_samples(
-                segment.start_sample,
-                audio.sample_rate_hz,
-            )?)?;
-        let expected_end = audio
-            .session_start_offset
-            .checked_add(TimelineTime::from_samples(
-                segment.end_sample,
-                audio.sample_rate_hz,
-            )?)?;
+        let expected_start = sample_position(segment.start_sample)?;
+        let expected_end = sample_position(segment.end_sample)?;
         if timeline_abs_difference(segment.start_time, expected_start)? > one_nanosecond
             || timeline_abs_difference(segment.end_time, expected_end)? > one_nanosecond
         {
@@ -1143,6 +1261,7 @@ struct OutputStreamProbe {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OutputVideoFrameTimelineProbe {
     frame_count: u64,
+    timestamp_sha256: String,
     inferred_tick: TimelineTime,
     timestamp_tolerance_ns: u64,
     max_timestamp_residual_ns: i64,
@@ -1286,6 +1405,7 @@ impl OutputMediaProbe {
         let frame_report_sha256 = sha256_bytes(b"uniform-test-video-frame-evidence");
         self.video_frame_timeline = Some(OutputVideoFrameTimelineProbe {
             frame_count,
+            timestamp_sha256: String::new(),
             inferred_tick,
             timestamp_tolerance_ns: video.time_base.ceil_nanoseconds()?.div_ceil(2),
             max_timestamp_residual_ns: 0,
@@ -1385,12 +1505,20 @@ fn read_video_frame_timeline_probe(
             "ffprobe reported a zero video frame count".to_string(),
         ));
     }
-    let inferred_tick = stream_end
-        .checked_sub(stream_start)?
-        .checked_div_u64(expected_frame_count)?;
+    let stream_duration = stream_end.checked_sub(stream_start)?;
+    let interpolation_denominator =
+        u128::from(stream_duration.denominator) * u128::from(expected_frame_count);
+    // A measured microsecond duration divided by an arbitrary frame count can
+    // exceed the bounded timeline denominator. Quantize diagnostic estimates
+    // once to nanoseconds; the actual per-frame timestamp digest stays exact.
+    let inferred_tick = TimelineTime::from_mixed_clock_ratio(
+        i128::from(stream_duration.numerator),
+        interpolation_denominator,
+    )?;
     let timestamp_tolerance_ns = time_base.ceil_nanoseconds()?.div_ceil(2);
     let mut reader = BufReader::new(reader);
     let mut report_hasher = Sha256::new();
+    let mut timestamp_hasher = Sha256::new();
     let mut line = Vec::with_capacity(32);
     let mut frame_count = 0_u64;
     let mut max_timestamp_residual_ns = 0_i64;
@@ -1458,7 +1586,13 @@ fn read_video_frame_timeline_probe(
             ))
         })?;
         let actual = time_base.checked_mul_integer(ticks)?;
-        let expected = stream_start.checked_add(inferred_tick.checked_mul_u64(frame_count)?)?;
+        let relative = actual.checked_sub(stream_start)?;
+        let micros = ((i128::from(relative.rounded_nanoseconds()?) + 500) / 1000) as i64;
+        timestamp_hasher.update(micros.to_le_bytes());
+        let expected = stream_start.checked_add(TimelineTime::from_mixed_clock_ratio(
+            i128::from(stream_duration.numerator) * i128::from(frame_count),
+            interpolation_denominator,
+        )?)?;
         let residual = timeline_residual_ns(actual, expected)?;
         if residual.unsigned_abs() > max_timestamp_residual_ns.unsigned_abs() {
             max_timestamp_residual_ns = residual;
@@ -1472,6 +1606,7 @@ fn read_video_frame_timeline_probe(
     }
     Ok(OutputVideoFrameTimelineProbe {
         frame_count,
+        timestamp_sha256: format!("{:x}", timestamp_hasher.finalize()),
         inferred_tick,
         timestamp_tolerance_ns,
         max_timestamp_residual_ns,
@@ -1637,10 +1772,15 @@ pub fn verify_session_export_output(
     }
 
     let video = &probe.video_streams[0];
-    if video.codec_name != "h264" {
-        return Err(SessionExportError::OutputVerificationFailed(
-            "derived output video stream is not a non-empty H.264 stream".to_string(),
-        ));
+    let expected_codec = if plan.options.video_codec == ExportVideoCodec::Hevc {
+        "hevc"
+    } else {
+        "h264"
+    };
+    if video.codec_name != expected_codec {
+        return Err(SessionExportError::OutputVerificationFailed(format!(
+            "derived output video stream is not the requested {expected_codec} stream"
+        )));
     }
     let video_width = video.width.filter(|width| *width > 0).ok_or_else(|| {
         SessionExportError::OutputVerificationFailed(
@@ -1681,11 +1821,18 @@ pub fn verify_session_export_output(
     let source_video_tick_ns = timing.video_tick().ceil_nanoseconds()?;
     let video_start_residual_ns = timeline_residual_ns(video.start, timing.video_start)?;
     let video_end_residual_ns = timeline_residual_ns(video.end, timing.video_end)?;
-    if video_start_residual_ns.unsigned_abs() > source_video_tick_ns
-        || video_end_residual_ns.unsigned_abs() > source_video_tick_ns
+    let video_boundary_ns = if timing.manifest.video_frame_pts_us.is_empty() {
+        source_video_tick_ns
+    } else {
+        // Legacy MP4 muxers quantize the edit-list origin to milliseconds.
+        // Relative frame PTS are still checked individually at microsecond precision.
+        1_000_000
+    };
+    if video_start_residual_ns.unsigned_abs() > video_boundary_ns
+        || video_end_residual_ns.unsigned_abs() > video_boundary_ns
     {
         return Err(SessionExportError::OutputVerificationFailed(format!(
-            "derived video timing residual exceeds one source video tick ({source_video_tick_ns} ns)"
+            "derived video timing residual exceeds the allowed boundary ({video_boundary_ns} ns)"
         )));
     }
     let frame_timeline = probe.video_frame_timeline.as_ref().ok_or_else(|| {
@@ -1699,42 +1846,56 @@ pub fn verify_session_export_output(
             frame_timeline.frame_count
         )));
     }
-    if frame_timeline.max_timestamp_residual_ns.unsigned_abs()
-        > frame_timeline.timestamp_tolerance_ns
-    {
-        return Err(SessionExportError::OutputVerificationFailed(format!(
+    if !timing.manifest.video_frame_pts_us.is_empty() {
+        let mut hasher = Sha256::new();
+        let first = timing.manifest.video_frame_pts_us[0];
+        for pts in &timing.manifest.video_frame_pts_us {
+            hasher.update((pts - first).to_le_bytes());
+        }
+        if frame_timeline.timestamp_sha256 != format!("{:x}", hasher.finalize()) {
+            return Err(SessionExportError::OutputVerificationFailed(
+                "derived output frame timestamps differ from the capture clock".to_string(),
+            ));
+        }
+    } else {
+        if frame_timeline.max_timestamp_residual_ns.unsigned_abs()
+            > frame_timeline.timestamp_tolerance_ns
+        {
+            return Err(SessionExportError::OutputVerificationFailed(format!(
             "derived output frame timestamp {} has residual {} ns from its stream clock; allowed {} ns",
             frame_timeline.max_timestamp_residual_frame,
             frame_timeline.max_timestamp_residual_ns,
             frame_timeline.timestamp_tolerance_ns
         )));
-    }
-    let observed_timestamp_uncertainty = frame_timeline.max_timestamp_residual_ns.unsigned_abs();
-    // The streaming reader compared every raw PTS with the stream's arithmetic
-    // clock and retained its worst error. Combining that bound with each
-    // stream-clock/manifest-clock residual proves every frame without storing
-    // an attacker-controlled number of timestamps in memory.
-    for frame_index in 0..timing.paired_frames {
-        let output_clock_timestamp = video
-            .start
-            .checked_add(frame_timeline.inferred_tick.checked_mul_u64(frame_index)?)?;
-        let manifest_timestamp = timing
-            .video_start
-            .checked_add(timing.video_tick().checked_mul_u64(frame_index)?)?;
-        let clock_residual =
-            timeline_residual_ns(output_clock_timestamp, manifest_timestamp)?.unsigned_abs();
-        let proven_residual = clock_residual
-            .checked_add(observed_timestamp_uncertainty)
-            .ok_or_else(|| {
-                SessionExportError::OutputVerificationFailed(
-                    "derived output frame timestamp residual overflowed".to_string(),
-                )
-            })?;
-        if proven_residual > frame_timeline.timestamp_tolerance_ns {
-            return Err(SessionExportError::OutputVerificationFailed(format!(
+        }
+        let observed_timestamp_uncertainty =
+            frame_timeline.max_timestamp_residual_ns.unsigned_abs();
+        // The streaming reader compared every raw PTS with the stream's arithmetic
+        // clock and retained its worst error. Combining that bound with each
+        // stream-clock/manifest-clock residual proves every frame without storing
+        // an attacker-controlled number of timestamps in memory.
+        for frame_index in 0..timing.paired_frames {
+            let output_clock_timestamp = video
+                .start
+                .checked_add(frame_timeline.inferred_tick.checked_mul_u64(frame_index)?)?;
+            let manifest_timestamp = timing
+                .video_start
+                .checked_add(timing.video_tick().checked_mul_u64(frame_index)?)?;
+            let clock_residual =
+                timeline_residual_ns(output_clock_timestamp, manifest_timestamp)?.unsigned_abs();
+            let proven_residual = clock_residual
+                .checked_add(observed_timestamp_uncertainty)
+                .ok_or_else(|| {
+                    SessionExportError::OutputVerificationFailed(
+                        "derived output frame timestamp residual overflowed".to_string(),
+                    )
+                })?;
+            if proven_residual > frame_timeline.timestamp_tolerance_ns {
+                return Err(SessionExportError::OutputVerificationFailed(format!(
                 "derived output frame timestamp {frame_index} differs from the manifest clock by at least {proven_residual} ns; allowed {} ns",
                 frame_timeline.timestamp_tolerance_ns
             )));
+            }
         }
     }
 
@@ -2256,6 +2417,7 @@ impl FfmpegSessionExporter {
             video,
             audio_segments,
             timing: None,
+            options: MediaExportOptions::default(),
         })
     }
 
@@ -2265,6 +2427,220 @@ impl FfmpegSessionExporter {
     ) -> Result<SessionExportReceipt, SessionExportError> {
         let plan = self.build_plan(request)?;
         self.export_plan(&plan)
+    }
+
+    /// Export an already synchronized movie. Matching H.264/HEVC is copied;
+    /// an audio adjustment only remuxes matching video. AAC
+    /// packets retain their content and only receive the explicit time shift.
+    pub fn export_playable_copy(
+        &self,
+        source: &Path,
+        output: &Path,
+        options: &MediaExportOptions,
+    ) -> Result<(), SessionExportError> {
+        if !(-1000..=1000).contains(&options.audio_delay_ms) {
+            return Err(SessionExportError::InvalidRequest(
+                "audio delay must be within +/-1000 ms".into(),
+            ));
+        }
+        let output = validate_output_path(output, true)?;
+        if fs::canonicalize(source).ok() == fs::canonicalize(&output).ok() && output.exists() {
+            return Err(SessionExportError::InvalidRequest(
+                "export cannot replace its source".into(),
+            ));
+        }
+        let original_hash = sha256_file(source)?;
+        let original = self.probe_output(source)?;
+        if original.video_streams.len() != 1 || original.audio_streams.len() > 1 {
+            return Err(SessionExportError::InvalidRequest(
+                "export requires one video and at most one audio stream".into(),
+            ));
+        }
+        if options.audio_delay_ms != 0 && original.audio_streams.is_empty() {
+            return Err(SessionExportError::InvalidRequest(
+                "audio calibration requires recorded audio".into(),
+            ));
+        }
+        let staging = TempExportDir::create_for(&output)?;
+        let staged = staging.path().join("output.mp4");
+        let video = &original.video_streams[0];
+        let expected_codec = if options.video_codec == ExportVideoCodec::Hevc {
+            "hevc"
+        } else {
+            "h264"
+        };
+        if options.audio_delay_ms == 0 && video.codec_name == expected_codec {
+            fs::copy(source, &staged).map_err(|error| SessionExportError::Io {
+                context: "copy verified library movie",
+                path: staged.clone(),
+                source: error,
+            })?;
+            if sha256_file(&staged)? != original_hash || sha256_file(source)? != original_hash {
+                return Err(SessionExportError::OutputVerificationFailed(
+                    "source changed during copy".into(),
+                ));
+            }
+            return replace_with_staged_output(&staged, &output);
+        }
+        let mut args = vec![
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-nostats".into(),
+            "-nostdin".into(),
+            "-y".into(),
+            "-copyts".into(),
+            "-i".into(),
+            source.to_string_lossy().into_owned(),
+        ];
+        if !original.audio_streams.is_empty() {
+            args.extend([
+                "-itsoffset".into(),
+                format!("{:.3}", f64::from(options.audio_delay_ms) / 1000.0),
+                "-i".into(),
+                source.to_string_lossy().into_owned(),
+            ]);
+        }
+        args.extend(["-map".into(), "0:v:0".into()]);
+        if !original.audio_streams.is_empty() {
+            args.extend(["-map".into(), "1:a:0".into(), "-c:a".into(), "copy".into()]);
+        }
+        if video.codec_name == expected_codec {
+            args.extend(["-c:v".into(), "copy".into()]);
+        } else {
+            append_video_output_args(&mut args, options.video_codec);
+            let duration = video.end.checked_sub(video.start)?;
+            let rate = video.frame_count.unwrap_or(0) as f64 * duration.denominator() as f64
+                / duration.numerator() as f64;
+            let fps = TimelineTime::new((rate * 1_000_000.0).round() as i64, 1_000_000)?;
+            args.extend([
+                "-vsync".into(),
+                "0".into(),
+                "-enc_time_base:v".into(),
+                "1:1000000".into(),
+                "-bf".into(),
+                "0".into(),
+            ]);
+            if options.video_codec == ExportVideoCodec::Hevc {
+                args.extend([
+                    "-x265-params".into(),
+                    format!(
+                        "fps={}/{}:pools=4:frame-threads=2:log-level=error",
+                        fps.numerator(),
+                        fps.denominator()
+                    ),
+                ]);
+            }
+        }
+        // MP4 edit lists otherwise use millisecond ticks and round AAC shifts.
+        // The bundled FFmpeg supports microsecond movie ticks; retain bounded
+        // millisecond compatibility for older system tools.
+        let mut help = Command::new(self.config.ffmpeg_path());
+        help.args(["-hide_banner", "-h", "muxer=mp4"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = std::time::Instant::now();
+        let capability = run_bounded_command(
+            &mut help,
+            "ffmpeg",
+            self.config.ffmpeg_path(),
+            PROCESS_STDERR_LIMIT_BYTES,
+            PROCESS_STDERR_LIMIT_BYTES,
+            &|| started.elapsed() > Duration::from_secs(5),
+        )?;
+        if String::from_utf8_lossy(&capability.stdout)
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("-movie_timescale"))
+        {
+            args.extend(["-movie_timescale".into(), "1000000".into()]);
+        }
+        args.extend(["-video_track_timescale".into(), "1000000".into(), "-avoid_negative_ts".into(), "disabled".into(),
+            "-metadata".into(), format!("comment={}", serde_json::json!({"schema":"openaria.playable-export.v1", "source_sha256":original_hash, "options":options})),
+            "-movflags".into(), "+faststart".into(), staged.to_string_lossy().into_owned()]);
+        let mut command = Command::new(self.config.ffmpeg_path());
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let result = run_bounded_command(
+            &mut command,
+            "ffmpeg",
+            self.config.ffmpeg_path(),
+            0,
+            PROCESS_STDERR_LIMIT_BYTES,
+            &|| false,
+        )?;
+        if !result.status.success() {
+            return Err(SessionExportError::FfmpegFailed {
+                status: result.status.to_string(),
+                stderr: stderr_preview(&result.stderr),
+            });
+        }
+        let exported = self.probe_output(&staged)?;
+        let expected_codec = if options.video_codec == ExportVideoCodec::Hevc {
+            "hevc"
+        } else {
+            "h264"
+        };
+        if exported.video_streams.len() != 1
+            || exported.audio_streams.len() != original.audio_streams.len()
+            || exported.video_streams[0].codec_name != expected_codec
+            || exported.video_streams[0].width != video.width
+            || exported.video_streams[0].height != video.height
+            || original
+                .video_frame_timeline
+                .as_ref()
+                .map(|v| (&v.timestamp_sha256, v.frame_count))
+                != exported
+                    .video_frame_timeline
+                    .as_ref()
+                    .map(|v| (&v.timestamp_sha256, v.frame_count))
+            || timeline_residual_ns(exported.video_streams[0].start, video.start)?.unsigned_abs()
+                > 1_000_000
+        {
+            return Err(SessionExportError::OutputVerificationFailed(
+                "export changed the video frame clock or stream layout".into(),
+            ));
+        }
+        if let Some(audio) = original.audio_streams.first() {
+            let delta = TimelineTime::new(i64::from(options.audio_delay_ms), 1000)?;
+            let expected_start = audio.start.checked_add(delta)?.max(TimelineTime::zero());
+            let actual = &exported.audio_streams[0];
+            // Remuxing retains complete AAC packets. The last packet may expose
+            // padding formerly shortened by the source container duration.
+            let tail_tolerance = 1_000_000
+                + 1_024_000_000_000_u64 / u64::from(audio.sample_rate_hz.unwrap_or(48_000));
+            // A positive shift can expose the encoder's formerly negative
+            // AAC preroll packet. It precedes the requested audible start by
+            // one packet; it does not shift the recorded waveform earlier.
+            let start_residual = timeline_residual_ns(actual.start, expected_start)?;
+            let leading_tolerance = if audio.codec_name == "aac" && options.audio_delay_ms > 0 {
+                tail_tolerance
+            } else {
+                1_000_000
+            };
+            if actual.codec_name != audio.codec_name
+                || actual.sample_rate_hz != audio.sample_rate_hz
+                || actual.channels != audio.channels
+                || start_residual > 1_000_000
+                || start_residual < -(leading_tolerance as i64)
+                || timeline_residual_ns(actual.end, audio.end.checked_add(delta)?)?.unsigned_abs()
+                    > tail_tolerance
+            {
+                return Err(SessionExportError::OutputVerificationFailed(
+                    format!("export changed audio beyond the requested calibration: actual {}..{}, expected {}..{}",
+                        actual.start.ffmpeg_seconds()?, actual.end.ffmpeg_seconds()?, expected_start.ffmpeg_seconds()?, audio.end.checked_add(delta)?.ffmpeg_seconds()?),
+                ));
+            }
+        }
+        if sha256_file(source)? != original_hash {
+            return Err(SessionExportError::OutputVerificationFailed(
+                "source changed during export".into(),
+            ));
+        }
+        replace_with_staged_output(&staged, &output)
     }
 
     pub fn probe_output(&self, path: &Path) -> Result<OutputMediaProbe, SessionExportError> {
@@ -2453,6 +2829,7 @@ impl FfmpegSessionExporter {
                     position,
                     timing.manifest().eye_width,
                     timing.manifest().eye_height,
+                    timing.manifest().source_video_codec,
                     is_cancelled,
                 )?;
                 if actual != expected {
@@ -2581,6 +2958,7 @@ impl FfmpegSessionExporter {
         position: usize,
         expected_width: u32,
         expected_height: u32,
+        expected_codec: SourceVideoCodec,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Result<u64, SessionExportError> {
         let mut command = Command::new(self.config.ffprobe_path());
@@ -2621,6 +2999,7 @@ impl FfmpegSessionExporter {
             position,
             expected_width,
             expected_height,
+            expected_codec,
         )
     }
 
@@ -2652,7 +3031,46 @@ impl FfmpegSessionExporter {
         let staged_output_path = staging.path().join("output.mp4");
         let mut run_plan = plan.clone();
         run_plan.output_path = staged_output_path.clone();
-        let args = build_ffmpeg_args(&run_plan, staging.path())?;
+        let mut args = build_ffmpeg_args(&run_plan, staging.path())?;
+        if let Some(timing) = run_plan
+            .timing()
+            .filter(|timing| !timing.manifest.video_frame_pts_us.is_empty())
+        {
+            let mut help = Command::new(self.config.ffmpeg_path());
+            help.args(["-hide_banner", "-h", "bsf=setts"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let started = std::time::Instant::now();
+            let capability = run_bounded_command(
+                &mut help,
+                "ffmpeg",
+                self.config.ffmpeg_path(),
+                PROCESS_STDERR_LIMIT_BYTES,
+                PROCESS_STDERR_LIMIT_BYTES,
+                &|| is_cancelled() || started.elapsed() > Duration::from_secs(5),
+            )?;
+            let help_text = String::from_utf8_lossy(&capability.stdout);
+            let has_duration = help_text
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some("-duration"));
+            if !has_duration {
+                // Older FFmpeg accepts an output rate hint with passthrough PTS;
+                // newer versions require the explicit packet-duration filter.
+                let index = args
+                    .iter()
+                    .position(|arg| arg == "-bsf:v")
+                    .expect("VFR duration filter");
+                let tick = timing.video_tick();
+                args[index] = "-r".to_string();
+                args[index + 1] = format!("{}/{}", tick.denominator(), tick.numerator());
+                let index = args
+                    .iter()
+                    .position(|arg| arg == "-movie_timescale")
+                    .expect("VFR movie timescale");
+                args.drain(index..index + 2);
+            }
+        }
 
         let mut command = Command::new(self.config.ffmpeg_path());
         command
@@ -2743,6 +3161,7 @@ fn parse_source_video_segment_probe(
     position: usize,
     expected_width: u32,
     expected_height: u32,
+    expected_codec: SourceVideoCodec,
 ) -> Result<u64, SessionExportError> {
     let report: Value = serde_json::from_slice(bytes).map_err(|error| {
         SessionExportError::OutputVerificationFailed(format!(
@@ -2775,16 +3194,21 @@ fn parse_source_video_segment_probe(
         })?;
     if streams.len() != 1 {
         return Err(SessionExportError::OutputVerificationFailed(format!(
-            "{eye}-eye segment {position} must contain exactly one H.264 video stream and no other streams; found {} streams",
+            "{eye}-eye segment {position} must contain exactly one video stream matching the declared codec and no other streams; found {} streams",
             streams.len()
         )));
     }
     let stream = &streams[0];
     if required_probe_string(stream, "codec_type")? != "video"
-        || required_probe_string(stream, "codec_name")? != "h264"
+        || required_probe_string(stream, "codec_name")?
+            != match expected_codec {
+                SourceVideoCodec::H264 => "h264",
+                SourceVideoCodec::Hevc => "hevc",
+                SourceVideoCodec::Mjpeg => "mjpeg",
+            }
     {
         return Err(SessionExportError::OutputVerificationFailed(format!(
-            "{eye}-eye segment {position} must contain exactly one H.264 video stream"
+            "{eye}-eye segment {position} must contain exactly one video stream matching the declared codec"
         )));
     }
     let width = optional_probe_u64(stream, "width")?
@@ -3640,7 +4064,7 @@ fn build_ffmpeg_args(
             } else {
                 args.push("-an".to_string());
             }
-            append_h264_video_output_args(&mut args);
+            append_video_output_args(&mut args, plan.options.video_codec);
         }
         SessionExportVideoInput::SideBySide {
             segments,
@@ -3657,10 +4081,10 @@ fn build_ffmpeg_args(
             } else {
                 args.push("-an".to_string());
             }
-            if *copy_video {
+            if *copy_video && plan.options.video_codec == ExportVideoCodec::H264 {
                 args.extend(["-c:v".to_string(), "copy".to_string()]);
             } else {
-                append_h264_video_output_args(&mut args);
+                append_video_output_args(&mut args, plan.options.video_codec);
             }
         }
     }
@@ -3723,36 +4147,106 @@ fn build_timeline_ffmpeg_args(
         video_tick.denominator()
     );
     let mut filter = format!(
-        "[0:v:0]setpts={video_clock}[l];\
-         [1:v:0]setpts={video_clock}[r];\
-         [l][r]hstack=inputs=2:shortest=1[v]"
+        "[0:v:0]settb=AVTB,setpts={video_clock}[l];\
+         [1:v:0]settb=AVTB,setpts={video_clock}[r];\
+         [l][r]hstack=inputs=2:shortest=1"
     );
+    let frame_pts = &manifest.video_frame_pts_us;
+    if frame_pts.is_empty() {
+        filter.push_str("[v]");
+    } else {
+        filter.push_str(&format!(
+            "[stacked];[stacked]settb=AVTB,setpts='{}'[v]",
+            frame_pts_expression(frame_pts, 0),
+        ));
+    }
     if let Some(audio_start) = timing.audio_start_offset() {
+        let audio = timing
+            .manifest
+            .audio
+            .as_ref()
+            .expect("audio timing has a source");
+        let actual_rate = audio
+            .sample_tick
+            .map_or(f64::from(audio.sample_rate_hz), |tick| {
+                tick.denominator() as f64 / tick.numerator() as f64
+            });
+        let resampling = sample_clock_filter(audio.sample_rate_hz, actual_rate)?;
         let audio_duration = timing
             .audio_end()
             .expect("audio timing has a manifest stop")
             .checked_sub(audio_start)?;
         filter.push_str(&format!(
-            ";[2:a:0]aresample=async=0:first_pts=0,\
+            ";[2:a:0]{resampling},\
              atrim=duration={},\
              asetpts=PTS-STARTPTS+{}/TB[a]",
             audio_duration.ffmpeg_seconds()?,
             audio_start.ffmpeg_seconds()?
         ));
     }
-    args.extend([
-        "-filter_complex".to_string(),
-        filter,
-        "-map".to_string(),
-        "[v]".to_string(),
-    ]);
+    if frame_pts.is_empty() {
+        args.extend(["-filter_complex".to_string(), filter]);
+    } else {
+        let path = staging_dir.join("timeline.fffilter");
+        fs::write(&path, filter).map_err(|source| SessionExportError::Io {
+            context: "write frame presentation clock",
+            path: path.clone(),
+            source,
+        })?;
+        args.extend([
+            "-filter_complex_script".to_string(),
+            path.to_string_lossy().into_owned(),
+        ]);
+    }
+    args.extend(["-map".to_string(), "[v]".to_string()]);
     if audio_list.is_some() {
         args.extend(["-map".to_string(), "[a]".to_string()]);
     } else {
         args.push("-an".to_string());
     }
-    append_h264_video_output_args(&mut args);
-    args.extend(["-vsync".to_string(), "0".to_string()]);
+    append_video_output_args(&mut args, plan.options.video_codec);
+    if frame_pts.is_empty() {
+        args.extend([
+            "-r".to_string(),
+            format!("{}/{}", video_tick.denominator(), video_tick.numerator()),
+        ]);
+        args.extend(["-vsync".to_string(), "cfr".to_string()]);
+    } else {
+        args.extend([
+            "-vsync".into(),
+            "0".into(),
+            "-enc_time_base:v".into(),
+            "1:1000000".into(),
+            "-video_track_timescale".into(),
+            "1000000".into(),
+            "-movie_timescale".into(),
+            "1000000".into(),
+            "-bf".into(),
+            "0".into(),
+            if plan.options.video_codec == ExportVideoCodec::Hevc {
+                "-x265-params"
+            } else {
+                "-x264-params"
+            }
+            .into(),
+            format!(
+                "fps={}/{}{}",
+                video_tick.denominator(),
+                video_tick.numerator(),
+                if plan.options.video_codec == ExportVideoCodec::Hevc {
+                    ":pools=4:frame-threads=2:log-level=error"
+                } else {
+                    ""
+                }
+            ),
+            "-bsf:v".into(),
+            format!(
+                "setts=pts=PTS:dts=DTS:duration='if(eq(N,{}),{},DURATION)'",
+                frame_pts.len() - 1,
+                (video_tick.ceil_nanoseconds()? + 500) / 1000
+            ),
+        ]);
+    }
     if audio_list.is_some() {
         args.extend([
             "-c:a".to_string(),
@@ -3771,6 +4265,33 @@ fn build_timeline_ffmpeg_args(
     Ok(args)
 }
 
+fn sample_clock_filter(rate: u32, actual_rate: f64) -> Result<String, SessionExportError> {
+    if rate == 0 || !actual_rate.is_finite() || actual_rate <= 0.0 {
+        return Err(SessionExportError::InvalidRequest(
+            "invalid audio sample clock rate".into(),
+        ));
+    }
+    let mut filter = "aresample=async=0:first_pts=0".to_string();
+    if (actual_rate / f64::from(rate) - 1.0).abs() <= 1e-9 {
+        return Ok(filter);
+    }
+    let scale = (f64::from(i32::MAX) / actual_rate.max(f64::from(rate)))
+        .floor()
+        .min(1000.0);
+    if scale < 1.0 {
+        return Err(SessionExportError::InvalidRequest(
+            "audio sample clock rate exceeds FFmpeg limits".into(),
+        ));
+    }
+    // Virtual rates retain millihertz precision without WSOLA moving transients.
+    filter.push_str(&format!(
+        ",asetrate={},aresample={},asetrate={rate}",
+        (actual_rate * scale).round() as u64,
+        u64::from(rate) * scale as u64,
+    ));
+    Ok(filter)
+}
+
 fn append_concat_input(args: &mut Vec<String>, list_path: &Path) {
     args.extend([
         "-f".to_string(),
@@ -3782,17 +4303,47 @@ fn append_concat_input(args: &mut Vec<String>, list_path: &Path) {
     ]);
 }
 
-fn append_h264_video_output_args(args: &mut Vec<String>) {
+fn frame_pts_expression(pts: &[u64], start: usize) -> String {
+    if pts.len() == 1 {
+        return pts[0].to_string();
+    }
+    let middle = pts.len() / 2;
+    format!(
+        "if(lt(N,{}),{},{})",
+        start + middle,
+        frame_pts_expression(&pts[..middle], start),
+        frame_pts_expression(&pts[middle..], start + middle)
+    )
+}
+
+fn append_video_output_args(args: &mut Vec<String>, codec: ExportVideoCodec) {
+    let hevc = codec == ExportVideoCodec::Hevc;
     args.extend([
         "-c:v".to_string(),
-        "libx264".to_string(),
+        if hevc { "libx265" } else { "libx264" }.to_string(),
         "-preset".to_string(),
-        "veryfast".to_string(),
+        "medium".to_string(),
         "-crf".to_string(),
         "18".to_string(),
         "-pix_fmt".to_string(),
         "yuv420p".to_string(),
+        "-color_primaries".into(),
+        "2".into(),
+        "-color_trc".into(),
+        "2".into(),
+        "-colorspace".into(),
+        "2".into(),
+        "-color_range".into(),
+        "tv".into(),
     ]);
+    if hevc {
+        args.extend([
+            "-tag:v".into(),
+            "hvc1".into(),
+            "-x265-params".into(),
+            "pools=4:frame-threads=2:log-level=error".into(),
+        ]);
+    }
 }
 
 fn write_concat_list(
@@ -3993,6 +4544,62 @@ impl Drop for TempExportDir {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sample_clock_resampling_preserves_transient_positions() {
+        if !ffmpeg_available() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let rate = 48_000_u32;
+        let indices = [24_624, 150_096, 506_064, 930_624, 1_513_392];
+        let mut bytes = vec![0_u8; 34 * rate as usize * 4];
+        for index in indices {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&0.9_f32.to_le_bytes());
+        }
+        let path = directory.path().join("impulses.f32");
+        std::fs::write(&path, bytes).unwrap();
+        for actual_rate in [48_004.615_414, 47_995.384_586] {
+            let output = std::process::Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "f32le", "-ar", "48000", "-ac", "1", "-i",
+                ])
+                .arg(&path)
+                .args([
+                    "-af",
+                    &sample_clock_filter(rate, actual_rate).unwrap(),
+                    "-f",
+                    "f32le",
+                    "-",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let samples: Vec<f32> = output
+                .stdout
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            for index in indices {
+                let expected = (index as f64 * f64::from(rate) / actual_rate).round() as usize;
+                let lo = expected - 2400;
+                let peak = samples[lo..expected + 2400]
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+                    .unwrap();
+                assert!((lo + peak.0).abs_diff(expected) <= 1);
+                assert!(peak.1.abs() > 0.3);
+            }
+        }
+        assert!(sample_clock_filter(48_000, f64::NAN).is_err());
+        assert!(sample_clock_filter(48_000, f64::INFINITY).is_err());
+        assert!(sample_clock_filter(48_000, -1.0).is_err());
+    }
+
     use std::path::Path;
     use std::process::{Command, Stdio};
 
@@ -4446,8 +5053,10 @@ mod tests {
             source_manifest_sha256: "6".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![timed_video_segment(0, left, 0, 30, 0, 1)],
             right_segments: vec![timed_video_segment(0, right, 0, 30, 0, 1)],
             audio: None,
@@ -4466,6 +5075,7 @@ mod tests {
             fs::write(&path, b"audio").expect("audio segment");
             Some(ManifestAudioTimeline {
                 sample_rate_hz: 48_000,
+                sample_tick: None,
                 channels: 2,
                 sample_count: 96_000,
                 session_start_offset: timeline_time(1, 2),
@@ -4488,8 +5098,10 @@ mod tests {
             source_manifest_sha256: "d".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![timed_video_segment(0, left, 0, 60, 0, 2)],
             right_segments: vec![timed_video_segment(0, right, 0, 60, 0, 2)],
             audio,
@@ -4512,12 +5124,15 @@ mod tests {
             source_manifest_sha256: "a".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![timed_video_segment(0, left, 0, 60, 0, 2)],
             right_segments: vec![timed_video_segment(0, right, 0, 60, 0, 2)],
             audio: Some(ManifestAudioTimeline {
                 sample_rate_hz: 48_000,
+                sample_tick: None,
                 channels: 2,
                 sample_count: 96_000,
                 session_start_offset: timeline_time(1, 2),
@@ -4565,12 +5180,15 @@ mod tests {
             source_manifest_sha256: "b".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![timed_video_segment(0, left, 0, 60, 0, 2)],
             right_segments: vec![timed_video_segment(0, right, 0, 60, 0, 2)],
             audio: Some(ManifestAudioTimeline {
                 sample_rate_hz: 48_000,
+                sample_tick: None,
                 channels: 2,
                 sample_count: 96_000,
                 session_start_offset: timeline_time(1, 2),
@@ -4612,7 +5230,7 @@ mod tests {
         assert!(filter.contains("atrim=duration=1.990000000"));
         assert!(filter.contains("asetpts=PTS-STARTPTS+0.500000000/TB"));
         assert!(!args.iter().any(|argument| argument == "-shortest"));
-        assert!(args.windows(2).any(|window| window == ["-vsync", "0"]));
+        assert!(args.windows(2).any(|window| window == ["-vsync", "cfr"]));
         assert!(fs::read_to_string(staging.path().join("left.ffconcat"))
             .expect("left concat list")
             .contains("duration 2.000000000"));
@@ -4636,12 +5254,15 @@ mod tests {
             source_manifest_sha256: "c".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![timed_video_segment(0, left, 0, 60, 0, 2)],
             right_segments: vec![timed_video_segment(0, right, 0, 60, 0, 2)],
             audio: Some(ManifestAudioTimeline {
                 sample_rate_hz: 48_000,
+                sample_tick: None,
                 channels: 2,
                 sample_count: 96_000,
                 session_start_offset: timeline_time(1, 2),
@@ -5469,15 +6090,18 @@ done
             Ok(_) => panic!("default periodic stats must exceed the bounded stderr budget"),
             Err(error) => error,
         };
-        assert!(matches!(
-            default_error,
-            SessionExportError::ProcessOutputLimit {
-                process: "ffmpeg",
-                stream: "stderr",
-                limit_bytes: PROCESS_STDERR_LIMIT_BYTES,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                &default_error,
+                SessionExportError::ProcessOutputLimit {
+                    process: "ffmpeg",
+                    stream: "stderr",
+                    limit_bytes: PROCESS_STDERR_LIMIT_BYTES,
+                    ..
+                }
+            ),
+            "unexpected output-limit result: {default_error:?}"
+        );
 
         write_publication(directory.path(), "h264", &separate_eyes_h264());
         let legacy_plan = FfmpegSessionExporter::new(SessionExportConfig::system_ffmpeg())
@@ -5769,6 +6393,158 @@ done
     }
 
     #[test]
+    fn real_export_preserves_measured_video_and_audio_rates() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            eprintln!("skipping measured clock export because ffmpeg/ffprobe is unavailable");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let left = source.join("video/left_00000.mp4");
+        let right = source.join("video/right_00000.mp4");
+        let wav = source.join("audio/audio_00000.wav");
+        generate_h264_clip(&left, "red");
+        generate_h264_clip(&right, "blue");
+        generate_wav(&wav);
+        let tick = TimelineTime::from_nanoseconds(125_123_456).unwrap();
+        let video_segment = |path: PathBuf| TimedVideoSegment {
+            index: 0,
+            bytes: fs::metadata(&path).unwrap().len(),
+            sha256: sha256_file(&path).unwrap(),
+            path,
+            start_frame: 0,
+            end_frame: 6,
+            start_time: TimelineTime::zero(),
+            end_time: tick.checked_mul_u64(6).unwrap(),
+        };
+        let sample_tick = timeline_time(1, 44_110);
+        let audio_start = timeline_time(1, 10);
+        let delta_ns = sample_tick
+            .checked_mul_u64(26_460)
+            .unwrap()
+            .rounded_nanoseconds()
+            .unwrap();
+        let audio_end = audio_start
+            .checked_add(TimelineTime::from_nanoseconds(delta_ns).unwrap())
+            .unwrap();
+        let timeline = ManifestSessionTimeline {
+            source_manifest_sha256: "e".repeat(64),
+            clock: SessionTimelineClock::HostMonotonic,
+            video_tick: tick,
+            video_frame_pts_us: Vec::new(),
+            eye_width: 32,
+            eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
+            left_segments: vec![video_segment(left)],
+            right_segments: vec![video_segment(right)],
+            audio: Some(ManifestAudioTimeline {
+                sample_rate_hz: 44_100,
+                sample_tick: Some(sample_tick),
+                channels: 2,
+                sample_count: 26_460,
+                session_start_offset: audio_start,
+                session_stop_offset: audio_end,
+                segments: vec![TimedAudioSegment {
+                    index: 0,
+                    bytes: fs::metadata(&wav).unwrap().len(),
+                    sha256: sha256_file(&wav).unwrap(),
+                    path: wav,
+                    start_sample: 0,
+                    end_sample: 26_460,
+                    start_time: audio_start,
+                    end_time: audio_end,
+                }],
+            }),
+        };
+        let plan = SessionExportPlan::from_manifest_timeline(
+            &source,
+            directory.path().join("derived.mp4"),
+            false,
+            timeline,
+        )
+        .unwrap();
+        let receipt = FfmpegSessionExporter::new(SessionExportConfig::system_ffmpeg())
+            .export_plan(&plan)
+            .unwrap();
+        let verification = receipt.timeline_verification.unwrap();
+        assert_eq!(verification.paired_frames, 6);
+        assert!(verification.video_end_residual_ns.unsigned_abs() < 10_000);
+    }
+
+    #[test]
+    fn real_vfr_export_preserves_every_capture_timestamp_and_rejects_clock_changes() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            return;
+        }
+        for (start, codec) in [
+            (0_u64, ExportVideoCodec::H264),
+            (200_123, ExportVideoCodec::H264),
+            (0, ExportVideoCodec::Hevc),
+            (200_123, ExportVideoCodec::Hevc),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source");
+            let left = source.join("video/left.mp4");
+            let right = source.join("video/right.mp4");
+            generate_h264_clip(&left, "red");
+            generate_h264_clip(&right, "blue");
+            let pts = vec![
+                start,
+                start + 125123,
+                start + 246247,
+                start + 384370,
+                start + 700494,
+                start + 825617,
+            ];
+            let tick_us = (pts[5] - pts[0] + 2) / 5;
+            let tick = timeline_time(tick_us as i64, 1_000_000);
+            let segment = |path: PathBuf| TimedVideoSegment {
+                index: 0,
+                bytes: fs::metadata(&path).unwrap().len(),
+                sha256: sha256_file(&path).unwrap(),
+                path,
+                start_frame: 0,
+                end_frame: 6,
+                start_time: timeline_time(start as i64, 1_000_000),
+                end_time: timeline_time((pts[5] + tick_us) as i64, 1_000_000),
+            };
+            let timeline = ManifestSessionTimeline {
+                source_manifest_sha256: "e".repeat(64),
+                clock: SessionTimelineClock::HostMonotonic,
+                video_tick: tick,
+                video_frame_pts_us: pts.clone(),
+                eye_width: 32,
+                eye_height: 32,
+                source_video_codec: SourceVideoCodec::H264,
+                left_segments: vec![segment(left)],
+                right_segments: vec![segment(right)],
+                audio: None,
+            };
+            let output = directory.path().join("vfr.mp4");
+            let plan = SessionExportPlan::from_manifest_timeline(&source, &output, false, timeline)
+                .unwrap()
+                .with_options(MediaExportOptions {
+                    video_codec: codec,
+                    audio_delay_ms: 0,
+                })
+                .unwrap();
+            let exporter = FfmpegSessionExporter::new(SessionExportConfig::system_ffmpeg());
+            let receipt = exporter.export_plan(&plan).unwrap();
+            let evidence = receipt.timeline_verification.unwrap();
+            assert_eq!(evidence.paired_frames, 6);
+            assert!(evidence.video_start_residual_ns.unsigned_abs() < 1_000_000);
+            assert!(evidence.video_end_residual_ns.unsigned_abs() < 1_000_000);
+            let mut changed = plan.clone();
+            changed.timing.as_mut().unwrap().manifest.video_frame_pts_us[2] += 1_000;
+            let probe = exporter.probe_output(&output).unwrap();
+            assert!(verify_session_export_output(&changed, &output, &probe)
+                .unwrap_err()
+                .to_string()
+                .contains("frame timestamps differ"));
+        }
+    }
+
+    #[test]
     fn exports_and_verifies_real_manifest_timeline_with_late_audio() {
         if !ffmpeg_available() || !ffprobe_available() {
             eprintln!("skipping manifest timeline export because ffmpeg/ffprobe is unavailable");
@@ -5797,12 +6573,15 @@ done
             source_manifest_sha256: "e".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 10),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![video_segment(left)],
             right_segments: vec![video_segment(right)],
             audio: Some(ManifestAudioTimeline {
                 sample_rate_hz: 44_100,
+                sample_tick: None,
                 channels: 2,
                 sample_count: 26_460,
                 session_start_offset: timeline_time(1, 5),
@@ -5854,6 +6633,22 @@ done
         let audio = media.audio.expect("output audio properties");
         assert_eq!(audio.codec, "aac");
         assert_eq!(audio.sample_rate_hz, 44_100);
+        let exporter = FfmpegSessionExporter::new(SessionExportConfig::system_ffmpeg());
+        for codec in [ExportVideoCodec::H264, ExportVideoCodec::Hevc] {
+            for delay in [-30, 0, 30] {
+                let copy = directory.path().join(format!("copy-{codec:?}-{delay}.mp4"));
+                exporter
+                    .export_playable_copy(
+                        &output,
+                        &copy,
+                        &MediaExportOptions {
+                            video_codec: codec,
+                            audio_delay_ms: delay,
+                        },
+                    )
+                    .expect("verified copy preserves the video clock and shifts only audio");
+            }
+        }
         assert!(output.is_file());
         assert_eq!(staging_dirs(directory.path()), Vec::<String>::new());
     }
@@ -5893,8 +6688,10 @@ done
             source_manifest_sha256: "f".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![
                 video_segment(0, left_first, 0, 30),
                 video_segment(1, left_second, 30, 60),
@@ -5905,6 +6702,7 @@ done
             ],
             audio: Some(ManifestAudioTimeline {
                 sample_rate_hz: 48_000,
+                sample_tick: None,
                 channels: 2,
                 sample_count: 96_000,
                 session_start_offset: TimelineTime::zero(),
@@ -5991,6 +6789,30 @@ done
                 "output frame {index} has timestamp residual {residual} ns"
             );
         }
+    }
+
+    #[test]
+    fn frame_probe_accepts_measured_duration_with_large_average_period_denominator() {
+        let report = (0..1579_u64)
+            .map(|index| {
+                format!(
+                    "frames_frame_{index}_best_effort_timestamp={}\n",
+                    (index * 53_096_681 + 789) / 1579,
+                )
+            })
+            .collect::<String>();
+        let probe = read_video_frame_timeline_probe(
+            report.as_bytes(),
+            Path::new("measured-clock.mp4"),
+            timeline_time(1, 1_000_000),
+            TimelineTime::zero(),
+            timeline_time(53_096_681, 1_000_000),
+            1579,
+        )
+        .expect("1579-frame measured clock remains representable");
+        assert_eq!(probe.frame_count, 1579);
+        assert!(probe.max_timestamp_residual_ns.unsigned_abs() <= 501);
+        assert!(!probe.timestamp_sha256.is_empty());
     }
 
     #[test]
@@ -6103,6 +6925,92 @@ done
     }
 
     #[test]
+    fn source_video_probe_requires_the_declared_hevc_codec() {
+        let bytes = br#"{"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2"},"streams":[{"codec_type":"video","codec_name":"hevc","width":32,"height":32,"nb_read_frames":"30"}]}"#;
+        assert_eq!(
+            parse_source_video_segment_probe(
+                bytes,
+                Path::new("left.mp4"),
+                "left",
+                0,
+                32,
+                32,
+                SourceVideoCodec::Hevc
+            )
+            .unwrap(),
+            30
+        );
+        assert!(parse_source_video_segment_probe(
+            bytes,
+            Path::new("left.mp4"),
+            "left",
+            0,
+            32,
+            32,
+            SourceVideoCodec::H264
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn hevc_eyes_export_at_full_size_and_matching_playable_copy_preserves_bytes() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            eprintln!("skipping HEVC media regression: ffmpeg/ffprobe unavailable");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir_all(source.join("video")).unwrap();
+        let left = source.join("video/left_00000.mp4");
+        let right = source.join("video/right_00000.mp4");
+        for (path, color) in [(&left, "red"), (&right, "blue")] {
+            run_ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("color={color}:size=32x32:rate=30"),
+                "-frames:v",
+                "30",
+                "-c:v",
+                "libx265",
+                "-preset",
+                "ultrafast",
+                "-x265-params",
+                "pools=1:frame-threads=1:log-level=error",
+                "-bf",
+                "0",
+                "-pix_fmt",
+                "yuv420p",
+                "-tag:v",
+                "hvc1",
+                path.to_str().unwrap(),
+            ]);
+        }
+        let mut timeline = single_segment_video_timeline(left, right);
+        timeline.source_video_codec = SourceVideoCodec::Hevc;
+        let output = directory.path().join("joined.mp4");
+        let plan =
+            SessionExportPlan::from_manifest_timeline(&source, &output, false, timeline).unwrap();
+        let exporter = FfmpegSessionExporter::new(SessionExportConfig::system_ffmpeg());
+        let receipt = exporter.export_plan(&plan).unwrap();
+        let media = receipt.output_media.unwrap();
+        assert_eq!((media.width, media.height), (64, 32));
+        let hevc = directory.path().join("hevc.mp4");
+        let copy = directory.path().join("copy.mp4");
+        let options = MediaExportOptions {
+            video_codec: ExportVideoCodec::Hevc,
+            audio_delay_ms: 0,
+        };
+        exporter
+            .export_playable_copy(&output, &hevc, &options)
+            .unwrap();
+        exporter
+            .export_playable_copy(&hevc, &copy, &options)
+            .unwrap();
+        assert_eq!(fs::read(&hevc).unwrap(), fs::read(&copy).unwrap());
+    }
+
+    #[test]
     fn source_video_contract_rejects_non_h264_mp4_segment() {
         if !ffmpeg_available() || !ffprobe_available() {
             eprintln!("skipping source video codec verification because ffmpeg is unavailable");
@@ -6129,7 +7037,7 @@ done
             .expect_err("MPEG-4 Part 2 must not satisfy the declared H.264 source contract");
 
         assert!(error.to_string().contains("left-eye segment 0"));
-        assert!(error.to_string().contains("H.264"));
+        assert!(error.to_string().contains("declared codec"));
         assert!(!output.exists());
     }
 
@@ -6261,8 +7169,10 @@ done
             source_manifest_sha256: "9".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![
                 video_segment(0, left_first, 0, 30),
                 video_segment(1, left_second, 30, 60),
@@ -6335,12 +7245,15 @@ done
             source_manifest_sha256: "8".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![video_segment(left)],
             right_segments: vec![video_segment(right)],
             audio: Some(ManifestAudioTimeline {
                 sample_rate_hz: 48_000,
+                sample_tick: None,
                 channels: 2,
                 sample_count: 96_000,
                 session_start_offset: TimelineTime::zero(),
@@ -6400,12 +7313,15 @@ done
             source_manifest_sha256: "7".repeat(64),
             clock: SessionTimelineClock::HostMonotonic,
             video_tick: timeline_time(1, 30),
+            video_frame_pts_us: Vec::new(),
             eye_width: 32,
             eye_height: 32,
+            source_video_codec: SourceVideoCodec::H264,
             left_segments: vec![video_segment(left)],
             right_segments: vec![video_segment(right)],
             audio: Some(ManifestAudioTimeline {
                 sample_rate_hz: 48_000,
+                sample_tick: None,
                 channels: 2,
                 sample_count: 96_000,
                 session_start_offset: TimelineTime::zero(),

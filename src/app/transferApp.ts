@@ -39,6 +39,7 @@ import { describeMediaBackendError, type MediaBackend } from "../runtime/media/b
 import { createMediaRuntime, type MediaRuntime } from "../runtime/media/runtime";
 import {
   IMPORT_ONLY_PIPELINE_POLICY,
+  type MediaExportOptions,
   type MediaJobCommand as RuntimeMediaJobCommand,
   type PipelineCommand,
   type ScanCandidate,
@@ -1799,9 +1800,9 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
     });
   }
 
-  function exportMediaLibraryEntry(entryKey: string): void {
+  function exportMediaLibraryEntry(entryKey: string, options?: MediaExportOptions): void {
     if (mediaRuntime === null) return;
-    void mediaRuntime.exportLibraryEntry(entryKey).then((result) => {
+    void mediaRuntime.exportLibraryEntry(entryKey, options).then((result) => {
       if (disposed || result.status !== "completed") return;
       if (result.value.status === "completed") {
         toast(`已导出 MP4：${result.value.outputPath}`, "success");
@@ -1955,7 +1956,7 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
         revokeTrustedProducer(action.keyFingerprint);
         return;
       case "media/exportLibraryEntry":
-        exportMediaLibraryEntry(action.entryKey);
+        exportMediaLibraryEntry(action.entryKey, action.options);
         return;
       case "media/toggleCandidateDetails":
         commit({ type: "ui/mediaCandidateExpanded", candidateId: action.candidateId });
@@ -2122,6 +2123,13 @@ export function createTransferApp(options: TransferAppOptions): TransferApp {
           key: `library:reveal:${action.key}:${action.fileId}`,
           run: () => backend.revealLibraryFile(action.key, action.fileId),
           success: () => "已在文件管理器中定位",
+        });
+        return;
+      case "entry/exportVideo":
+        void runner.run({
+          key: `library:export:${action.key}:${action.fileId}`,
+          run: () => backend.exportLibraryVideo(action.key, action.fileId, action.options),
+          success: (path) => (path === null ? "已取消另存" : `成片已另存到 ${path}`),
         });
         return;
       case "entry/remove":

@@ -15,6 +15,7 @@ import type { ResourceRetryTarget } from "../runtime/reducer";
 import type { SaveStorageConfigInput } from "../types";
 import type { TrayCommand } from "../ui/traySelector";
 import type { MediaWorkspaceAction } from "../ui/media/types";
+import type { MediaExportOptions } from "../runtime/media/types";
 
 export type UiAction =
   /* independently recoverable backend resources */
@@ -64,6 +65,12 @@ export type UiAction =
   | { readonly kind: "session/remove"; readonly deviceId: DeviceId; readonly sessionId: SessionId }
   | { readonly kind: "entry/upload"; readonly key: LibraryKey }
   | { readonly kind: "entry/revealFile"; readonly key: LibraryKey; readonly fileId: FileId }
+  | {
+      readonly kind: "entry/exportVideo";
+      readonly key: LibraryKey;
+      readonly fileId: FileId;
+      readonly options: MediaExportOptions;
+    }
   | { readonly kind: "entry/remove"; readonly key: LibraryKey }
 
   /* tray */

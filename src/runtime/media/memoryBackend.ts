@@ -25,6 +25,7 @@ import type {
   MediaError,
   MediaJobCommand,
   MediaLibraryEntryExportResult,
+  MediaExportOptions,
   MediaLibraryEntryProjection,
   MediaTrustedProducerRevocation,
   MediaScanSnapshot,
@@ -570,8 +571,9 @@ export function createMemoryMediaBackend(options: MemoryMediaBackendOptions = {}
       record("revokeTrustedProducer", keyFingerprint);
       return Promise.resolve({ keyFingerprint, revoked: false });
     },
-    exportLibraryEntry(entryKey: string): Promise<MediaLibraryEntryExportResult> {
-      record("exportLibraryEntry", entryKey);
+    exportLibraryEntry(entryKey: string, exportOptions?: MediaExportOptions): Promise<MediaLibraryEntryExportResult> {
+      if (exportOptions === undefined) record("exportLibraryEntry", entryKey);
+      else record("exportLibraryEntry", entryKey, exportOptions);
       const entry = library.find((item) => item.entryKey === entryKey);
       if (entry === undefined) {
         return throwMedia(

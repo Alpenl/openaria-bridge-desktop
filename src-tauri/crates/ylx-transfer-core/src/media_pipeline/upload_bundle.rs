@@ -1269,6 +1269,7 @@ fn source_schema_tag(schema: SourceSchema) -> &'static [u8] {
     match schema {
         SourceSchema::DeviceSessionV1 => b"device_session_v1",
         SourceSchema::DeviceSessionV2 => b"device_session_v2",
+        SourceSchema::DeviceSessionV3 => b"device_session_v3",
         SourceSchema::SignedPublicationV1 => b"signed_publication_v1",
         SourceSchema::UnsignedPublicationV1 => b"unsigned_publication_v1",
         SourceSchema::CompleteUnpublishedV6 => b"complete_unpublished_v6",

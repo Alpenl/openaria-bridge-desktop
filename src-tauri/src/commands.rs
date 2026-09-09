@@ -363,6 +363,35 @@ pub async fn get_storage_config(app: AppHandle) -> Result<Revisioned<StorageConf
 }
 
 #[tauri::command]
+pub async fn export_library_video(
+    app: AppHandle,
+    key: String,
+    file_id: String,
+    options: ylx_transfer_adapters::session_export::MediaExportOptions,
+) -> Result<Option<String>, RpcError> {
+    validate_command_string("key", &key)?;
+    validate_command_string("fileId", &file_id)?;
+    let application = application(&app)?;
+    let source = application
+        .library_export_source(&key, &file_id)
+        .map_err(|message| command_failure("library_export_failed", message, false))?;
+    let library_root = application.active_library_root();
+    let stem = source.file_stem().unwrap_or_default().to_string_lossy();
+    let filename = format!("{stem}-export.mp4");
+    let directory = library_root.parent().unwrap_or(&library_root).to_path_buf();
+    let Some(output) =
+        crate::media::commands::select_export_path(&app, directory, filename).await?
+    else {
+        return Ok(None);
+    };
+    let path = application
+        .export_library_video(key, file_id, output, options)
+        .await
+        .map_err(|message| command_failure("library_export_failed", message, true))?;
+    Ok(Some(path))
+}
+
+#[tauri::command]
 pub async fn select_download_root(app: AppHandle) -> Result<Option<String>, RpcError> {
     let application = application(&app)?;
     let (send, receive) = tokio::sync::oneshot::channel();

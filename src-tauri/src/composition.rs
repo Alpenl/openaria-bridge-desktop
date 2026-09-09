@@ -26,6 +26,7 @@
 //! falls back to them.
 
 mod derived_media;
+pub(crate) use derived_media::device_session_export_plan;
 mod derived_publication;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -5736,7 +5737,7 @@ fn apply_terminal_download(
     )
 }
 
-fn ffmpeg_export_config() -> Result<SessionExportConfig, String> {
+pub(crate) fn ffmpeg_export_config() -> Result<SessionExportConfig, String> {
     let ffmpeg = resolve_bundled_ffmpeg_path();
     let ffprobe = resolve_bundled_ffprobe_path();
     #[cfg(target_os = "windows")]

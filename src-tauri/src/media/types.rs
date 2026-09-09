@@ -50,6 +50,7 @@ opaque_id!(UploadBundleId);
 pub enum SourceSchema {
     DeviceSessionV1,
     DeviceSessionV2,
+    DeviceSessionV3,
     RawCaptureV2,
     LegacyMjpegSessionV5,
     CompleteUnpublishedV6,
@@ -63,6 +64,7 @@ pub enum SourceSchema {
 pub enum UnsignedSourceSchema {
     DeviceSessionV1,
     DeviceSessionV2,
+    DeviceSessionV3,
     RawCaptureV2,
     LegacyMjpegSessionV5,
     CompleteUnpublishedV6,
@@ -75,6 +77,7 @@ impl From<UnsignedSourceSchema> for SourceSchema {
         match value {
             UnsignedSourceSchema::DeviceSessionV1 => Self::DeviceSessionV1,
             UnsignedSourceSchema::DeviceSessionV2 => Self::DeviceSessionV2,
+            UnsignedSourceSchema::DeviceSessionV3 => Self::DeviceSessionV3,
             UnsignedSourceSchema::RawCaptureV2 => Self::RawCaptureV2,
             UnsignedSourceSchema::LegacyMjpegSessionV5 => Self::LegacyMjpegSessionV5,
             UnsignedSourceSchema::CompleteUnpublishedV6 => Self::CompleteUnpublishedV6,

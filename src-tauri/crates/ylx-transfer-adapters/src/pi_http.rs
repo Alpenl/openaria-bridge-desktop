@@ -4038,7 +4038,10 @@ fn v4_manifest_to_session_detail(
     gateway_verification: Option<V4GatewayVerification>,
 ) -> Result<SessionDetail, PiHttpError> {
     let schema = required_string(&manifest, "/schema")?;
-    if schema != "ylx.device-session.v2" && schema != "ylx.device-session.v1" {
+    if !matches!(
+        schema.as_str(),
+        "ylx.device-session.v1" | "ylx.device-session.v2" | "ylx.device-session.v3"
+    ) {
         return Err(PiHttpError::InvalidResponse(format!(
             "unsupported Device Session schema {schema}"
         )));

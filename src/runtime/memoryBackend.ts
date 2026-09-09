@@ -586,6 +586,7 @@ export function createMemoryBackend(options: MemoryBackendOptions = {}): MemoryB
         (eventRevision, value) => ({ kind: "library", revision: eventRevision, library: value.library }),
       ),
     revealLibraryFile: (key, fileId) => respond("revealLibraryFile", [key, fileId], () => undefined),
+    exportLibraryVideo: (key, fileId, options) => respond("exportLibraryVideo", [key, fileId, options], () => null),
 
     downloadSession: (deviceId, sessionId) =>
       respond("downloadSession", [deviceId, sessionId], () => asDownloadJobId(`job-${sessionId}`)),

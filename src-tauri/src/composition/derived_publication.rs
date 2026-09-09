@@ -73,8 +73,10 @@ impl DerivedPublicationPlan {
         validate_source_manifest_schema(&source_value)?;
         let source: SourceDocument = serde_json::from_value(source_value)
             .map_err(|error| format!("source manifest identity is invalid: {error}"))?;
-        if source.schema != "ylx.device-session.v2"
-            || source.manifest_id != input.source_manifest_id
+        if !matches!(
+            source.schema.as_str(),
+            "ylx.device-session.v2" | "ylx.device-session.v3"
+        ) || source.manifest_id != input.source_manifest_id
             || source.session_id != input.source_session_id
             || source.volume_id != input.source_volume_id
             || source.device.device_id != input.source_device_id
@@ -143,7 +145,11 @@ impl DerivedPublicationPlan {
             assets: [
                 MarkerAsset::SourceManifest {
                     role: "source.manifest",
-                    schema: "ylx.device-session.v2",
+                    schema: if source.schema == "ylx.device-session.v3" {
+                        "ylx.device-session.v3"
+                    } else {
+                        "ylx.device-session.v2"
+                    },
                     manifest_id: input.source_manifest_id,
                     session_id: input.source_session_id,
                     volume_id: input.source_volume_id,
@@ -446,11 +452,52 @@ fn validate_schema(
 }
 
 pub(super) fn validate_source_manifest_schema(value: &Value) -> Result<(), String> {
-    validate_schema(value, source_validator(), "source manifest")
+    if value["schema"] == "ylx.device-session.v3" {
+        static V3: OnceLock<jsonschema::Validator> = OnceLock::new();
+        validate_schema(
+            value,
+            V3.get_or_init(|| {
+                compile_schema(include_str!(
+                    "../../../contracts/schemas/ylx-device-session-v3.schema.json"
+                ))
+            }),
+            "source manifest",
+        )
+    } else {
+        validate_schema(value, source_validator(), "source manifest")
+    }
 }
 
 fn compile_schema(raw: &str) -> jsonschema::Validator {
-    let value: Value = serde_json::from_str(raw).expect("vendored publication schema is JSON");
+    let mut value: Value = serde_json::from_str(raw).expect("vendored publication schema is JSON");
+    fn extend_source_versions(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                if map.get("const").and_then(Value::as_str) == Some("ylx.device-session.v2") {
+                    map.remove("const");
+                    map.insert(
+                        "enum".into(),
+                        serde_json::json!(["ylx.device-session.v2", "ylx.device-session.v3"]),
+                    );
+                }
+                for child in map.values_mut() {
+                    extend_source_versions(child);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    extend_source_versions(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    if matches!(
+        value["properties"]["schema"]["const"].as_str(),
+        Some("ylx.derived-media-receipt.v1" | "ylx.bucket-publication.v4")
+    ) {
+        extend_source_versions(&mut value);
+    }
     jsonschema::options()
         .with_draft(Draft::Draft202012)
         .should_validate_formats(true)
@@ -460,7 +507,15 @@ fn compile_schema(raw: &str) -> jsonschema::Validator {
 
 fn source_validator() -> &'static jsonschema::Validator {
     static VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
-    VALIDATOR.get_or_init(|| compile_schema(SOURCE_SCHEMA_JSON))
+    VALIDATOR.get_or_init(|| {
+        let mut value: Value =
+            serde_json::from_str(SOURCE_SCHEMA_JSON).expect("source schema JSON");
+        value["$defs"]["recordedAudio"]["properties"]["capture_clock"] = serde_json::json!({
+            "type": "object", "required": ["schema"],
+            "properties": {"schema": {"const": "openaria.audio-clock.v1"}}
+        });
+        compile_schema(&value.to_string())
+    })
 }
 
 fn receipt_validator() -> &'static jsonschema::Validator {

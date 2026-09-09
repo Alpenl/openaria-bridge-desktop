@@ -324,7 +324,9 @@ function libraryEntryHtml(entry: MediaLibraryEntryProjection): string {
   const exportButton =
     sourceEvidence === null
       ? ""
-      : `<button type="button" class="btn btn-primary btn-sm" data-media-action="export-library-entry" data-entry-key="${escapeAttr(
+      : `<label>视频编码 <select data-export-codec aria-label="视频编码"><option value="h264">H.264</option><option value="hevc">H.265 归档</option></select></label>` +
+        `<label>音频延后 (ms) <input data-export-delay type="number" value="0" min="-1000" max="1000" step="1" aria-label="音频延后毫秒" style="width:7em"></label>` +
+        `<button type="button" class="btn btn-primary btn-sm" data-media-action="export-library-entry" data-entry-key="${escapeAttr(
           entry.entryKey,
         )}">导出 MP4</button>`;
   const revokeButton =

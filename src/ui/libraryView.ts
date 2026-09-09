@@ -96,10 +96,16 @@ export function libraryRowHtml(
         .map((f) => {
           const pathText = escapeHtml(f.displayPath);
           const fileIdAttr = escapeAttr(f.fileId);
+          const exportControls =
+            entry.complete && f.displayPath.toLowerCase().endsWith(".mp4")
+              ? `<span class="export-controls"><label>格式 <select data-export-codec aria-label="另存视频编码"><option value="h264">H.264 原码流</option><option value="hevc">H.265 归档</option></select></label>` +
+                `<label>音频延后 (ms) <input data-export-delay type="number" value="0" min="-1000" max="1000" step="1" aria-label="另存音频延后毫秒" style="width:7em"></label>` +
+                `<button class="btn btn-ghost btn-sm" data-action="export-video" data-key="${keyAttr}" data-file-id="${fileIdAttr}">另存成片</button></span>`
+              : "";
           return (
             `<li class="file-row"><span class="file-path">${pathText}</span>` +
             `<span class="file-size mono">${formatBytes(f.bytes)}</span>` +
-            `<button class="btn btn-ghost btn-sm" data-action="reveal" data-key="${keyAttr}" data-file-id="${fileIdAttr}">在文件夹中显示</button></li>`
+            `${exportControls}<button class="btn btn-ghost btn-sm" data-action="reveal" data-key="${keyAttr}" data-file-id="${fileIdAttr}">在文件夹中显示</button></li>`
           );
         })
         .join("")

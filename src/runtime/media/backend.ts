@@ -13,6 +13,7 @@ import type {
   StartPipelineRequest,
   MediaError,
   MediaLibraryEntryExportResult,
+  MediaExportOptions,
   MediaLibraryEntryProjection,
   MediaTrustedProducerRevocation,
 } from "./types";
@@ -72,7 +73,7 @@ export interface MediaBackend {
   readPipelineSessions(): Promise<Revisioned<readonly PipelineSession[]>>;
   readLibraryProjections(): Promise<Revisioned<readonly MediaLibraryEntryProjection[]>>;
   revokeTrustedProducer(keyFingerprint: string): Promise<MediaTrustedProducerRevocation>;
-  exportLibraryEntry(entryKey: string): Promise<MediaLibraryEntryExportResult>;
+  exportLibraryEntry(entryKey: string, options?: MediaExportOptions): Promise<MediaLibraryEntryExportResult>;
 
   scan(request: ScanRequest): Promise<Revisioned<MediaScanSnapshot>>;
   startImport(request: StartImportRequest): Promise<Revisioned<ImportJob>>;
