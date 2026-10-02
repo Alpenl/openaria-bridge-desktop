@@ -1874,7 +1874,11 @@ pub fn verify_session_export_output(
         // clock and retained its worst error. Combining that bound with each
         // stream-clock/manifest-clock residual proves every frame without storing
         // an attacker-controlled number of timestamps in memory.
-        for frame_index in 0..timing.paired_frames {
+        // The difference between these two arithmetic clocks is affine in the
+        // frame index. Its largest absolute (rounded) residual is at an endpoint;
+        // the streaming decoder has already bounded every individual frame's
+        // departure from the output clock above.
+        for frame_index in [0, timing.paired_frames - 1] {
             let output_clock_timestamp = video
                 .start
                 .checked_add(frame_timeline.inferred_tick.checked_mul_u64(frame_index)?)?;
@@ -2655,37 +2659,19 @@ impl FfmpegSessionExporter {
     where
         F: Fn() -> bool,
     {
-        let mut command = Command::new(self.config.ffprobe_path());
-        command
-            .args([
-                "-v",
-                "error",
-                "-print_format",
-                "json",
-                "-count_frames",
-                "-show_entries",
-                "stream=codec_type,codec_name,time_base,start_pts,start_time,duration_ts,duration,nb_frames,nb_read_frames,sample_rate,channels,width,height",
-                "-show_streams",
-            ])
-            .arg(path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let completed = run_bounded_command(
-            &mut command,
-            "ffprobe",
-            self.config.ffprobe_path(),
-            FFPROBE_STDOUT_LIMIT_BYTES,
-            PROCESS_STDERR_LIMIT_BYTES,
-            &is_cancelled,
-        )?;
-        if !completed.status.success() {
-            return Err(SessionExportError::FfprobeFailed {
-                status: completed.status.to_string(),
-                stderr: stderr_preview(&completed.stderr),
-            });
+        // MP4 stores the frame count in its sample table. Use it only to set up
+        // the timestamp interpolation: the streaming decoder below must still
+        // produce exactly that many frames. Counting every decoded frame here
+        // used to decode both streams a second time before timestamp validation.
+        let mut probe = self.probe_output_streams_cancellable(path, false, &is_cancelled)?;
+        if probe.video_streams.len() == 1
+            && probe.video_streams[0]
+                .frame_count
+                .is_none_or(|count| count == 0)
+        {
+            // Preserve support for containers which omit their frame count.
+            probe = self.probe_output_streams_cancellable(path, true, &is_cancelled)?;
         }
-        let mut probe = OutputMediaProbe::from_ffprobe_json(&completed.stdout)?;
         if probe.video_streams.len() == 1 {
             let video = &probe.video_streams[0];
             if let Some(frame_count) = video.frame_count.filter(|count| *count > 0) {
@@ -2695,6 +2681,13 @@ impl FfmpegSessionExporter {
                     frame_count,
                     &is_cancelled,
                 )?;
+                if frame_timeline.frame_count != frame_count {
+                    return Err(SessionExportError::OutputVerificationFailed(format!(
+                        "ffprobe per-frame timestamp count {} does not match reported video frame count {frame_count}",
+                        frame_timeline.frame_count
+                    )));
+                }
+                probe.video_streams[0].frame_count = Some(frame_timeline.frame_count);
                 probe.report_sha256 = combined_probe_report_sha256(
                     probe.report_sha256.as_str(),
                     frame_timeline.report_sha256.as_str(),
@@ -2721,6 +2714,7 @@ impl FfmpegSessionExporter {
                 sample_rate_hz,
                 &is_cancelled,
             )?;
+            probe.audio_streams[0].frame_count = Some(frame_timeline.frame_count);
             probe.report_sha256 = combined_audio_probe_report_sha256(
                 probe.report_sha256.as_str(),
                 frame_timeline.report_sha256.as_str(),
@@ -2728,6 +2722,47 @@ impl FfmpegSessionExporter {
             probe.audio_frame_timeline = Some(frame_timeline);
         }
         Ok(probe)
+    }
+
+    fn probe_output_streams_cancellable(
+        &self,
+        path: &Path,
+        count_frames: bool,
+        is_cancelled: &dyn Fn() -> bool,
+    ) -> Result<OutputMediaProbe, SessionExportError> {
+        let mut command = Command::new(self.config.ffprobe_path());
+        if count_frames {
+            command.arg("-count_frames");
+        }
+        command
+            .args([
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_entries",
+                "stream=codec_type,codec_name,time_base,start_pts,start_time,duration_ts,duration,nb_frames,nb_read_frames,sample_rate,channels,width,height",
+                "-show_streams",
+            ])
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let completed = run_bounded_command(
+            &mut command,
+            "ffprobe",
+            self.config.ffprobe_path(),
+            FFPROBE_STDOUT_LIMIT_BYTES,
+            PROCESS_STDERR_LIMIT_BYTES,
+            is_cancelled,
+        )?;
+        if !completed.status.success() {
+            return Err(SessionExportError::FfprobeFailed {
+                status: completed.status.to_string(),
+                stderr: stderr_preview(&completed.stderr),
+            });
+        }
+        OutputMediaProbe::from_ffprobe_json(&completed.stdout)
     }
 
     fn probe_video_frame_timeline_cancellable(
@@ -4609,6 +4644,124 @@ mod tests {
 
     const SESSION_ID: &str = "20260803T060347_023247_0000-28f96b7c5a19";
 
+    #[cfg(unix)]
+    fn write_output_probe_fixture(directory: &Path, advertised_frames: Option<u64>) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut video = serde_json::json!({
+            "codec_type": "video", "codec_name": "h264", "time_base": "1/30",
+            "start_pts": 0, "duration_ts": 3, "width": 64, "height": 32,
+        });
+        if let Some(count) = advertised_frames {
+            video["nb_frames"] = count.to_string().into();
+        }
+        let audio = serde_json::json!({
+            "codec_type": "audio", "codec_name": "aac", "time_base": "1/48000",
+            "start_pts": 0, "duration_ts": 2048, "sample_rate": "48000", "channels": 2,
+            // Includes packets omitted by the decoder, e.g. AAC preroll.
+            "nb_frames": "3",
+        });
+        let mut report = serde_json::json!({"streams": [video, audio]});
+        fs::write(directory.join("metadata.json"), report.to_string()).unwrap();
+        report["streams"][0]["nb_read_frames"] = "3".into();
+        report["streams"][1]["nb_read_frames"] = "2".into();
+        fs::write(directory.join("count.json"), report.to_string()).unwrap();
+        fs::write(
+            directory.join("video.txt"),
+            "frames_frame_0_best_effort_timestamp=0\nframes_frame_1_best_effort_timestamp=1\nframes_frame_2_best_effort_timestamp=2\n",
+        ).unwrap();
+        fs::write(directory.join("audio.txt"), "0,1024\n1024,1024\n").unwrap();
+        let executable = directory.join("ffprobe.sh");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+set -eu
+base=$(dirname "$0")
+kind=metadata
+for arg in "$@"; do
+    case "$arg" in
+        -count_frames) kind=count ;;
+        v:0) kind=video ;;
+        a:0) kind=audio ;;
+    esac
+done
+printf '%s\n' "$kind" >> "$base/calls"
+case "$kind" in
+    metadata|count) cat "$base/$kind.json" ;;
+    *) cat "$base/$kind.txt" ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        executable
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_probe_decodes_each_stream_once_when_frame_count_is_available() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = write_output_probe_fixture(directory.path(), Some(3));
+        let exporter = FfmpegSessionExporter::new(
+            SessionExportConfig::system_ffmpeg().with_ffprobe_path(executable),
+        );
+        let probe = exporter
+            .probe_output(&directory.path().join("media.mp4"))
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(directory.path().join("calls")).unwrap(),
+            "metadata\nvideo\naudio\n"
+        );
+        assert_eq!(probe.video_streams[0].frame_count, Some(3));
+        assert_eq!(probe.video_frame_timeline.unwrap().frame_count, 3);
+        assert_eq!(probe.audio_streams[0].frame_count, Some(2));
+        assert_eq!(
+            probe.audio_frame_timeline.unwrap().decoded_sample_frames,
+            2048
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_probe_retains_decoded_count_fallback_for_missing_container_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = write_output_probe_fixture(directory.path(), None);
+        let exporter = FfmpegSessionExporter::new(
+            SessionExportConfig::system_ffmpeg().with_ffprobe_path(executable),
+        );
+        let probe = exporter
+            .probe_output(&directory.path().join("media.mp4"))
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(directory.path().join("calls")).unwrap(),
+            "metadata\ncount\nvideo\naudio\n"
+        );
+        assert_eq!(probe.video_streams[0].frame_count, Some(3));
+        assert_eq!(probe.video_frame_timeline.unwrap().frame_count, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_probe_rejects_container_count_that_disagrees_with_decoded_frames() {
+        for count in [2, 4] {
+            let directory = tempfile::tempdir().unwrap();
+            let executable = write_output_probe_fixture(directory.path(), Some(count));
+            let exporter = FfmpegSessionExporter::new(
+                SessionExportConfig::system_ffmpeg().with_ffprobe_path(executable),
+            );
+            let error = exporter
+                .probe_output(&directory.path().join("media.mp4"))
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                SessionExportError::OutputVerificationFailed(_)
+            ));
+            assert!(error.to_string().contains("per-frame timestamp count 3"));
+        }
+    }
+
     struct Artifact {
         path: &'static str,
         role: &'static str,
@@ -5692,6 +5845,44 @@ mod tests {
         assert_eq!(verification.video_end_residual_ns, 0);
         assert_eq!(verification.paired_frames, 108_000);
         assert_eq!(verification.probe_summary.duration_ns, 3_600_000_000_000);
+    }
+
+    #[test]
+    fn uniform_clock_verification_rejects_both_drift_directions_and_start_offset() {
+        for (duration_ns, start_ns, bad_frame) in [
+            (1_999_999_980_u64, 0_i64, 59),
+            (2_000_000_040, 0, 59),
+            (2_000_000_000, 2, 0),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let timeline = manifest_timeline_fixture(directory.path(), false);
+            let output = directory.path().join("derived.mp4");
+            fs::write(&output, b"derived bytes").unwrap();
+            let plan = SessionExportPlan::from_manifest_timeline(
+                directory.path(),
+                &output,
+                true,
+                timeline,
+            )
+            .unwrap();
+            let report = serde_json::json!({"streams": [{
+                "codec_type": "video", "codec_name": "h264", "time_base": "1/1000000000",
+                "start_pts": start_ns, "duration_ts": duration_ns,
+                "nb_read_frames": "60", "width": 64, "height": 32,
+            }]});
+            let probe = OutputMediaProbe::from_ffprobe_json(&serde_json::to_vec(&report).unwrap())
+                .unwrap()
+                .with_uniform_video_frame_evidence_for_test()
+                .unwrap();
+
+            let error = verify_session_export_output(&plan, &output, &probe).unwrap_err();
+            assert!(
+                error.to_string().contains(&format!(
+                    "frame timestamp {bad_frame} differs from the manifest clock"
+                )),
+                "{error}"
+            );
+        }
     }
 
     #[test]
