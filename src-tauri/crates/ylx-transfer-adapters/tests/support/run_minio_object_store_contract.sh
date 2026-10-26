@@ -9,7 +9,9 @@ set -Eeuo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)"
 manifest="${repo_root}/src-tauri/Cargo.toml"
-image="${YLX_MINIO_IMAGE:-minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e}"
+image="${YLX_MINIO_IMAGE:-}"
+build_dir=""
+owned_image=""
 tmpfs_size="${YLX_MINIO_TMPFS_SIZE:-2g}"
 
 require_command() {
@@ -22,6 +24,7 @@ require_command() {
 require_command docker
 require_command curl
 require_command python3
+require_command sha256sum
 
 docker info >/dev/null 2>&1 || {
   printf 'C94 MinIO lane requires a reachable Docker daemon\n' >&2
@@ -52,9 +55,44 @@ cleanup() {
     docker logs "$container" >&2 || true
   fi
   docker rm -f "$container" >/dev/null 2>&1 || true
+  if [[ -n "$owned_image" ]]; then
+    docker image rm "$owned_image" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$build_dir" ]]; then
+    rm -rf -- "$build_dir"
+  fi
   exit "$status"
 }
 trap cleanup EXIT
+
+# The upstream container registries no longer serve this release. Build the
+# same MinIO version from its official, checksum-pinned GitHub release binary;
+# scratch keeps the contract independent of another mutable base image.
+if [[ -z "$image" ]]; then
+  case "$(docker info --format '{{.Architecture}}')" in
+    x86_64|amd64)
+      arch="amd64"
+      binary_sha="7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f"
+      ;;
+    aarch64|arm64)
+      arch="arm64"
+      binary_sha="5c83cd2cf151717ba0243f73e1c7802ff36e272b67144bdd7f1f7d684fd6f03d"
+      ;;
+    *) printf 'Unsupported Docker architecture for the pinned MinIO binary\n' >&2; exit 2 ;;
+  esac
+  release="RELEASE.2025-09-07T16-13-09Z"
+  build_dir="$(mktemp -d)"
+  curl --fail --location --silent --show-error --retry 3 \
+    --connect-timeout 20 --max-time 300 \
+    "https://github.com/minio/minio/releases/download/${release}/minio.linux-${arch}.${release}" \
+    --output "${build_dir}/minio"
+  printf '%s  %s\n' "$binary_sha" "${build_dir}/minio" | sha256sum --check --strict
+  chmod 0755 "${build_dir}/minio"
+  printf 'FROM scratch\nCOPY minio /minio\nENTRYPOINT ["/minio"]\n' > "${build_dir}/Dockerfile"
+  image="ylx-minio-contract:${nonce}"
+  owned_image="$image"
+  docker build --network=none --tag "$image" "$build_dir" >/dev/null
+fi
 
 docker run --detach --rm \
   --name "$container" \
