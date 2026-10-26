@@ -396,8 +396,6 @@ jobs:
         with:
           workspaces: src-tauri
       - name: Run the pinned MinIO contract lane
-        env:
-          YLX_MINIO_IMAGE: minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
         run: bash src-tauri/crates/ylx-transfer-adapters/tests/support/run_minio_object_store_contract.sh
 
   tauri:
